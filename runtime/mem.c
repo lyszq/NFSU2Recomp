@@ -113,6 +113,7 @@ void mprot_rearm(void){
 
 static void segv(int sig, siginfo_t *si, void *uc){
     (void)sig;
+    (void)uc; /* The ARM64 diagnostic path below uses the machine context. */
     /* korunan sayfaya yazma mi? */
     if (g_mprot_page){
         uint8_t *fa = (uint8_t*)si->si_addr;
