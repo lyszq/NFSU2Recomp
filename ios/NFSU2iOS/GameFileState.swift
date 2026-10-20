@@ -12,6 +12,21 @@ final class GameFileState: ObservableObject {
     @Published var message = "No executable selected."
     @Published private(set) var isVerified = false
 
+    init() {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                in: .userDomainMask)[0]
+        let saved = support.appendingPathComponent("NFSU2/Game/SPEED2.EXE")
+        guard let data = try? Data(contentsOf: saved),
+              data.count == Self.expectedSize else { return }
+        let digest = SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        if digest == Self.expectedSHA256 {
+            isVerified = true
+            message = "Previously verified SPEED2.EXE is still saved locally. Runtime integration is pending."
+        }
+    }
+
     func importExecutable(from url: URL) {
         isVerified = false
         let accessGranted = url.startAccessingSecurityScopedResource()

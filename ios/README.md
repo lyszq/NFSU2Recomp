@@ -1,38 +1,46 @@
-# NFSU2 iOS: Stage 1 native bootstrap
+# NFSU2 iOS Stage 2 — native guest runtime smoke test
 
-An iOS 16+ SwiftUI / UIKit + Metal application scaffold for experimenting with an eventual native Apple Silicon port of [TalhaMudo/NFSU2Recomp](https://github.com/TalhaMudo/NFSU2Recomp).
+This stage deliberately validates small, authentic pieces of the upstream
+macOS runtime on iPhone/iPad **without running NFSU2**.
 
-## What works in this stage
+## Changes from Stage 1
 
-- Native iPhone/iPad app, compiling for arm64 on GitHub's macOS runner.
-- Real Metal pipeline and shader drawn in an `MTKView` (graphics capability check).
-- iOS Files picker for the *user's own* `SPEED2.EXE`.
-- File-size/SHA-256 verification against upstream's supported build; saves verified executable in the app sandbox.
-- GitHub Actions produces an **unsigned** `.ipa` as a downloadable workflow artifact.
+- `Native/GuestSmoke.c` includes the **original** [`runtime/cpu.h`](../../runtime/cpu.h) and executes
+  its x86 EFLAGS macros against a real `CPU` struct, including signed overflow,
+  carry, zero, parity and borrow; verifies x87/MMX/XMM **storage**.
+- Probes a 4 GiB **virtual** guest mapping using `mmap(PROT_NONE)` (NOT 4 GiB RAM),
+  commits three host-sized pages with `mprotect`, reads/writes 32-bit guest
+  addresses in the PE/heap/high ranges, then unmaps everything.
+- A SwiftUI test button displays an explicit PASS or FAIL (with errno on VM failure).
+  Tests run on a worker queue, not the UI thread.
+- The same native test executable runs in CI on macOS before the iOS target is
+  built, including all C sources, helping catch upstream header changes.
+- The working Metal triangle, SHA-256/size validator, and locally saved EXE
+  are unchanged.
 
-## What does **not** work
+## What this stage does **not** do
 
-- **This is NOT a playable NFSU2 port.** It does not compile or run the upstream recompilation, convert its AppKit renderer, play audio, load game resources or handle gameplay input.
-- It does not ship a game executable or game data. It cannot generate the game's lifted C without a legal copy of the supported PC release.
-- IPA is unsigned. Installation requires legitimate personal signing/sideloading (e.g. signing it with an Apple development identity); an unsigned archive cannot simply be tapped to install.
+- `runtime/mem.c` is not linked yet. It includes macOS debug signal handling;
+  the isolated iOS probe uses its 4 GiB offset model, not the full manager.
+- No generated `gen/all/shard_*.c` is included, no game instructions executed,
+  no Direct3D-to-Metal game rendering, audio, menus or races.
+- The ISO/PC game files are not uploaded to GitHub.
+- Success on a macOS runner does not guarantee iOS mmap permissions; confirm
+  with the button on your iPad before treating the address-space test as passed.
 
-## Build it without a Mac
+## Update on a Windows machine
 
-1. Fork `TalhaMudo/NFSU2Recomp` into your GitHub account (via GitHub's **Fork** button).
-2. Copy `ios/` and `.github/workflows/ios-bootstrap.yml` from this overlay into your fork and commit. On Windows, after cloning your fork, extract the overlay zip into its root, then `git add ios .github/workflows/ios-bootstrap.yml && git commit -m "Add iOS Metal bootstrap and unsigned IPA CI" && git push`.
-3. Open **Actions > iOS bootstrap (unsigned IPA) > Run workflow**. The push also triggers it.
-4. If green, open the completed run and download `NFSU2iOS-bootstrap-unsigned` from **Artifacts**. The ZIP contains `NFSU2iOS-bootstrap-unsigned.ipa`.
+Use the one-click v0.2 update kit supplied with this revision. It applies
+only the `ios/` and workflow changes to `feat/ios-metal-bootstrap`, commits,
+and pushes them to the user's own fork.
 
-This step deliberately builds *only* a Metal proof-of-life. Game porting is a separate, substantial task.
+## iOS install
 
-## Planned engineering milestones
+GitHub Actions builds an **unsigned** IPA. It needs normal device signing
+before installation. App bundle ID is unchanged (`dev.lyszq.nfsu2ios`).
 
-- Port the macOS app shell from `NSApplication`/`NSWindow` (AppKit) to iOS `UIApplication` / `UIView` / `CAMetalLayer` or `MTKView`.
-- Extract the existing D3D9-to-Metal translator so it accepts an iOS `CAMetalLayer` and doesn't depend on Cocoa window/event APIs.
-- Adapt audio from macOS CoreAudio / AudioQueue to supported iOS audio session and render lifecycle (`AVAudioSession`).
-- Review x86 32-bit guest address-space reservation, 64-bit pointers, signal/exception handling, and W^X restrictions on iOS.
-- Adapt Win32 shims and file paths to sandbox-compatible paths, then implement keyboard/controller/touch input.
-- Generate translated C locally **from the user's game** (never commit it) and build testable subsets of the portable runtime; integrate the game loop only after unit/runtime checks.
-- Once the above passes on device, debug startup, menus, race loading, FMVs, audio and frame pacing.
+## Next milestone
 
-This scaffold is additive to upstream. It avoids modifying macOS code until iOS platform boundaries have been identified.
+Once both native tests pass on iPad, refactor the guest memory manager into a
+portable module and implement an iOS game-boot entry. Generate C from a supported
+SPEED2.EXE **privately**; never commit generated game code to a public repo.

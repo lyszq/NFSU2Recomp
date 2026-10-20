@@ -4,6 +4,30 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @EnvironmentObject private var files: GameFileState
     @State private var chooseExecutable = false
+    @State private var smokeRunning = false
+    @State private var smokePassed = false
+    @State private var smokeOutput = "Not run yet. Tap RUN CPU + MEMORY TEST."
+
+    private func startSmokeTest() {
+        guard !smokeRunning else { return }
+        smokeRunning = true
+        smokePassed = false
+        smokeOutput = "Running native CPU and virtual-memory tests…"
+
+        // Reserving a large virtual address range is not work for the UI thread.
+        DispatchQueue.global(qos: .userInitiated).async {
+            var buffer = [CChar](repeating: 0, count: 1024)
+            let result = buffer.withUnsafeMutableBufferPointer { ptr in
+                nfs_guest_smoke_run(ptr.baseAddress, ptr.count)
+            }
+            let output = String(cString: buffer)
+            DispatchQueue.main.async {
+                self.smokePassed = (result == 0)
+                self.smokeOutput = output
+                self.smokeRunning = false
+            }
+        }
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -18,13 +42,13 @@ struct ContentView: View {
                             .foregroundStyle(.white)
                     }
 
-                    Text("APPLE SILICON · METAL BOOTSTRAP")
+                    Text("APPLE SILICON · STAGE 2: GUEST RUNTIME")
                         .font(.system(.caption, design: .monospaced, weight: .semibold))
-                        .tracking(1.4)
+                        .tracking(1.1)
                         .foregroundStyle(.mint)
 
                     MetalPreview()
-                        .frame(height: max(220, min(geometry.size.height * 0.43, 420)))
+                        .frame(height: max(190, min(geometry.size.height * 0.30, 320)))
                         .background(.black)
                         .clipShape(RoundedRectangle(cornerRadius: 16))
                         .overlay(alignment: .bottomLeading) {
@@ -37,12 +61,45 @@ struct ContentView: View {
                     HStack(spacing: 8) {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundStyle(.mint)
-                        Text("Native iOS app and Metal renderer are linked")
+                        Text("Native iOS Metal renderer connected")
                             .foregroundStyle(.white)
                     }
                     .font(.subheadline)
 
-                    Text("Choose SPEED2.EXE from a legally obtained PC installation. This bootstrap verifies the supported build; it does not run the game yet.")
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("GUEST CPU + MEMORY SMOKE TEST")
+                            .font(.system(.caption, design: .monospaced, weight: .bold))
+                            .foregroundStyle(.mint)
+
+                        Text("Exercises the upstream x86 CPU register/flag definitions and probes a 4 GiB 32-bit virtual address space. It does not boot NFSU2.")
+                            .font(.footnote)
+                            .foregroundStyle(.white.opacity(0.7))
+
+                        Button(action: startSmokeTest) {
+                            Label(smokeRunning ? "Testing…" : "RUN CPU + MEMORY TEST",
+                                  systemImage: "cpu")
+                                .fontWeight(.bold)
+                                .frame(maxWidth: .infinity)
+                                .padding(10)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.mint)
+                        .disabled(smokeRunning)
+
+                        HStack(alignment: .top, spacing: 8) {
+                            Image(systemName: smokeRunning ? "hourglass" :
+                                  (smokePassed ? "checkmark.circle.fill" : "info.circle"))
+                            Text(smokeOutput)
+                                .textSelection(.enabled)
+                        }
+                        .foregroundStyle(smokePassed ? .mint : .white)
+                        .font(.system(.footnote, design: .monospaced))
+                    }
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+
+                    Text("Select your locally owned SPEED2.EXE. The file is verified and saved for a later stage; it is not executed.")
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(0.7))
 
@@ -70,7 +127,7 @@ struct ContentView: View {
                     .padding(14)
                     .background(.white.opacity(0.065), in: RoundedRectangle(cornerRadius: 12))
 
-                    Text("Next milestone: adapt the macOS recompilation runtime from Cocoa/AppKit to UIKit and connect its D3D9-to-Metal renderer. No copyrighted game data is included in this build.")
+                    Text("NEXT: Generate lifted C from your own EXE privately, port the guest boot process, then connect the macOS D3D9-to-Metal implementation to iOS. This IPA does not contain the game runtime or game assets.")
                         .font(.footnote)
                         .foregroundStyle(.white.opacity(0.6))
                 }

@@ -1,4 +1,4 @@
-name: iOS bootstrap (unsigned IPA)
+name: iOS runtime smoke test (unsigned IPA)
 
 on:
   workflow_dispatch:
@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build-ios:
-    name: Compile UIKit/Metal bootstrap
+    name: Compile Metal + upstream CPU guest-memory smoke test
     runs-on: macos-15
     timeout-minutes: 40
     steps:
@@ -23,6 +23,14 @@ jobs:
         run: |
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Run portable native guest CPU/VM tests (macOS)
+        run: |
+          set -euo pipefail
+          clang -O2 -std=gnu11 -Wall -Wextra -Werror \
+            ios/NFSU2iOS/Native/GuestSmoke.c ios/tests/smoke_cli.c \
+            -o "$RUNNER_TEMP/nfsu2-smoke"
+          "$RUNNER_TEMP/nfsu2-smoke"
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -51,12 +59,12 @@ jobs:
           test -d "$APP"
           mkdir -p "$RUNNER_TEMP/nfsu2-ipa/Payload"
           ditto "$APP" "$RUNNER_TEMP/nfsu2-ipa/Payload/NFSU2iOS.app"
-          (cd "$RUNNER_TEMP/nfsu2-ipa" && zip -qry "$GITHUB_WORKSPACE/NFSU2iOS-bootstrap-unsigned.ipa" Payload)
+          (cd "$RUNNER_TEMP/nfsu2-ipa" && zip -qry "$GITHUB_WORKSPACE/NFSU2iOS-runtime-smoke-unsigned.ipa" Payload)
 
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
-          name: NFSU2iOS-bootstrap-unsigned
-          path: NFSU2iOS-bootstrap-unsigned.ipa
+          name: NFSU2iOS-runtime-smoke-unsigned
+          path: NFSU2iOS-runtime-smoke-unsigned.ipa
           if-no-files-found: error
           retention-days: 14
