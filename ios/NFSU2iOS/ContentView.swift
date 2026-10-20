@@ -32,6 +32,33 @@ struct ContentView: View {
         }
     }
 
+    private var imageProbePanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button(action: files.runImageProbe) {
+                Label(files.probeRunning ? "Loading image..." : "LOAD VERIFIED GAME IMAGE",
+                      systemImage: "memorychip")
+                    .frame(maxWidth: .infinity)
+                    .padding(10)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.mint)
+            .disabled(!files.isVerified || files.probeRunning || smokeRunning)
+            Text(files.probeOutput)
+                .font(.system(.footnote, design: .monospaced))
+                .foregroundStyle(files.probePassed ? .mint : .white)
+                .textSelection(.enabled)
+            if !files.probeRunning {
+                ShareLink(item: files.probeOutput) {
+                    Label("Share image diagnostic", systemImage: "square.and.arrow.up")
+                }
+                .font(.footnote)
+                .tint(.mint)
+            }
+        }
+        .padding(14)
+        .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+    }
+
     var body: some View {
         GeometryReader { geometry in
             ScrollView {
@@ -139,30 +166,7 @@ struct ContentView: View {
                     .padding(14)
                     .background(.white.opacity(0.065), in: RoundedRectangle(cornerRadius: 12))
 
-                    VStack(alignment: .leading, spacing: 10) {
-                        Button(action: files.runImageProbe) {
-                            Label(files.probeRunning ? "Loading image…" : "LOAD VERIFIED GAME IMAGE",
-                                  systemImage: "memorychip")
-                                .frame(maxWidth: .infinity)
-                                .padding(10)
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(.mint)
-                        .disabled(!files.isVerified || files.probeRunning || smokeRunning)
-                        Text(files.probeOutput)
-                            .font(.system(.footnote, design: .monospaced))
-                            .foregroundStyle(files.probePassed ? .mint : .white)
-                            .textSelection(.enabled)
-                        if !files.probeRunning {
-                            ShareLink(item: files.probeOutput) {
-                                Label("Share image diagnostic", systemImage: "square.and.arrow.up")
-                            }
-                            .font(.footnote)
-                            .tint(.mint)
-                        }
-                    }
-                    .padding(14)
-                    .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
+                    imageProbePanel
 
                     Text("NEXT: Generate lifted C from your own EXE privately, port the guest boot process, then connect the macOS D3D9-to-Metal implementation to iOS. This IPA includes the shared memory core, but no lifted game code or game assets.")
                         .font(.footnote)

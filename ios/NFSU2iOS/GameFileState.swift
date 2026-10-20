@@ -27,7 +27,7 @@ final class GameFileState: ObservableObject {
         guard isVerified, !probeRunning else { return }
         probeRunning = true
         probePassed = false
-        probeOutput = "Verifying saved EXE and loading its PE32 image…"
+        probeOutput = "Verifying saved EXE and loading its PE32 image..."
         let saved = Self.savedExecutable
         // Reauthenticate the exact bytes passed to C, on the worker queue.
         // No sandbox path or proprietary bytes are sent to CI or diagnostics.

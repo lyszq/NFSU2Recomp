@@ -11,6 +11,7 @@ spec = yaml.safe_load((root / "ios/project.yml").read_text())
 target = spec["targets"]["NFSU2iOS"]
 target["sources"].extend({"path": "../gen/ios-private/" + name}
                          for name in ["lifted.c", "private_probe.c"])
+target["settings"]["base"]["HEADER_SEARCH_PATHS"] = ["$(inherited)", "$(SRCROOT)/../runtime"]
 target["settings"]["base"]["GCC_PREPROCESSOR_DEFINITIONS"] = ["$(inherited)", "NFS_PRIVATE_PROBE=1"]
 target["info"]["properties"]["CFBundleShortVersionString"] = "0.4.1"
 target["info"]["properties"]["CFBundleVersion"] = "5"
