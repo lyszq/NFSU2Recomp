@@ -132,7 +132,49 @@ int main(void) {
     CHECK(!guest_execution_run(&config,&c,0x401000u,&result));
     CHECK(result.stop==GUEST_STOP_MEMORY && result.target==0xff000000u && !result.imports_handled);
     CHECK(c.esp==before.esp && c.eax==before.eax);
+    const uint32_t section=0x38001u;
+    GuestImport critical={0,"KERNEL32.dll","InitializeCriticalSection"};
+    put(TEB+0x24,1);
+    c=setup(0); c.eax=0xb16b00b5u; put(STACK+4,section);
+    CHECK(guest_windows_import(&c,&critical,&windows,&fault)==1);
+    CHECK(c.eax==0xb16b00b5u && c.esp==STACK+8 && get(TEB+0x34)==999);
+    CHECK(guest_critical_count(&windows.critical)==1 && get(section+4)==UINT32_MAX);
+    critical.name="EnterCriticalSection";
+    c=setup(0); c.eax=1234; put(STACK+4,section);
+    CHECK(guest_windows_import(&c,&critical,&windows,&fault)==1 && c.eax==1234);
+    CHECK(get(section+4)==0 && get(section+8)==1 && get(section+12)==1);
+    critical.name="TryEnterCriticalSection"; c=setup(0); put(STACK+4,section);
+    CHECK(guest_windows_import(&c,&critical,&windows,&fault)==1 && c.eax==1);
+    CHECK(get(section+8)==2 && get(TEB+0x34)==999);
+    put(TEB+0x24,2); c=setup(0); put(STACK+4,section);
+    CHECK(guest_windows_import(&c,&critical,&windows,&fault)==1 && !c.eax);
+    CHECK(get(section+8)==2 && get(TEB+0x34)==999);
+    critical.name="EnterCriticalSection"; c=setup(0); put(STACK+4,section); before=c;
+    CHECK(guest_windows_import(&c,&critical,&windows,&fault)==-2 && fault==section);
+    CHECK(!memcmp(&c,&before,sizeof c) && get(section+8)==2);
+    put(TEB+0x24,1);
+    critical.name="DeleteCriticalSection"; c=setup(0); put(STACK+4,section); before=c;
+    CHECK(guest_windows_import(&c,&critical,&windows,&fault)==-2 && fault==section);
+    CHECK(!memcmp(&c,&before,sizeof c) && get(section+8)==2);
+    critical.name="LeaveCriticalSection";
+    for (unsigned i=0;i<2;i++) {
+        c=setup(0); c.eax=4321; put(STACK+4,section);
+        CHECK(guest_windows_import(&c,&critical,&windows,&fault)==1 && c.eax==4321);
+    }
+    CHECK(get(section+4)==UINT32_MAX && !get(section+8) && !get(section+12));
+    critical.name="EnterCriticalSection";
+    config.imports=&critical; config.import_context=&windows;
+    c=setup(0); put(STACK+4,section+64); before=c;
+    CHECK(!guest_execution_run(&config,&c,0x401000u,&result));
+    CHECK(result.stop==GUEST_STOP_API_STATE && result.target==section+64);
+    CHECK(c.esp==before.esp && !result.imports_handled && result.instructions==1);
+    /* A budget stop after a real acquire must still release native resources. */
+    config.instruction_budget=1; c=setup(0); put(STACK+4,section);
+    CHECK(!guest_execution_run(&config,&c,0x401000u,&result));
+    CHECK(result.stop==GUEST_STOP_BUDGET && result.imports_handled==1 && get(section+8)==1);
+    CHECK(!guest_windows_cleanup(&windows) && !guest_critical_count(&windows.critical));
+    CHECK(!guest_windows_cleanup(&windows));
     guest_dispatch_destroy(&table); CHECK(!guest_memory_shutdown());
-    puts("PASS | Windows compatibility bridge | version layouts + stdcall + LastError + strict faults/unknown APIs");
+    puts("PASS | Windows compatibility bridge | version/module/heap/critical contracts + stdcall + LastError + strict faults/unknown APIs + stop cleanup");
     return 0;
 }

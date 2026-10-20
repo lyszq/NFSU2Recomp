@@ -6,6 +6,37 @@
 
 static uint32_t read32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static void write32(void *p, uint32_t v) { memcpy(p, &v, 4); }
+static int critical_import(CPU *c, const GuestImport *import, GuestWindows *windows, uint32_t *fault) {
+    int initialize=!strcmp(import->name,"InitializeCriticalSection");
+    int enter=!strcmp(import->name,"EnterCriticalSection");
+    int attempt=!strcmp(import->name,"TryEnterCriticalSection");
+    int leave=!strcmp(import->name,"LeaveCriticalSection");
+    int destroy=!strcmp(import->name,"DeleteCriticalSection");
+    if (!windows || (!initialize && !enter && !attempt && !leave && !destroy)) return 0;
+    const uint8_t *stack=guest_memory_pointer(c->esp,8,0);
+    if (!stack) { *fault=c->esp; return -1; }
+    uint32_t ret=read32(stack), address=read32(stack+4), thread_id=0;
+    if (enter || attempt || leave) {
+        uint64_t at=(uint64_t)c->fs_base+0x24u;
+        const void *tid=at<=UINT32_MAX ? guest_memory_pointer((uint32_t)at,4,0) : NULL;
+        if (!tid) { *fault=at>UINT32_MAX ? UINT32_MAX : (uint32_t)at; return -1; }
+        thread_id=read32(tid);
+    }
+    /* Validate memory before native state lookup so an unmapped section is
+     * diagnosed consistently, even if it was never initialized. */
+    if (!address || !guest_memory_pointer(address,GUEST_CRITICAL_BYTES,1)) {
+        *fault=address; return -1;
+    }
+    int rc;
+    if (initialize) rc=guest_critical_create(&windows->critical,address);
+    else if (enter || attempt) rc=guest_critical_acquire(&windows->critical,address,thread_id);
+    else if (leave) rc=guest_critical_release(&windows->critical,address,thread_id);
+    else rc=guest_critical_delete(&windows->critical,address);
+    if (rc && !(attempt && rc==EBUSY)) { *fault=address; return rc==EFAULT ? -1 : -2; }
+    if (attempt) c->eax=!rc; /* The other four APIs return void. */
+    c->eip=ret; c->esp+=8u;
+    return 1;
+}
 static int heap_import(CPU *c, const GuestImport *import, GuestWindows *windows, uint32_t *fault) {
     unsigned nargs=0;
     int create=!strcmp(import->name,"HeapCreate"), alloc=!strcmp(import->name,"HeapAlloc");
@@ -53,7 +84,10 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
     int version = !strcmp(import->name, "GetVersionExA");
     int module = !strcmp(import->name, "GetModuleHandleA");
     if (strcasecmp(import->library, "KERNEL32.dll")) return 0;
-    if (!version && !module) return heap_import(c,import,context,fault);
+    if (!version && !module) {
+        int handled=critical_import(c,import,context,fault);
+        return handled ? handled : heap_import(c,import,context,fault);
+    }
     if (module && !context) return 0;
     /* Validate the return and argument together: wrapped x86 stack ranges are
      * rejected, and a malformed API never partly consumes the guest stack. */
@@ -113,4 +147,7 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
     c->eip = return_ip;
     c->esp += 8u;
     return 1;
+}
+int guest_windows_cleanup(GuestWindows *windows) {
+    return windows ? guest_critical_cleanup(&windows->critical) : EINVAL;
 }

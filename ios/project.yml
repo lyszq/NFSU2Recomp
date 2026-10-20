@@ -26,6 +26,7 @@ targets:
       - path: ../runtime/guest_bootstrap.c
       - path: ../runtime/guest_windows.c
       - path: ../runtime/guest_heap.c
+      - path: ../runtime/guest_critical.c
       - path: tests/cpu_flags_test.c
     settings:
       base:
@@ -40,8 +41,8 @@ targets:
       path: NFSU2iOS/Info.plist
       properties:
         CFBundleDisplayName: NFSU2 iOS
-        CFBundleShortVersionString: '0.6.0'
-        CFBundleVersion: '8'
+        CFBundleShortVersionString: '0.7.0'
+        CFBundleVersion: '10'
         LSRequiresIPhoneOS: true
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true

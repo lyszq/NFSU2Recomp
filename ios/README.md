@@ -182,9 +182,10 @@ fails. Native execution remains ARM64 static code without JIT or an interpreter.
 
 Host tests cover heap exhaustion, failed-allocation atomicity, freed-gap reuse,
 protection, stdcall cleanup, structure layouts, LastError preservation, aliased
-outputs, malformed memory and unsupported imports. Physical iPad validation of
-0.6.1 is pending; the last confirmed device regression is 0.4.1. This probe still
-stops during CRT initialization and has no game boot, renderer, audio or input.
+outputs, malformed memory and unsupported imports. On 20 October 2026 the user
+supplied an iPadOS 26.3 screenshot confirming both 0.6.1 CPU/memory PASS (16 KiB
+pages) and the expected 154-instruction entry stop with full state/hash match.
+This confirms 0.6.1 on-device; it still has no game boot, renderer, audio or input.
 
 API references:
 - https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getversionexa
@@ -192,3 +193,39 @@ API references:
 - https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapcreate
 - https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapalloc
 - https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapsize
+
+
+## Stage 7: native critical sections (0.7.1 private)
+
+`runtime/guest_critical.c` implements guest critical sections using real native
+recursive pthread mutexes. The Windows bridge now services Initialize, Enter,
+TryEnter, Leave and DeleteCriticalSection with checked 24-byte guest structures,
+recursive ownership, stdcall cleanup and LastError/void-return preservation.
+Host mutex pointers stay outside guest memory. Duplicate/overlapping objects,
+invalid ownership, guest mirror corruption and the 64-object cap are explicit
+errors. TryEnter contention returns false; Enter contention stops as API_STATE
+because the current single guest-thread runner cannot schedule a waiter. It
+never pretends a contended lock was acquired, and never blocks past the budget.
+
+The caller must quiesce section lifecycle and guest mapping changes. Native
+acquire/release contention is tested with actual pthreads. Process teardown
+frees native mutex state after every execution stop, including budget longjmp;
+it can cancel recursive locks held by its own worker even after VM shutdown.
+Guest thread creation and general multithreaded game execution remain pending.
+
+The original-x86 reference now initializes 14 CRT critical sections and reaches
+KERNEL32.dll!TlsAlloc at 0x00762021 after 1,115 instructions, 82 calls and 18
+implemented API invocations. The bounded static generator includes every
+observed real function. The native private test must match the full trace,
+GPR/EFLAGS, image/TEB/stack/heap hashes, call/depth counts and 14 native section
+objects, then clean up all native resources. TlsAlloc remains unimplemented.
+
+The 48-case actual leaf regression remains in the same device button. Version
+0.7.1/build 11 needs separate physical-device confirmation; the last confirmed
+build is 0.6.1. No gameplay or successful complete CRT/game boot is claimed.
+
+API references:
+- https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-initializecriticalsection
+- https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-entercriticalsection
+- https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-leavecriticalsection
+- https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-deletecriticalsection

@@ -9,12 +9,13 @@ typedef struct GuestImport {
     const char *library, *name;
 } GuestImport;
 /* 1 = completed stdcall, 0 = unsupported without side effects, -1 = memory
- * fault (address returned through fault). Handler validates before mutation. */
+ * fault (address returned through fault), -2 = invalid/unsupported host state.
+ * Handler validates before mutation; failed calls keep their guest call frame. */
 typedef int (*GuestImportHandler)(CPU *, const GuestImport *, void *, uint32_t *fault);
 enum GuestStop {
     GUEST_STOP_RETURN = 1, GUEST_STOP_IMPORT, GUEST_STOP_UNRESOLVED,
     GUEST_STOP_INSTRUCTION, GUEST_STOP_MEMORY, GUEST_STOP_BUDGET,
-    GUEST_STOP_DEPTH, GUEST_STOP_TIMEOUT
+    GUEST_STOP_DEPTH, GUEST_STOP_TIMEOUT, GUEST_STOP_API_STATE
 };
 typedef struct GuestExecutionResult {
     enum GuestStop stop;

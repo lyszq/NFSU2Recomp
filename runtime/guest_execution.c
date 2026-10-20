@@ -58,7 +58,8 @@ void guest_execution_call(CPU *cpu, uint32_t target) {
                 uint32_t fault = 0;
                 int handled = active->config.import_handler(cpu, &active->config.imports[index],
                     active->config.import_context, &fault);
-                if (handled < 0) stop(GUEST_STOP_MEMORY, fault);
+                if (handled == -1) stop(GUEST_STOP_MEMORY, fault);
+                if (handled < -1) stop(GUEST_STOP_API_STATE, fault);
                 if (handled > 0) { active->result.imports_handled++; return; }
             }
             stop(GUEST_STOP_IMPORT, target);
