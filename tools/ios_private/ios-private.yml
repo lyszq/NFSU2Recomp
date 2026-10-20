@@ -4,12 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       macos_runner:
-        description: Native ARM64 macOS build host
+        description: macOS build host (the iOS output is always ARM64)
         type: choice
         default: macos-15
         options:
           - macos-15
           - macos-26
+          - macos-15-intel
 permissions:
   contents: read
 env:

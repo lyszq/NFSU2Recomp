@@ -79,8 +79,8 @@ def main():
     parser.add_argument("--create", action="store_true", help="create a new PRIVATE control repository if absent")
     parser.add_argument("--exe", type=Path, help="upload only the authenticated EXE as a PRIVATE release asset")
     parser.add_argument("--dispatch", action="store_true", help="start the configured private workflow")
-    parser.add_argument("--macos-runner", choices=["macos-15", "macos-26"], default="macos-15",
-                        help="standard ARM64 macOS runner; keep 15 as the default, 26 as a queue fallback")
+    parser.add_argument("--macos-runner", choices=["macos-15", "macos-26", "macos-15-intel"], default="macos-15",
+                        help="standard macOS build host; the iOS output remains ARM64 on every host")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.repository):
         raise ValueError("invalid repository name")

@@ -128,3 +128,9 @@ python tools/ios_private/provision.py --dispatch --macos-runner macos-26
 
 Runner-label reference:
 https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+
+`--macos-runner macos-15-intel` selects the separate standard Intel host pool
+when ARM host queues are unavailable. Its CLI test executes native x86_64 C;
+Xcode still cross-compiles the actual application to ARM64 and the IPA link-map
+and lipo checks stay required. An Intel host test is not physical ARM64 execution;
+the 0.7.1 iPad check remains necessary regardless of which build host is used.
