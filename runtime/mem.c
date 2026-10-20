@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include "cpu.h"
+#include "guest_memory.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -11,7 +12,6 @@
 void (*g_backtrace_fn)(struct CPU*,int) = 0;   /* dispatch.c kurar */
 CPU *g_cur_cpu = 0;
 
-uint8_t *g_mem = 0;
 uint32_t g_image_base = 0x400000u, g_res_dir_va = 0, g_res_dir_size = 0;
 
 /* izleme durumu: her derlemede tanimli olmali (debug.c opsiyonel) */
@@ -23,32 +23,24 @@ void (*g_report_fn)(void) = 0;          /* boot.c kurar */
 __attribute__((weak)) void watch_report_change(uint32_t ip, uint32_t o, uint32_t n){
     (void)ip;(void)o;(void)n;
 }
-static uint64_t g_committed = 0;
-/* commit edilen 16 KB sayfalarin bitmap'i (4 GB / 16 KB = 262144 bit = 32 KB) */
-uint8_t g_cbits[1u<<15] = {0};
-/* Govde artik cpu.h'ta satir ici (uc komut).  Ayri bir cagri olarak
- * profilde konuk thread'in %1.45'iydi -- is degil, cagri masrafi. */
-
-
 void mprot_arm(uint32_t);
 void mem_init(void){
-    if (g_mem) return;
-    g_mem = mmap(0, GSZ, PROT_NONE, MAP_PRIVATE|MAP_ANON|MAP_NORESERVE, -1, 0);
-    if (g_mem == MAP_FAILED){ perror("mmap 4GB"); exit(1); }
+    int rc = guest_memory_init();
+    if (rc){ errno = rc; perror("mmap 4GB"); exit(1); }
 }
 
 void mem_commit(uint32_t addr, uint32_t size){
-    uint64_t lo = addr & ~0x3FFFull;                    /* 16 KB sayfa */
-    uint64_t hi = ((uint64_t)addr + size + 0x3FFF) & ~0x3FFFull;
-    if (hi > 0x100000000ull) hi = 0x100000000ull;
-    if (mprotect(g_mem + lo, hi - lo, PROT_READ|PROT_WRITE) != 0){
-        fprintf(stderr,"mem_commit 0x%08x+%u basarisiz\n", addr, size); exit(1);
+    if (!size) return;
+    uint64_t lo = (uint64_t)addr & ~0x3FFFull;
+    /* Preserve the desktop API's legacy clipping at the end of x86 space. */
+    uint64_t length = size;
+    if (length > GSZ - addr) length = GSZ - addr;
+    uint64_t hi = ((uint64_t)addr + length + 0x3FFFu) & ~0x3FFFull;
+    int rc = guest_memory_commit(addr, length);
+    if (rc){
+        fprintf(stderr,"mem_commit 0x%08x+%u failed: %s\n", addr, size, strerror(rc));
+        exit(1);
     }
-    for (uint64_t a2 = lo; a2 < hi; a2 += 0x4000ull){
-        uint32_t pg = (uint32_t)(a2 >> 14);
-        g_cbits[pg>>3] |= (uint8_t)(1u << (pg&7));
-    }
-    g_committed += hi - lo;
     /* WATCHADDR=<adres>: o adres commit edilir edilmez watchpoint kur.
      * Boylece ilk yazan bile yakalanir. */
     { static int wa_done = 0;
@@ -58,7 +50,7 @@ void mem_commit(uint32_t addr, uint32_t size){
           if ((uint64_t)t >= lo && (uint64_t)t < hi){ wa_done = 1; mprot_arm(t); }
       } }
 }
-uint64_t mem_committed(void){ return g_committed; }
+uint64_t mem_committed(void){ return guest_memory_committed(); }
 
 /* Guest'in commit edilmemis bolgeye erisimini teshis et */
 static volatile int g_in_handler = 0;

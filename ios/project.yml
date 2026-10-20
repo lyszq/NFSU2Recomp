@@ -19,18 +19,23 @@ targets:
     deploymentTarget: '16.0'
     sources:
       - path: NFSU2iOS
+      - path: ../runtime/guest_memory.c
+      - path: tests/cpu_flags_test.c
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.lyszq.nfsu2ios
         PRODUCT_NAME: NFSU2iOS
+        GCC_STRICT_ALIASING: 'NO'
+        GCC_C_LANGUAGE_STANDARD: gnu11
+        LD_GENERATE_MAP_FILE: 'YES'
         SWIFT_OBJC_BRIDGING_HEADER: NFSU2iOS/Native/NFSU2BridgingHeader.h
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: 'YES'
     info:
       path: NFSU2iOS/Info.plist
       properties:
         CFBundleDisplayName: NFSU2 iOS
-        CFBundleShortVersionString: '0.2.0'
-        CFBundleVersion: '2'
+        CFBundleShortVersionString: '0.3.0'
+        CFBundleVersion: '3'
         LSRequiresIPhoneOS: true
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true

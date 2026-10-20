@@ -333,7 +333,8 @@ void mem_altstack_install(void);
 extern uint8_t g_cbits[1u<<15];   /* commit edilen 16 KB sayfalarin bitmap'i */
 static inline int mem_is_committed(uint32_t addr){
     uint32_t pg = (addr) >> 14;
-    return (g_cbits[pg>>3] >> (pg&7)) & 1;
+    /* Commit may publish another page in this bitmap byte from a guest thread. */
+    return (__atomic_load_n(&g_cbits[pg>>3], __ATOMIC_ACQUIRE) >> (pg&7)) & 1;
 }
 
 #endif

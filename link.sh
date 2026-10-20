@@ -21,7 +21,7 @@ WHICH="${1:-both}"
 SURUM="$(tr -cd '0-9' < "$ROOT/SURUM" 2>/dev/null)"; SURUM="${SURUM:-0}"
 case "$WHICH" in both|orig|hd) ;; *) echo "kullanim: ./link.sh [orig|hd]"; exit 1 ;; esac
 
-CSRC="mem dispatch genexec win32 win32_ext com debug res fileio overrides d3dx_hle vsemu enhance perflog"
+CSRC="mem guest_memory dispatch genexec win32 win32_ext com debug res fileio overrides d3dx_hle vsemu enhance perflog"
 MSRC="metal audio bundle"
 FW="-lm -framework Cocoa -framework Metal -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreServices -framework AudioToolbox"
 SHARDS="out/obj/shard_*.o out/obj/fntab.o out/obj/stubs.o"
@@ -67,7 +67,7 @@ fi
 # testler guncel lifter'i hic sinamiyordu.  Artik bayat ikili silinir ki
 # ./run.sh test gorunur sekilde dussun.
 if "$ROOT/.venv/bin/python" "$ROOT/tools/isatest.py" >/dev/null \
-   && clang -O1 -Wno-unused-label -Iruntime -o out/isatest gen/isatest.c runtime/mem.c -lm; then
+   && clang -O1 -Wno-unused-label -Iruntime -o out/isatest gen/isatest.c runtime/mem.c runtime/guest_memory.c -pthread -lm; then
   :
 else
   rm -f out/isatest

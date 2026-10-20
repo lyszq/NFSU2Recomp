@@ -502,7 +502,7 @@ def gen_guest(cases, chunks, workdir):
     open(src, 'w').write('\n'.join(o))
     exe = os.path.join(workdir, 'guest')
     subprocess.run(['clang','-O1','-Wno-unused-label','-Iruntime','-o',exe,src,
-                    'runtime/mem.c','-lm'], check=True)
+                    'runtime/mem.c','runtime/guest_memory.c','-pthread','-lm'], check=True)
     return exe, skipped
 
 def main():

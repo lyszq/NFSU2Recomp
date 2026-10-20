@@ -5,14 +5,26 @@ on:
   push:
     paths:
       - 'ios/**'
+      - 'runtime/cpu.h'
+      - 'runtime/guest_memory.*'
+      - 'runtime/mem.c'
+      - 'tests/guest_memory*'
+      - 'tests/run_guest_tests.sh'
       - '.github/workflows/ios-bootstrap.yml'
 
 permissions:
   contents: read
 
 jobs:
+  test-linux:
+    name: Shared guest memory and CPU tests (Linux x86_64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tests/run_guest_tests.sh "$RUNNER_TEMP/guest-tests"
+
   build-ios:
-    name: Compile Metal + upstream CPU guest-memory smoke test
+    name: Shared runtime tests + native ARM64 IPA
     runs-on: macos-15
     timeout-minutes: 40
     steps:
@@ -24,13 +36,10 @@ jobs:
           xcodebuild -version
           xcrun --sdk iphoneos --show-sdk-version
 
-      - name: Run portable native guest CPU/VM tests (macOS)
+      - name: Run shared runtime and desktop adapter tests (macOS)
         run: |
           set -euo pipefail
-          clang -O2 -std=gnu11 -Wall -Wextra -Werror \
-            ios/NFSU2iOS/Native/GuestSmoke.c ios/tests/smoke_cli.c \
-            -o "$RUNNER_TEMP/nfsu2-smoke"
-          "$RUNNER_TEMP/nfsu2-smoke"
+          bash tests/run_guest_tests.sh "$RUNNER_TEMP/guest-tests" | tee "$RUNNER_TEMP/guest-tests.txt"
 
       - name: Install XcodeGen
         run: brew install xcodegen
@@ -52,7 +61,20 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Package unsigned bootstrap IPA
+      - name: Verify ARM64 and shared runtime linkage
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/NFSU2DerivedData/Build/Products/Release-iphoneos/NFSU2iOS.app"
+          test "$(lipo -archs "$APP/NFSU2iOS")" = arm64
+          MAP="$RUNNER_TEMP/NFSU2DerivedData/Build/Intermediates.noindex/NFSU2iOS.build/Release-iphoneos/NFSU2iOS.build/NFSU2iOS-LinkMap-normal-arm64.txt"
+          test -f "$MAP"
+          sed '/^# Dead Stripped Symbols/,$d' "$MAP" > "$RUNNER_TEMP/live-symbols.txt"
+          for SYMBOL in guest_memory_init guest_memory_commit guest_memory_protect guest_memory_shutdown guest_memory_pointer nfs_cpu_flags_test; do
+            grep -E "[[:space:]]_$SYMBOL$" "$RUNNER_TEMP/live-symbols.txt" | tee -a "$RUNNER_TEMP/guest-tests.txt"
+          done
+          echo 'PASS | physical-device ARM64 binary links shared memory and CPU tests' | tee -a "$RUNNER_TEMP/guest-tests.txt"
+
+      - name: Package unsigned runtime IPA
         run: |
           set -euo pipefail
           APP="$RUNNER_TEMP/NFSU2DerivedData/Build/Products/Release-iphoneos/NFSU2iOS.app"
@@ -66,5 +88,13 @@ jobs:
         with:
           name: NFSU2iOS-runtime-smoke-unsigned
           path: NFSU2iOS-runtime-smoke-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload runtime test and link evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSU2iOS-shared-runtime-evidence
+          path: ${{ runner.temp }}/guest-tests.txt
           if-no-files-found: error
           retention-days: 14

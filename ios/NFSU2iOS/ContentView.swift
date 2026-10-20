@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -14,13 +15,15 @@ struct ContentView: View {
         smokePassed = false
         smokeOutput = "Running native CPU and virtual-memory tests…"
 
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let device = "iOS \(version) | \(UIDevice.current.model) \(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"
         // Reserving a large virtual address range is not work for the UI thread.
         DispatchQueue.global(qos: .userInitiated).async {
             var buffer = [CChar](repeating: 0, count: 1024)
             let result = buffer.withUnsafeMutableBufferPointer { ptr in
                 nfs_guest_smoke_run(ptr.baseAddress, ptr.count)
             }
-            let output = String(cString: buffer)
+            let output = device + "\n" + String(cString: buffer)
             DispatchQueue.main.async {
                 self.smokePassed = (result == 0)
                 self.smokeOutput = output
@@ -42,7 +45,7 @@ struct ContentView: View {
                             .foregroundStyle(.white)
                     }
 
-                    Text("APPLE SILICON · STAGE 2: GUEST RUNTIME")
+                    Text("APPLE SILICON · STAGE 3: SHARED MEMORY")
                         .font(.system(.caption, design: .monospaced, weight: .semibold))
                         .tracking(1.1)
                         .foregroundStyle(.mint)
@@ -61,7 +64,7 @@ struct ContentView: View {
                     HStack(spacing: 8) {
                         Image(systemName: "checkmark.circle.fill")
                             .foregroundStyle(.mint)
-                        Text("Native iOS Metal renderer connected")
+                        Text("Native iOS Metal bootstrap preview")
                             .foregroundStyle(.white)
                     }
                     .font(.subheadline)
@@ -71,7 +74,7 @@ struct ContentView: View {
                             .font(.system(.caption, design: .monospaced, weight: .bold))
                             .foregroundStyle(.mint)
 
-                        Text("Exercises the upstream x86 CPU register/flag definitions and probes a 4 GiB 32-bit virtual address space. It does not boot NFSU2.")
+                        Text("Tests the shared macOS/iOS guest memory core, CPU flags, stack operations, address limits and page permissions. It does not boot NFSU2.")
                             .font(.footnote)
                             .foregroundStyle(.white.opacity(0.7))
 
@@ -94,6 +97,14 @@ struct ContentView: View {
                         }
                         .foregroundStyle(smokePassed ? .mint : .white)
                         .font(.system(.footnote, design: .monospaced))
+
+                        if !smokeRunning {
+                            ShareLink(item: "NFSU2 iOS 0.3 (shared memory core)\n" + smokeOutput) {
+                                Label("Share test diagnostic", systemImage: "square.and.arrow.up")
+                            }
+                            .font(.footnote)
+                            .tint(.mint)
+                        }
                     }
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -127,7 +138,7 @@ struct ContentView: View {
                     .padding(14)
                     .background(.white.opacity(0.065), in: RoundedRectangle(cornerRadius: 12))
 
-                    Text("NEXT: Generate lifted C from your own EXE privately, port the guest boot process, then connect the macOS D3D9-to-Metal implementation to iOS. This IPA does not contain the game runtime or game assets.")
+                    Text("NEXT: Generate lifted C from your own EXE privately, port the guest boot process, then connect the macOS D3D9-to-Metal implementation to iOS. This IPA includes the shared memory core, but no lifted game code or game assets.")
                         .font(.footnote)
                         .foregroundStyle(.white.opacity(0.6))
                 }
