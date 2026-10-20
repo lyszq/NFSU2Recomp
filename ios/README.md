@@ -83,3 +83,27 @@ small verified function from the supported local EXE and connect real dispatch.
 Keep game-derived source, binaries and assets outside public Git and Actions
 artifacts. The desktop D3D9/Metal frontend still needs its AppKit lifecycle split
 before it can attach to the existing iOS MTKView.
+
+
+## Stage 4: real image loading and private lifted-function build
+
+On 20 October 2026 the user supplied a physical-device v0.3 PASS from iPadOS
+26.3 with 16 KiB host pages. This confirms the shared memory and CPU/stack smoke
+path on that iPad. It does not establish gameplay or the new image probe.
+
+Version 0.4 adds a bounded PE32/i386 loader (`runtime/guest_pe.c`). The app
+reauthenticates the saved EXE's size and SHA-256 on the runtime worker queue,
+then loads the actual headers and sections at the preferred guest addresses,
+zero-fills virtual tails and reports the entry address. It releases the test
+mapping afterward. No imports, relocations, TLS startup or entry execution are
+performed. Synthetic host fixtures test malformed inputs without game data.
+All native app probes share one serial queue to keep mapping ownership clear.
+Format reference: https://learn.microsoft.com/en-us/windows/win32/debug/pe-format
+
+`tools/ios_private/README.md` describes the separate private build. That flow
+lifts the authentic `sub_0048b1e0` already covered by upstream tests, compares
+native execution with 48 independent x86 reference cases, and builds version
+0.4.1 with that actual generated function linked into ARM64 code. The host-only
+Unicorn reference is not bundled into the app. Only the private IPA can run
+this function probe; the public IPA reports image loading only. Neither boots
+the engine or provides gameplay.

@@ -7,8 +7,10 @@ on:
       - 'ios/**'
       - 'runtime/cpu.h'
       - 'runtime/guest_memory.*'
+      - 'runtime/guest_pe.*'
       - 'runtime/mem.c'
       - 'tests/guest_memory*'
+      - 'tests/guest_pe*'
       - 'tests/run_guest_tests.sh'
       - '.github/workflows/ios-bootstrap.yml'
 
@@ -69,7 +71,7 @@ jobs:
           MAP="$RUNNER_TEMP/NFSU2DerivedData/Build/Intermediates.noindex/NFSU2iOS.build/Release-iphoneos/NFSU2iOS.build/NFSU2iOS-LinkMap-normal-arm64.txt"
           test -f "$MAP"
           sed '/^# Dead Stripped Symbols/,$d' "$MAP" > "$RUNNER_TEMP/live-symbols.txt"
-          for SYMBOL in guest_memory_init guest_memory_commit guest_memory_protect guest_memory_shutdown guest_memory_pointer nfs_cpu_flags_test; do
+          for SYMBOL in guest_memory_init guest_memory_commit guest_memory_protect guest_memory_shutdown guest_memory_pointer nfs_cpu_flags_test guest_pe_load nfs_guest_image_probe; do
             grep -E "[[:space:]]_$SYMBOL$" "$RUNNER_TEMP/live-symbols.txt" | tee -a "$RUNNER_TEMP/guest-tests.txt"
           done
           echo 'PASS | physical-device ARM64 binary links shared memory and CPU tests' | tee -a "$RUNNER_TEMP/guest-tests.txt"

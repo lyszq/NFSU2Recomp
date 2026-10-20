@@ -20,6 +20,7 @@ targets:
     sources:
       - path: NFSU2iOS
       - path: ../runtime/guest_memory.c
+      - path: ../runtime/guest_pe.c
       - path: tests/cpu_flags_test.c
     settings:
       base:
@@ -34,8 +35,8 @@ targets:
       path: NFSU2iOS/Info.plist
       properties:
         CFBundleDisplayName: NFSU2 iOS
-        CFBundleShortVersionString: '0.3.0'
-        CFBundleVersion: '3'
+        CFBundleShortVersionString: '0.4.0'
+        CFBundleVersion: '4'
         LSRequiresIPhoneOS: true
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true

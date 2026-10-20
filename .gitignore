@@ -25,3 +25,11 @@ __pycache__/
 
 # Eski surum arsivi (gen/ ve out/ turevleri; bkz. arsiv/v1/OKUBENI.txt)
 /arsiv/
+
+# Private iOS build outputs and confidential input (never public Git).
+/SPEED2.EXE
+/private-input/
+/ios/project-private.yml
+/ios/NFSU2iOS.xcodeproj/
+/ios/NFSU2iOS/Info.plist
+*.ipa

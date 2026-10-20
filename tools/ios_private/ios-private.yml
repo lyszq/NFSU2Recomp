@@ -1,0 +1,101 @@
+# TEMPLATE ONLY. Provision into a PRIVATE control repository, never public CI.
+name: Private native lifted-function IPA
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  private-ios:
+    if: github.event.repository.private == true
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_SHA: SOURCE_COMMIT_PLACEHOLDER
+    steps:
+      - name: Require private repository and pinned public source
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git clone --filter=blob:none --no-checkout https://github.com/lyszq/NFSU2Recomp.git "$RUNNER_TEMP/source"
+          cd "$RUNNER_TEMP/source"
+          git fetch --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Host tools and portable tests
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/private-python"
+          "$RUNNER_TEMP/private-python/bin/pip" install -r tools/ios_private/requirements.txt
+          bash tests/run_guest_tests.sh "$RUNNER_TEMP/guest-tests"
+          brew install xcodegen
+
+      - name: Download authenticated input and generate privately
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          gh release download private-input-v1 --repo "$GH_REPO" --pattern SPEED2.EXE --dir "$RUNNER_TEMP/private-input"
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/generate_probe.py --exe "$RUNNER_TEMP/private-input/SPEED2.EXE"
+
+      - name: Execute actual native lifted function against x86 oracle
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          clang -O2 -std=gnu11 -Wall -Wextra -Werror -Wno-unused-label \
+            -fno-strict-aliasing -pthread -DNFS_PRIVATE_PROBE=1 -Iruntime \
+            runtime/guest_memory.c runtime/guest_pe.c \
+            ios/NFSU2iOS/Native/GuestImageProbe.c tests/guest_image_cli.c \
+            gen/ios-private/lifted.c gen/ios-private/private_probe.c \
+            -o "$RUNNER_TEMP/private-lifted-test"
+          "$RUNNER_TEMP/private-lifted-test" "$RUNNER_TEMP/private-input/SPEED2.EXE" | tee "$RUNNER_TEMP/private-evidence.txt"
+
+      - name: Build native ARM64 private IPA
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/configure_project.py
+          cd ios
+          xcodegen generate --spec project-private.yml
+          xcodebuild -project NFSU2iOS.xcodeproj -scheme NFSU2iOS -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/PrivateDerivedData" CODE_SIGNING_ALLOWED=NO build
+
+      - name: Verify actual function linkage and package private IPA
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/PrivateDerivedData/Build/Products/Release-iphoneos/NFSU2iOS.app"
+          test "$(lipo -archs "$APP/NFSU2iOS")" = arm64
+          MAP="$RUNNER_TEMP/PrivateDerivedData/Build/Intermediates.noindex/NFSU2iOS.build/Release-iphoneos/NFSU2iOS.build/NFSU2iOS-LinkMap-normal-arm64.txt"
+          sed '/^# Dead Stripped Symbols/,$d' "$MAP" > "$RUNNER_TEMP/private-live-symbols.txt"
+          for SYMBOL in sub_0048b1e0 nfs_private_lifted_probe guest_pe_load; do
+            grep -E "[[:space:]]_$SYMBOL$" "$RUNNER_TEMP/private-live-symbols.txt" | tee -a "$RUNNER_TEMP/private-evidence.txt"
+          done
+          mkdir -p "$RUNNER_TEMP/private-ipa/Payload"
+          ditto "$APP" "$RUNNER_TEMP/private-ipa/Payload/NFSU2iOS.app"
+          (cd "$RUNNER_TEMP/private-ipa" && zip -qry "$RUNNER_TEMP/NFSU2iOS-private-unsigned.ipa" Payload)
+          cp gen/ios-private/manifest.json "$RUNNER_TEMP/private-provenance.json"
+          echo "Source commit: $SOURCE_SHA" >> "$RUNNER_TEMP/private-evidence.txt"
+
+      - name: Upload only to this private run
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSU2iOS-private-lifted-unsigned
+          path: |
+            ${{ runner.temp }}/NFSU2iOS-private-unsigned.ipa
+            ${{ runner.temp }}/private-provenance.json
+            ${{ runner.temp }}/private-evidence.txt
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Remove runner-local confidential inputs and generated C
+        if: always()
+        working-directory: ${{ runner.temp }}
+        run: |
+          rm -f "$RUNNER_TEMP/private-input/SPEED2.EXE"
+          rm -f "$RUNNER_TEMP/source/gen/ios-private/lifted.c" "$RUNNER_TEMP/source/gen/ios-private/private_probe.c"

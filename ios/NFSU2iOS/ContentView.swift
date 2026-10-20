@@ -10,7 +10,7 @@ struct ContentView: View {
     @State private var smokeOutput = "Not run yet. Tap RUN CPU + MEMORY TEST."
 
     private func startSmokeTest() {
-        guard !smokeRunning else { return }
+        guard !smokeRunning, !files.probeRunning else { return }
         smokeRunning = true
         smokePassed = false
         smokeOutput = "Running native CPU and virtual-memory tests…"
@@ -18,7 +18,7 @@ struct ContentView: View {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
         let device = "iOS \(version) | \(UIDevice.current.model) \(UIDevice.current.systemName) \(UIDevice.current.systemVersion)"
         // Reserving a large virtual address range is not work for the UI thread.
-        DispatchQueue.global(qos: .userInitiated).async {
+        GameFileState.runtimeQueue.async {
             var buffer = [CChar](repeating: 0, count: 1024)
             let result = buffer.withUnsafeMutableBufferPointer { ptr in
                 nfs_guest_smoke_run(ptr.baseAddress, ptr.count)
@@ -45,7 +45,7 @@ struct ContentView: View {
                             .foregroundStyle(.white)
                     }
 
-                    Text("APPLE SILICON · STAGE 3: SHARED MEMORY")
+                    Text("APPLE SILICON · STAGE 4: REAL PE IMAGE")
                         .font(.system(.caption, design: .monospaced, weight: .semibold))
                         .tracking(1.1)
                         .foregroundStyle(.mint)
@@ -87,7 +87,7 @@ struct ContentView: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .tint(.mint)
-                        .disabled(smokeRunning)
+                        .disabled(smokeRunning || files.probeRunning)
 
                         HStack(alignment: .top, spacing: 8) {
                             Image(systemName: smokeRunning ? "hourglass" :
@@ -99,7 +99,7 @@ struct ContentView: View {
                         .font(.system(.footnote, design: .monospaced))
 
                         if !smokeRunning {
-                            ShareLink(item: "NFSU2 iOS 0.3 (shared memory core)\n" + smokeOutput) {
+                            ShareLink(item: smokeOutput) {
                                 Label("Share test diagnostic", systemImage: "square.and.arrow.up")
                             }
                             .font(.footnote)
@@ -124,6 +124,7 @@ struct ContentView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.mint)
+                    .disabled(smokeRunning || files.probeRunning)
 
                     VStack(alignment: .leading, spacing: 7) {
                         Text("GAME BUILD CHECK")
@@ -137,6 +138,31 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(14)
                     .background(.white.opacity(0.065), in: RoundedRectangle(cornerRadius: 12))
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Button(action: files.runImageProbe) {
+                            Label(files.probeRunning ? "Loading image�" : "LOAD VERIFIED GAME IMAGE",
+                                  systemImage: "memorychip")
+                                .frame(maxWidth: .infinity)
+                                .padding(10)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.mint)
+                        .disabled(!files.isVerified || files.probeRunning || smokeRunning)
+                        Text(files.probeOutput)
+                            .font(.system(.footnote, design: .monospaced))
+                            .foregroundStyle(files.probePassed ? .mint : .white)
+                            .textSelection(.enabled)
+                        if !files.probeRunning {
+                            ShareLink(item: files.probeOutput) {
+                                Label("Share image diagnostic", systemImage: "square.and.arrow.up")
+                            }
+                            .font(.footnote)
+                            .tint(.mint)
+                        }
+                    }
+                    .padding(14)
+                    .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
 
                     Text("NEXT: Generate lifted C from your own EXE privately, port the guest boot process, then connect the macOS D3D9-to-Metal implementation to iOS. This IPA includes the shared memory core, but no lifted game code or game assets.")
                         .font(.footnote)

@@ -1,0 +1,60 @@
+# Private iOS native function build
+
+This template is deliberately outside `.github/workflows`. The public workflow
+builds only infrastructure and synthetic tests; it never receives the game EXE
+or generates game-derived C. Keep the separate build repository private.
+
+The first real function is the existing upstream `sub_0048b1e0` test target.
+It is a seven-instruction cdecl leaf with a caller-clean stack and a deterministic
+32-bit result. The generator authenticates the exact supported EXE, lifts that
+function using the existing `tools/lift.py`, and builds 48 reference vectors by
+running its original x86 instructions in Unicorn **on the build host**. Native
+C then must match all general registers, defined arithmetic flags, DF, return
+address and stack bytes. Unicorn and x86 machine code are not bundled into iOS.
+There is no dummy implementation if private generation fails.
+
+## Provision on Windows
+
+Requires Python 3 and the user's existing GitHub sign-in through Git Credential
+Manager. No token is printed, saved to a file, or put into a command argument.
+First commit/push the infrastructure on the existing public feature branch.
+From the source repository, run:
+
+```powershell
+python tools/ios_private/provision.py --create --exe "C:\path\to\SPEED2.EXE" --dispatch
+```
+
+The script creates `lyszq/NFSU2Recomp-ios-private`, verifies its private visibility
+and purpose marker, and pins the workflow to the exact pushed source commit.
+Only the workflow and a README are committed in the control repository.
+The authenticated EXE is uploaded as a **private release asset**, not into Git.
+An existing asset is reused only with the exact matching SHA-256 digest.
+The source repository's `gen/` and `out/` directories remain ignored.
+
+The private workflow rechecks visibility before fetching the input. It generates
+on a temporary macOS runner, runs the native function harness twice, builds a
+native ARM64 iOS 0.4.1 IPA, and checks that both the actual `sub_0048b1e0` symbol
+and its harness are live in the link map. Its seven-day private artifact contains
+only the unsigned IPA, hash/provenance metadata and test diagnostics; no raw EXE
+or generated C source is uploaded as an artifact. Temporary input and generated
+source are removed during cleanup. The private release input remains available
+for repeat builds until the owner deletes it.
+
+To update the pinned source and rerun without reuploading the EXE:
+
+```powershell
+python tools/ios_private/provision.py --dispatch
+```
+
+## Device check
+
+Sign the private 0.4.1 IPA with the existing identity and upgrade the app without
+deleting it. The bundle ID and verified-EXE save location stay the same. Run
+**LOAD VERIFIED GAME IMAGE**; the private build maps the actual authenticated
+image, executes the statically recompiled leaf against all 48 reference cases,
+and releases the temporary runtime mapping. Share the full diagnostic.
+
+Native host success and a linked ARM64 binary are separate from an iPad PASS.
+This milestone executes one isolated actual game function. It does not invoke
+the game entry point, dispatch the complete engine, bind imports, or render a
+game scene. Full boot, renderer, audio and input integration remain future work.

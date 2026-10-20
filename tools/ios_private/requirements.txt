@@ -1,0 +1,5 @@
+# These packages run only on the build host, never inside the iOS app.
+capstone==5.0.7
+pefile==2024.8.26
+unicorn==2.1.4
+PyYAML==6.0.3
