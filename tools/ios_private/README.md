@@ -99,3 +99,16 @@ together. CPU/memory tests remain separately available. Earlier 0.5.1 build
 instructions above describe that historical boundary, not the latest probe.
 The current missing API is InitializeCriticalSection. Gameplay, renderer,
 audio and input remain unimplemented. Device confirmation is still pending.
+
+
+## Native critical-section probe (0.7.1)
+
+Physical iPadOS 26.3 confirmation for both 0.6.1 tests was supplied on 20 October
+2026. The next build adds actual recursive native mutex-backed guest critical
+sections and frees those resources on every stop path. The authentic startup
+initializes 14 CRT locks, executes 1,115 original instructions and 82 calls,
+then stops before the unimplemented TlsAlloc import (18 implemented API calls).
+Independent x86 and native execution must match all trace/register/memory hashes
+and object counts. Version 0.7.1/build 11 is the new combined device probe;
+physical confirmation is pending. All earlier build-specific boundaries above
+are historical. Keep the private artifact and provenance private.

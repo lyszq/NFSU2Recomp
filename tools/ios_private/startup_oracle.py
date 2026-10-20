@@ -51,18 +51,35 @@ HEAP_HEADER_SIZE = 0x4000
 HEAP_GRANULE = 0x4000
 HEAP_MAX_COUNT = 4
 HEAP_SUPPORTED_FLAGS = 0x01
+CRITICAL_SECTION_SIZE = 24
+CRITICAL_SECTION_MAX_COUNT = 64
+CRITICAL_SECTION_MAX_RECURSION = 0x7FFFFFFF
+TEB_THREAD_ID_OFFSET = 0x24
 BOUNDARY_ARGUMENT_COUNTS = {
+    "TlsAlloc": 0,
     "HeapCreate": 3,
     "HeapAlloc": 3,
     "HeapFree": 3,
     "HeapSize": 3,
     "HeapDestroy": 1,
     "InitializeCriticalSection": 1,
+    "EnterCriticalSection": 1,
+    "TryEnterCriticalSection": 1,
+    "LeaveCriticalSection": 1,
+    "DeleteCriticalSection": 1,
+}
+CRITICAL_SECTION_IMPORTS = {
+    "InitializeCriticalSection",
+    "EnterCriticalSection",
+    "TryEnterCriticalSection",
+    "LeaveCriticalSection",
+    "DeleteCriticalSection",
 }
 SUPPORTED_IMPORTS = {
     ("kernel32.dll", "GetVersionExA"),
     ("kernel32.dll", "GetModuleHandleA"),
     ("kernel32.dll", "HeapCreate"),
+    *(("kernel32.dll", name) for name in CRITICAL_SECTION_IMPORTS),
 }
 ERROR_MOD_NOT_FOUND = 126
 
@@ -380,6 +397,195 @@ def _heap_create(engine: Any, registers: Any, unicorn_module: Any,
     return True
 
 
+def _critical_section_import(engine: Any, registers: Any, import_row: dict[str, Any],
+                             mapped_ranges: list[tuple[int, int]],
+                             state: dict[str, Any]) -> bool:
+    """Implement the bounded, single guest-thread critical-section contract.
+
+    The guest-visible 24-byte structure is authoritative and checked against
+    the oracle's ownership metadata on every operation. Contention cannot be
+    scheduled by this startup runner, so EnterCriticalSection stops explicitly
+    instead of reporting a successful or fabricated blocking operation.
+    """
+    name = import_row["name"]
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": name,
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+    }
+    state["api_calls"].append(api)
+
+    def stop_state(reason: str, pointer: int, **details: Any) -> bool:
+        api["outcome"] = "invalid_state"
+        api["state_error"] = reason
+        api.update(details)
+        state["status"] = "GUEST_STOP_API_STATE"
+        state["target"] = pointer & 0xFFFFFFFF
+        state["api_state_fault"] = {
+            "api": name,
+            "address": pointer & 0xFFFFFFFF,
+            "reason": reason,
+            **details,
+        }
+        return False
+
+    try:
+        if not _range_is_mapped(esp, 8, mapped_ranges):
+            raise _GuestPointerFault("read", esp, 8)
+        return_address = _read_u32(engine, esp)
+        pointer = _read_u32(engine, esp + 4)
+        api["return_address"] = return_address
+        api["argument"] = pointer
+        api["address"] = pointer
+
+        if not _range_is_mapped(pointer, CRITICAL_SECTION_SIZE, mapped_ranges):
+            raise _GuestPointerFault("read_write", pointer, CRITICAL_SECTION_SIZE)
+
+        sections: dict[int, dict[str, int]] = state["critical_sections"]
+        section = sections.get(pointer)
+        words = list(struct.unpack("<6I", engine.mem_read(pointer, CRITICAL_SECTION_SIZE)))
+
+        if name == "InitializeCriticalSection":
+            if section is not None:
+                return stop_state("critical_section_already_initialized", pointer)
+            if len(sections) >= CRITICAL_SECTION_MAX_COUNT:
+                return stop_state("critical_section_limit", pointer,
+                                  critical_section_count=len(sections))
+            for other_address in sections:
+                if pointer < other_address + CRITICAL_SECTION_SIZE and other_address < pointer + CRITICAL_SECTION_SIZE:
+                    return stop_state("critical_section_overlap", pointer,
+                                      other_address=other_address)
+            initial_words = [0, 0xFFFFFFFF, 0, 0, 0, 0]
+            engine.mem_write(pointer, struct.pack("<6I", *initial_words))
+            sections[pointer] = {
+                "lock_count": 0xFFFFFFFF,
+                "recursion_count": 0,
+                "owning_thread": 0,
+            }
+            api["outcome"] = "initialized"
+            api["critical_section"] = dict(sections[pointer])
+        else:
+            if section is None:
+                return stop_state("critical_section_not_initialized", pointer)
+            expected_words = [
+                0,
+                section["lock_count"],
+                section["recursion_count"],
+                section["owning_thread"],
+                0,
+                0,
+            ]
+            if words != expected_words:
+                return stop_state("critical_section_memory_mismatch", pointer,
+                                  expected_words=expected_words,
+                                  actual_words=words)
+
+            owner = section["owning_thread"]
+            recursion = section["recursion_count"]
+            lock_count = section["lock_count"]
+            if recursion == 0:
+                if owner != 0 or lock_count != 0xFFFFFFFF:
+                    return stop_state("invalid_unowned_critical_section", pointer,
+                                      owner=owner, recursion_count=recursion,
+                                      lock_count=lock_count)
+            elif owner == 0 or lock_count != recursion - 1:
+                return stop_state("invalid_owned_critical_section", pointer,
+                                  owner=owner, recursion_count=recursion,
+                                  lock_count=lock_count)
+
+            if name in ("EnterCriticalSection", "TryEnterCriticalSection"):
+                thread_id_address = TEB_BASE + TEB_THREAD_ID_OFFSET
+                if not _range_is_mapped(thread_id_address, 4, mapped_ranges):
+                    raise _GuestPointerFault("read", thread_id_address, 4)
+                thread_id = _read_u32(engine, thread_id_address)
+                if thread_id == 0:
+                    return stop_state("invalid_current_thread_id", pointer)
+                if owner not in (0, thread_id):
+                    if name == "TryEnterCriticalSection":
+                        api["outcome"] = "contended"
+                        api["result"] = 0
+                        api["critical_section"] = dict(section)
+                    else:
+                        return stop_state("critical_section_contention_unschedulable",
+                                          pointer, owner=owner, thread_id=thread_id,
+                                          recursion_count=recursion)
+                else:
+                    if recursion >= CRITICAL_SECTION_MAX_RECURSION:
+                        return stop_state("critical_section_recursion_overflow", pointer,
+                                          recursion_count=recursion)
+                    recursion += 1
+                    owner = thread_id
+                    lock_count = recursion - 1
+                    section.update(lock_count=lock_count,
+                                   recursion_count=recursion,
+                                   owning_thread=owner)
+                    _write_u32(engine, pointer + 4, lock_count)
+                    _write_u32(engine, pointer + 8, recursion)
+                    _write_u32(engine, pointer + 12, owner)
+                    api["outcome"] = "acquired"
+                    api["critical_section"] = dict(section)
+                    if name == "TryEnterCriticalSection":
+                        api["result"] = 1
+            elif name == "LeaveCriticalSection":
+                thread_id_address = TEB_BASE + TEB_THREAD_ID_OFFSET
+                if not _range_is_mapped(thread_id_address, 4, mapped_ranges):
+                    raise _GuestPointerFault("read", thread_id_address, 4)
+                thread_id = _read_u32(engine, thread_id_address)
+                if thread_id == 0:
+                    return stop_state("invalid_current_thread_id", pointer)
+                if owner != thread_id or recursion == 0:
+                    return stop_state("critical_section_leave_not_owned", pointer,
+                                      owner=owner, thread_id=thread_id,
+                                      recursion_count=recursion)
+                recursion -= 1
+                if recursion == 0:
+                    owner = 0
+                    lock_count = 0xFFFFFFFF
+                else:
+                    lock_count = recursion - 1
+                section.update(lock_count=lock_count,
+                               recursion_count=recursion,
+                               owning_thread=owner)
+                _write_u32(engine, pointer + 4, lock_count)
+                _write_u32(engine, pointer + 8, recursion)
+                _write_u32(engine, pointer + 12, owner)
+                api["outcome"] = "released"
+                api["critical_section"] = dict(section)
+            elif name == "DeleteCriticalSection":
+                if owner != 0 or recursion != 0 or lock_count != 0xFFFFFFFF:
+                    return stop_state("critical_section_delete_owned", pointer,
+                                      owner=owner, recursion_count=recursion,
+                                      lock_count=lock_count)
+                del sections[pointer]
+                engine.mem_write(pointer, bytes(CRITICAL_SECTION_SIZE))
+                api["outcome"] = "deleted"
+                api["critical_section"] = dict(section)
+
+        api["last_error_preserved"] = True
+        api["flags_preserved"] = True
+        if name == "TryEnterCriticalSection":
+            engine.reg_write(registers.UC_X86_REG_EAX, int(api["result"]))
+        # These are stdcall APIs with one pointer parameter. Void APIs leave
+        # EAX untouched; EFLAGS and TEB.LastError are never written here.
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        api["esp_after"] = (esp + 8) & 0xFFFFFFFF
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
 def _write_u32(engine: Any, address: int, value: int) -> None:
     engine.mem_write(address, struct.pack("<I", value & 0xFFFFFFFF))
 
@@ -624,6 +830,7 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "api_calls": [],
         "boundary_call": None,
         "heaps": {},
+        "critical_sections": {},
         "resume": False,
         "memory_fault": None,
     }
@@ -643,6 +850,14 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
                     _get_version_ex_a(engine, xr, row, mapped_ranges, state)
                 elif row["name"] == "GetModuleHandleA":
                     _get_module_handle_a(engine, xr, row, mapped_ranges, image_base, state)
+                elif row["name"] in CRITICAL_SECTION_IMPORTS:
+                    handled = _critical_section_import(engine, xr, row,
+                                                       mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
                 else:
                     handled = _heap_create(engine, xr, uc, row, mapped_ranges, state)
                     if handled or state["status"] is not None:
@@ -783,7 +998,11 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         begin = int(engine.reg_read(xr.UC_X86_REG_EIP)) & 0xFFFFFFFF
 
     if state["status"] != "GUEST_STOP_IMPORT":
-        raise RuntimeError(f"startup oracle stopped at {state.get('status')} target=0x{state.get('target', 0):08x}")
+        detail = state.get("api_state_fault", state.get("memory_fault"))
+        raise RuntimeError(
+            f"startup oracle stopped at {state.get('status')} "
+            f"target=0x{state.get('target', 0):08x} detail={detail!r}"
+        )
     boundary_import = state["import"]
     if (not state["api_calls"] or state["api_calls"][0]["name"] != "GetVersionExA" or
             state["api_calls"][0]["import_index"] != first_expected["index"]):
@@ -794,6 +1013,8 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         ("kernel32.dll", "GetModuleHandleA"),
     } or (boundary_key == ("kernel32.dll", "HeapCreate") and not state["boundary_call"]):
         raise RuntimeError("startup oracle stopped at a supported import instead of applying its contract")
+    if boundary_key[0] == "kernel32.dll" and boundary_key[1] in CRITICAL_SECTION_IMPORTS:
+        raise RuntimeError("startup oracle stopped at a supported critical-section import instead of applying its contract")
 
     # The guest runner's EIP is the last instruction reported by its step hook;
     # Unicorn's architectural EIP is the tagged import target after CALL.
@@ -809,6 +1030,10 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
     image_state = bytes(engine.mem_read(image_base, image_size))
     teb_state = bytes(engine.mem_read(TEB_BASE, TEB_SIZE))
     active_heaps = sorted(state["heaps"].values(), key=lambda heap: heap["slot"])
+    active_critical_sections = [
+        {"address": address, **dict(section)}
+        for address, section in sorted(state["critical_sections"].items())
+    ]
     heap_slots = []
     for slot in range(HEAP_MAX_COUNT):
         heap = state["heaps"].get(slot)
@@ -870,6 +1095,8 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "api_call_count": len(state["api_calls"]),
         "api_calls": state["api_calls"],
         "boundary_call": state["boundary_call"],
+        "critical_section_count": len(active_critical_sections),
+        "critical_sections": active_critical_sections,
         "state_heaps": heap_slots,
         "instructions": int(state["instructions"]),
         "calls": int(state["calls"]),

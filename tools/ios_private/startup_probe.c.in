@@ -23,6 +23,7 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     CPU context;
     CPU *c = &context;
     GuestExecutionResult result = {0};
+    GuestWindows windows={.image_base=image->image_base};
     int rc = guest_execution_bind_imports(image, nfs_startup_imports, nfs_startup_import_count);
     if (rc) goto failed;
     rc = guest_bootstrap_init(c, image);
@@ -30,7 +31,6 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     rc = guest_dispatch_init(&table, 0x00401000u, 0x00381af1u,
                              nfs_startup_addresses, nfs_startup_functions, nfs_startup_count);
     if (rc) goto failed;
-    GuestWindows windows={.image_base=image->image_base};
     GuestExecutionConfig config = {.dispatch=&table, .imports=nfs_startup_imports,
         .import_count=nfs_startup_import_count, .instruction_budget=100000u,
         .depth_limit=64u, .timeout_ns=UINT64_C(2000000000), .import_handler=guest_windows_import,
@@ -42,6 +42,7 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     if (result.stop != GUEST_STOP_IMPORT || result.target != @EXPECTED_TARGET@ ||
         result.ip != @EXPECTED_IP@ || result.instructions != @EXPECTED_STEPS@ ||
         result.imports_handled != @EXPECTED_APIS@ ||
+        guest_critical_count(&windows.critical) != @EXPECTED_CRITICALS@ ||
         result.calls != @EXPECTED_CALLS@ || result.maximum_depth != @EXPECTED_DEPTH@ ||
         c->eip != @EXPECTED_IP@ || c->fs_base != GUEST_TEB_BASE || c->gs_base != GUEST_TEB_BASE ||
         result.trace_hash != UINT64_C(@EXPECTED_TRACE@) ||
@@ -57,21 +58,28 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
             "FAIL | actual entry/reference mismatch | stop=%d ip=%08x target=%08x steps=%" PRIu64
             " trace=%016" PRIx64 " | no game boot",
             result.stop, result.ip, result.target, result.instructions, result.trace_hash);
-        guest_dispatch_destroy(&table);
-        return rc;
+        goto cleanup;
     }
     const GuestImport *import = &nfs_startup_imports[result.import_index];
     (void)snprintf(out, capacity,
         "VERIFIED ENTRY STOP | 0075bcc7 -> %08x | %s!%s not implemented | "
         "%" PRIu64 " instructions / %" PRIu64 " dispatch calls / %u registered functions | "
-        "%" PRIu64 " implemented API calls | x86 trace + GPR/EFLAGS + image/TEB/stack/heap match | "
+        "%" PRIu64 " implemented API calls / %u native critical sections | "
+        "x86 trace + GPR/EFLAGS + image/TEB/stack/heap match | "
         "leaf regression PASS | no JIT | no game boot",
         result.ip, import->library, import->name, result.instructions, result.calls, nfs_startup_count,
-        result.imports_handled);
-    guest_dispatch_destroy(&table);
-    return 0;
+        result.imports_handled,guest_critical_count(&windows.critical));
+    goto cleanup;
 failed:
-    guest_dispatch_destroy(&table);
     (void)snprintf(out, capacity, "FAIL | native entry setup/execution | error=%d", rc);
+cleanup:
+    guest_dispatch_destroy(&table);
+    {
+        int cleanup_rc=guest_windows_cleanup(&windows);
+        if (cleanup_rc) {
+            rc=cleanup_rc;
+            (void)snprintf(out, capacity, "FAIL | native host resource cleanup | error=%d", rc);
+        }
+    }
     return rc;
 }

@@ -52,8 +52,8 @@ def generate(exe):
                 "name": entry.name.decode("ascii") if entry.name else f"#{entry.ordinal}"}
                for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
     reference = run_startup_reference(exe, imports)
-    if (reference["import_name"] != "InitializeCriticalSection" or reference["instructions"] != 154
-            or reference["api_call_count"] != 4):
+    if (reference["import_name"] != "TlsAlloc" or reference["instructions"] != 1115
+            or reference["api_call_count"] != 18 or reference["critical_section_count"] != 14):
         raise ValueError("unexpected independent x86 entry boundary")
     # Prioritize the authentic observed startup path within the bounded static
     # graph. This changes generation order, never the guest instructions or API
@@ -118,6 +118,7 @@ def generate(exe):
                      "EXPECTED_IP": f"0x{reference['ip']:08x}u",
                      "EXPECTED_STEPS": str(reference["instructions"]),
                      "EXPECTED_APIS": str(reference["api_call_count"]),
+                     "EXPECTED_CRITICALS": str(reference["critical_section_count"]),
                      "EXPECTED_CALLS": str(reference["calls"]),
                      "EXPECTED_DEPTH": str(reference["maximum_depth"]),
                      "EXPECTED_TRACE": str(reference["trace_hash"]),
@@ -139,7 +140,7 @@ def generate(exe):
     manifest["startup"] = {"entry": f"{ENTRY:08x}", "generated_functions": len(addresses),
                             "unliftable_omitted": omitted, "frontier_remaining": len(queue),
                             "import_count": len(imports), "reference": reference,
-                            "semantics": "original x86 instructions with explicit XP/module/heap contracts; strict stop at unimplemented APIs"}
+                            "semantics": "original x86 instructions with explicit XP/module/heap/critical-section contracts; strict stop at unimplemented APIs"}
     for name in ["startup_lifted.c", "startup_probe.c"]:
         manifest[name + "_sha256"] = hashlib.sha256((output / name).read_bytes()).hexdigest()
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
