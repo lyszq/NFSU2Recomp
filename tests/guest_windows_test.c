@@ -71,6 +71,17 @@ static int tls_contract(void) {
     CHECK(guest_windows_import(&c,&api,NULL,&fault)==-1 && fault==UINT32_MAX);
     CHECK(!memcmp(&c,&expected,sizeof c));
     put(TEB+0x24,1);
+    api.name="SetHandleCount";
+    const uint32_t requested_counts[]={0,512,UINT32_MAX};
+    for (unsigned i=0;i<sizeof requested_counts/sizeof requested_counts[0];i++) {
+        c=setup(0); put(STACK+4,requested_counts[i]); eflags_set(&c,0xcd5u); expected=c;
+        CHECK(guest_windows_import(&c,&api,NULL,&fault)==1);
+        expected.eax=requested_counts[i]; expected.eip=0x401005; expected.esp+=8;
+        CHECK(!memcmp(&c,&expected,sizeof c) && get(TEB+0x34)==999);
+    }
+    c=setup(0); c.esp=UINT32_MAX-3; expected=c;
+    CHECK(guest_windows_import(&c,&api,NULL,&fault)==-1 && fault==c.esp);
+    CHECK(!memcmp(&c,&expected,sizeof c));
     return 0;
 }
 int main(void) {

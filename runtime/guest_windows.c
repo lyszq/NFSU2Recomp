@@ -1,11 +1,23 @@
 #include "guest_windows.h"
 #include "guest_memory.h"
+#include "guest_startup.h"
+#include "guest_error.h"
 #include <string.h>
 #include <strings.h>
 #include <errno.h>
 
 static uint32_t read32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static void write32(void *p, uint32_t v) { memcpy(p, &v, 4); }
+static int handle_count_import(CPU *c,const GuestImport *import,uint32_t *fault) {
+    if (strcmp(import->name,"SetHandleCount")) return 0;
+    const uint8_t *frame=guest_memory_pointer(c->esp,8,0);
+    if (!frame) { *fault=c->esp; return -1; }
+    uint32_t ret=read32(frame), requested=read32(frame+4);
+    /* Documented NT compatibility no-op; acknowledges the request without
+     * creating handles, changing any limit, or claiming a file exists. */
+    c->eax=requested; c->eip=ret; c->esp+=8u;
+    return 1;
+}
 static int identity_import(CPU *c,const GuestImport *import,uint32_t *fault) {
     if (strcmp(import->name,"GetCurrentThreadId")) return 0;
     const void *stack=guest_memory_pointer(c->esp,4,0);
@@ -123,7 +135,13 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
     int module = !strcmp(import->name, "GetModuleHandleA");
     if (strcasecmp(import->library, "KERNEL32.dll")) return 0;
     if (!version && !module) {
-        int handled=identity_import(c,import,fault);
+        int handled=guest_startup_import(c,import,fault);
+        if (handled) return handled;
+        handled=guest_error_import(c,import,fault);
+        if (handled) return handled;
+        handled=handle_count_import(c,import,fault);
+        if (handled) return handled;
+        handled=identity_import(c,import,fault);
         if (handled) return handled;
         handled=tls_import(c,import,context,fault);
         if (handled) return handled;
