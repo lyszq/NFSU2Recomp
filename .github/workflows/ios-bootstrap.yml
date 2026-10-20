@@ -1,0 +1,62 @@
+name: iOS bootstrap (unsigned IPA)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/ios-bootstrap.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios:
+    name: Compile UIKit/Metal bootstrap
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+
+      - name: Toolchain diagnostics
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate --spec project.yml
+
+      - name: Compile for physical iPhone and iPad (no signing)
+        working-directory: ios
+        run: |
+          xcodebuild \
+            -project NFSU2iOS.xcodeproj \
+            -scheme NFSU2iOS \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/NFSU2DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package unsigned bootstrap IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/NFSU2DerivedData/Build/Products/Release-iphoneos/NFSU2iOS.app"
+          test -d "$APP"
+          mkdir -p "$RUNNER_TEMP/nfsu2-ipa/Payload"
+          ditto "$APP" "$RUNNER_TEMP/nfsu2-ipa/Payload/NFSU2iOS.app"
+          (cd "$RUNNER_TEMP/nfsu2-ipa" && zip -qry "$GITHUB_WORKSPACE/NFSU2iOS-bootstrap-unsigned.ipa" Payload)
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSU2iOS-bootstrap-unsigned
+          path: NFSU2iOS-bootstrap-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
