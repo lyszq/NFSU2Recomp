@@ -3,6 +3,7 @@
 #include "guest_execution.h"
 #include "guest_heap.h"
 #include "guest_critical.h"
+#include "guest_tls.h"
 /* Explicit guest Windows XP compatibility policy, independent of the host OS.
  * Only implemented contracts are serviced. No unknown API success fallback.
  * Caller supplies the bootstrap TEB and serializes the guest thread/heap state.
@@ -13,6 +14,7 @@ typedef struct GuestWindows {
     uint32_t image_base;
     GuestHeapSet heaps;
     GuestCriticalSet critical;
+    GuestTLSSet tls;
 } GuestWindows;
 int guest_windows_import(CPU *cpu, const GuestImport *import, void *context,
                          uint32_t *fault);

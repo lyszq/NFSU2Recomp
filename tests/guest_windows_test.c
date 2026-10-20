@@ -20,9 +20,51 @@ static void caller(CPU *c) {
     guest_execution_call(c,GUEST_IMPORT_BASE);
     guest_execution_step(c,0x401005u);
 }
+static int tls_contract(void) {
+    GuestWindows windows={0}; uint32_t fault=0;
+    GuestImport api={0,"KERNEL32.dll","TlsAlloc"};
+    put(TEB+0x24,1); put(TEB+0x2c,0x12345678u);
+    CPU c=setup(0), expected=c;
+    eflags_set(&c,0xcd5u); expected=c;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1 && c.eax==0);
+    expected.eax=0; expected.esp+=4; expected.eip=0x401005;
+    CHECK(!memcmp(&c,&expected,sizeof c) && get(TEB+0x34)==999);
+    CHECK(guest_tls_count(&windows.tls)==1 && get(TEB+0x2c)==0x12345678u);
+    api.name="TlsSetValue"; c=setup(0); put(STACK+4,0); put(STACK+8,UINT32_MAX);
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1 && c.eax==1 && c.esp==STACK+12);
+    CHECK(get(TEB+GUEST_TLS_OFFSET)==UINT32_MAX && get(TEB+0x34)==999);
+    api.name="TlsGetValue"; c=setup(0); put(STACK+4,0);
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1 && c.eax==UINT32_MAX && c.esp==STACK+8);
+    CHECK(!get(TEB+0x34));
+    put(TEB+GUEST_TLS_OFFSET,0); c=setup(0); put(STACK+4,0);
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1 && !c.eax && !get(TEB+0x34));
+    c=setup(0); put(STACK+4,64); expected=c; GuestTLSSet snapshot=windows.tls;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==-2 && !memcmp(&c,&expected,sizeof c));
+    CHECK(!memcmp(&snapshot,&windows.tls,sizeof snapshot) && get(TEB+0x34)==999);
+    api.name="TlsAlloc";
+    for (unsigned i=1;i<64;i++) {
+        c=setup(0); CHECK(guest_windows_import(&c,&api,&windows,&fault)==1 && c.eax==i);
+    }
+    c=setup(0); snapshot=windows.tls;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1 && c.eax==UINT32_MAX && get(TEB+0x34)==8);
+    CHECK(!memcmp(&snapshot,&windows.tls,sizeof snapshot));
+    api.name="TlsFree"; c=setup(0); put(STACK+4,0);
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1 && c.eax==1 && get(TEB+0x34)==999);
+    api.name="TlsAlloc"; c=setup(0);
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1 && !c.eax && !get(TEB+GUEST_TLS_OFFSET));
+    api.name="TlsSetValue"; c=setup(0); c.esp=UINT32_MAX-3u; expected=c; snapshot=windows.tls;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==-1 && !memcmp(&c,&expected,sizeof c));
+    CHECK(!memcmp(&snapshot,&windows.tls,sizeof snapshot));
+    c=setup(0); c.fs_base=UINT32_MAX-0x10u; expected=c;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==-1 && fault==UINT32_MAX);
+    CHECK(!memcmp(&c,&expected,sizeof c) && !memcmp(&snapshot,&windows.tls,sizeof snapshot));
+    CHECK(!guest_windows_cleanup(&windows) && !guest_tls_count(&windows.tls));
+    return 0;
+}
 int main(void) {
     CHECK(!guest_memory_init());
     CHECK(!guest_memory_commit(STACK,0x30000));
+    CHECK(!tls_contract());
     GuestImport api={0,"KeRnEl32.DlL","GetVersionExA"}; uint32_t fault=0;
     GuestWindows windows={.image_base=0x400000u};
     for (uint32_t size=148; size<=156; size+=8) {
@@ -175,6 +217,6 @@ int main(void) {
     CHECK(!guest_windows_cleanup(&windows) && !guest_critical_count(&windows.critical));
     CHECK(!guest_windows_cleanup(&windows));
     guest_dispatch_destroy(&table); CHECK(!guest_memory_shutdown());
-    puts("PASS | Windows compatibility bridge | version/module/heap/critical contracts + stdcall + LastError + strict faults/unknown APIs + stop cleanup");
+    puts("PASS | Windows compatibility bridge | version/module/heap/critical/TLS contracts + stdcall + LastError + strict faults/unknown APIs + stop cleanup");
     return 0;
 }

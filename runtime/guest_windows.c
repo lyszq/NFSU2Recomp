@@ -6,6 +6,31 @@
 
 static uint32_t read32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static void write32(void *p, uint32_t v) { memcpy(p, &v, 4); }
+static int tls_import(CPU *c,const GuestImport *import,GuestWindows *windows,uint32_t *fault) {
+    GuestTLSOperation op; unsigned nargs;
+    if (!strcmp(import->name,"TlsAlloc")) { op=GUEST_TLS_ALLOC; nargs=0; }
+    else if (!strcmp(import->name,"TlsFree")) { op=GUEST_TLS_FREE; nargs=1; }
+    else if (!strcmp(import->name,"TlsGetValue")) { op=GUEST_TLS_GET; nargs=1; }
+    else if (!strcmp(import->name,"TlsSetValue")) { op=GUEST_TLS_SET; nargs=2; }
+    else return 0;
+    if (!windows) return 0;
+    const uint8_t *stack=guest_memory_pointer(c->esp,4u*(nargs+1),0);
+    if (!stack) { *fault=c->esp; return -1; }
+    uint32_t ret=read32(stack), index=nargs ? read32(stack+4) : 0;
+    uint32_t value=nargs==2 ? read32(stack+8) : 0, result=0;
+    /* GET clears LastError; preflight potential exhaustion reporting for all
+     * calls before touching the TLS model. Success otherwise preserves it. */
+    uint64_t error_at=(uint64_t)c->fs_base+0x34u;
+    void *error=error_at<=UINT32_MAX ? guest_memory_pointer((uint32_t)error_at,4,1) : NULL;
+    if (!error) { *fault=error_at>UINT32_MAX ? UINT32_MAX : (uint32_t)error_at; return -1; }
+    int rc=guest_tls_apply(&windows->tls,c->fs_base,op,index,value,&result,fault);
+    if (rc==ENOSPC && op==GUEST_TLS_ALLOC) {
+        result=UINT32_MAX; write32(error,8); /* Explicit bounded-resource policy. */
+    } else if (rc) return rc==EFAULT ? -1 : -2;
+    else if (op==GUEST_TLS_GET) write32(error,0);
+    c->eax=result; c->eip=ret; c->esp+=4u*(nargs+1);
+    return 1;
+}
 static int critical_import(CPU *c, const GuestImport *import, GuestWindows *windows, uint32_t *fault) {
     int initialize=!strcmp(import->name,"InitializeCriticalSection");
     int enter=!strcmp(import->name,"EnterCriticalSection");
@@ -85,7 +110,9 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
     int module = !strcmp(import->name, "GetModuleHandleA");
     if (strcasecmp(import->library, "KERNEL32.dll")) return 0;
     if (!version && !module) {
-        int handled=critical_import(c,import,context,fault);
+        int handled=tls_import(c,import,context,fault);
+        if (handled) return handled;
+        handled=critical_import(c,import,context,fault);
         return handled ? handled : heap_import(c,import,context,fault);
     }
     if (module && !context) return 0;
@@ -149,5 +176,8 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
     return 1;
 }
 int guest_windows_cleanup(GuestWindows *windows) {
-    return windows ? guest_critical_cleanup(&windows->critical) : EINVAL;
+    if (!windows) return EINVAL;
+    int rc=guest_critical_cleanup(&windows->critical);
+    if (!rc) guest_tls_cleanup(&windows->tls);
+    return rc;
 }
