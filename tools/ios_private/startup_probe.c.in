@@ -28,6 +28,8 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     if (rc) goto failed;
     rc = guest_bootstrap_init(c, image);
     if (rc) goto failed;
+    rc = guest_process_init(&windows.process, image);
+    if (rc) goto failed;
     rc = guest_dispatch_init(&table, 0x00401000u, 0x00381af1u,
                              nfs_startup_addresses, nfs_startup_functions, nfs_startup_count);
     if (rc) goto failed;
@@ -66,6 +68,8 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         guest_critical_count(&windows.critical) != @EXPECTED_CRITICALS@ ||
         guest_tls_count(&windows.tls) != @EXPECTED_TLS@ ||
         windows.tls.count != @EXPECTED_TLS_THREADS@ || !metadata_match ||
+        windows.process.environment_a_refs != @EXPECTED_ENV_A_REFS@ ||
+        windows.process.environment_w_refs != @EXPECTED_ENV_W_REFS@ ||
         result.calls != @EXPECTED_CALLS@ || result.maximum_depth != @EXPECTED_DEPTH@ ||
         c->eip != @EXPECTED_IP@ || c->fs_base != GUEST_TEB_BASE || c->gs_base != GUEST_TEB_BASE ||
         result.trace_hash != UINT64_C(@EXPECTED_TRACE@) ||
@@ -75,7 +79,9 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         memory_hash(g_mem + GUEST_TEB_BASE, 0x20000u) != UINT64_C(@EXPECTED_TEB_HASH@) ||
         !guest_memory_pointer(@HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@, 0) ||
         memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@) != UINT64_C(@EXPECTED_HEAP_HASH@) ||
-        memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) != UINT64_C(@EXPECTED_STACK_HASH@)) {
+        memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) != UINT64_C(@EXPECTED_STACK_HASH@) ||
+        !guest_memory_pointer(@PROCESS_WINDOW_ADDRESS@, @PROCESS_WINDOW_SIZE@, 0) ||
+        memory_hash(g_mem + @PROCESS_WINDOW_ADDRESS@, @PROCESS_WINDOW_SIZE@) != UINT64_C(@EXPECTED_PROCESS_HASH@)) {
         rc = EINVAL;
         (void)snprintf(out, capacity,
             "FAIL | actual entry/reference mismatch | stop=%d ip=%08x target=%08x steps=%" PRIu64
@@ -88,7 +94,7 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         "VERIFIED ENTRY STOP | 0075bcc7 -> %08x | %s!%s not implemented | "
         "%" PRIu64 " instructions / %" PRIu64 " dispatch calls / %u registered functions | "
         "%" PRIu64 " implemented API calls / %u native critical sections / %u TLS keys | "
-        "x86 trace + GPR/EFLAGS + image/TEB/stack/heap match | "
+        "x86 trace + GPR/EFLAGS + image/TEB/stack/heap/process match | "
         "leaf regression PASS | no JIT | no game boot",
         result.ip, import->library, import->name, result.instructions, result.calls, nfs_startup_count,
         result.imports_handled,guest_critical_count(&windows.critical),guest_tls_count(&windows.tls));

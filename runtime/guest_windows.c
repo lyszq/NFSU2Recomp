@@ -2,6 +2,8 @@
 #include "guest_memory.h"
 #include "guest_startup.h"
 #include "guest_error.h"
+#include "guest_stdio.h"
+#include "guest_process.h"
 #include <string.h>
 #include <strings.h>
 #include <errno.h>
@@ -139,9 +141,13 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
         if (handled) return handled;
         handled=guest_error_import(c,import,fault);
         if (handled) return handled;
+        handled=guest_stdio_import(c,import,fault);
+        if (handled) return handled;
         handled=handle_count_import(c,import,fault);
         if (handled) return handled;
         handled=identity_import(c,import,fault);
+        if (handled) return handled;
+        handled=guest_process_import(c,import,context ? &((GuestWindows *)context)->process : NULL,fault);
         if (handled) return handled;
         handled=tls_import(c,import,context,fault);
         if (handled) return handled;
@@ -210,6 +216,7 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
 }
 int guest_windows_cleanup(GuestWindows *windows) {
     if (!windows) return EINVAL;
+    guest_process_cleanup(&windows->process);
     int rc=guest_critical_cleanup(&windows->critical);
     if (!rc) guest_tls_cleanup(&windows->tls);
     return rc;

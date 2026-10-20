@@ -44,6 +44,7 @@ STACK_WINDOW_SIZE = 0x2000
 LAST_ERROR_OFFSET = 0x34
 ERROR_INSUFFICIENT_BUFFER = 122
 ERROR_INVALID_PARAMETER = 87
+ERROR_INVALID_HANDLE = 6
 ERROR_NOT_ENOUGH_MEMORY = 8
 HEAP_BASE = 0x20000000
 HEAP_ARENA_SIZE = 0x04000000
@@ -62,7 +63,37 @@ TLS_SLOT_COUNT = 64
 TLS_SLOT_BYTES = TLS_SLOT_COUNT * 4
 TLS_MAX_THREAD_COUNT = 64
 TLS_IMPORTS = {"TlsAlloc", "TlsFree", "TlsGetValue", "TlsSetValue"}
+PROCESS_BASE = 0x00C20000
+PROCESS_RESERVED_SIZE = 0x10000
+PROCESS_COMMITTED_SIZE = 0x4000
+PROCESS_COMMAND_LINE = r"C:\NFSU2\SPEED2.EXE"
+PROCESS_COMMAND_LINE_BYTES = PROCESS_COMMAND_LINE.encode("ascii") + b"\0"
+PROCESS_ENV_A_BASE = PROCESS_BASE + 0x1000
+PROCESS_ENV_W_BASE = PROCESS_BASE + 0x2000
+PROCESS_ENV_LEASE_CAP = 32
+PROCESS_PROFILE = "nfsu2_headless_xp"
+PROCESS_CODE_PAGES = {"GetACP": 1252, "GetOEMCP": 437}
+PROCESS_ENVIRONMENT_GETTERS = {"GetEnvironmentStrings", "GetEnvironmentStringsW"}
+PROCESS_ENVIRONMENT_FREES = {"FreeEnvironmentStringsA", "FreeEnvironmentStringsW"}
+PROCESS_IMPORTS = PROCESS_ENVIRONMENT_GETTERS | PROCESS_ENVIRONMENT_FREES
+STARTUPINFOA_SIZE = 68
+STD_INPUT_HANDLE = 0xFFFFFFF6
+STD_OUTPUT_HANDLE = 0xFFFFFFF5
+STD_ERROR_HANDLE = 0xFFFFFFF4
+STD_HANDLE_SELECTORS = frozenset((STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+                                  STD_ERROR_HANDLE))
 BOUNDARY_ARGUMENT_COUNTS = {
+    "GetStartupInfoA": 1,
+    "GetStdHandle": 1,
+    "GetFileType": 1,
+    "SetHandleCount": 1,
+    "GetCommandLineA": 0,
+    "GetEnvironmentStrings": 0,
+    "GetEnvironmentStringsW": 0,
+    "FreeEnvironmentStringsA": 1,
+    "FreeEnvironmentStringsW": 1,
+    "GetACP": 0,
+    "GetOEMCP": 0,
     "GetCurrentThreadId": 0,
     "TlsAlloc": 0,
     "TlsFree": 1,
@@ -89,6 +120,14 @@ CRITICAL_SECTION_IMPORTS = {
 SUPPORTED_IMPORTS = {
     ("kernel32.dll", "GetVersionExA"),
     ("kernel32.dll", "GetModuleHandleA"),
+    ("kernel32.dll", "GetStartupInfoA"),
+    ("kernel32.dll", "GetStdHandle"),
+    ("kernel32.dll", "GetFileType"),
+    ("kernel32.dll", "SetHandleCount"),
+    ("kernel32.dll", "GetCommandLineA"),
+    *(('kernel32.dll', name) for name in PROCESS_IMPORTS),
+    ("kernel32.dll", "GetACP"),
+    ("kernel32.dll", "GetOEMCP"),
     ("kernel32.dll", "GetCurrentThreadId"),
     ("kernel32.dll", "HeapCreate"),
     ("kernel32.dll", "HeapAlloc"),
@@ -103,6 +142,50 @@ def _fnv1a64(data: bytes | bytearray | memoryview) -> int:
     for byte in memoryview(data).cast("B"):
         value = ((value ^ byte) * FNV64_PRIME) & FNV64_MASK
     return value
+
+
+def _initialize_process_arena(engine: Any, image_base: int,
+                              image_size: int, unicorn_module: Any) -> dict[str, Any]:
+    """Commit and populate the canonical guest process configuration region."""
+    if (image_size <= 0 or image_base < 0 or image_base > 0xFFFFFFFF or
+            image_size > 0x100000000 - image_base):
+        raise ValueError("guest image range is empty or outside PE32 address space")
+    image_end = image_base + image_size
+    process_end = PROCESS_BASE + PROCESS_RESERVED_SIZE
+    if image_base < process_end and PROCESS_BASE < image_end:
+        raise ValueError("guest image overlaps the reserved process arena")
+
+    for region_start, region_end, _permissions in engine.mem_regions():
+        region_end += 1
+        if region_start < process_end and PROCESS_BASE < region_end:
+            raise ValueError("process arena overlaps an existing accessible VM region")
+
+    committed = bytearray(PROCESS_COMMITTED_SIZE)
+    committed[:len(PROCESS_COMMAND_LINE_BYTES)] = PROCESS_COMMAND_LINE_BYTES
+    env_a_offset = PROCESS_ENV_A_BASE - PROCESS_BASE
+    committed[env_a_offset:env_a_offset + 2] = b"\0\0"
+    env_w_offset = PROCESS_ENV_W_BASE - PROCESS_BASE
+    committed[env_w_offset:env_w_offset + 4] = b"\0\0\0\0"
+
+    permissions = unicorn_module.UC_PROT_READ | unicorn_module.UC_PROT_WRITE
+    engine.mem_map(PROCESS_BASE, PROCESS_COMMITTED_SIZE, permissions)
+    engine.mem_write(PROCESS_BASE, bytes(committed))
+    return {
+        "initialized": 1,
+        "base": PROCESS_BASE,
+        "reserved_size": PROCESS_RESERVED_SIZE,
+        "committed_size": PROCESS_COMMITTED_SIZE,
+        "profile": PROCESS_PROFILE,
+        "command_line": PROCESS_COMMAND_LINE,
+        "command_line_address": PROCESS_BASE,
+        "command_line_size": len(PROCESS_COMMAND_LINE_BYTES),
+        "environment_a_address": PROCESS_ENV_A_BASE,
+        "environment_a_size": 2,
+        "environment_w_address": PROCESS_ENV_W_BASE,
+        "environment_w_size": 4,
+        "environment_a_refs": 0,
+        "environment_w_refs": 0,
+    }
 
 
 def _read_u32(engine: Any, address: int) -> int:
@@ -366,6 +449,436 @@ def _get_current_thread_id(engine: Any, registers: Any, unicorn_module: Any,
         state["target"] = int(address) & 0xFFFFFFFF
         state["memory_fault"] = dict(api["fault"])
         return False
+
+
+def _get_startup_info_a(engine: Any, registers: Any, unicorn_module: Any,
+                        import_row: dict[str, Any],
+                        mapped_ranges: list[tuple[int, int]],
+                        state: dict[str, Any]) -> bool:
+    """Return the configured zeroed GUI/headless guest STARTUPINFOA value.
+
+    This process policy deliberately does not copy host startup state. The
+    caller's buffer is validated in full before any guest memory or CPU state
+    is changed, and the return address is captured before writing so the
+    output may alias the x86 call frame.
+    """
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api: dict[str, Any] = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 1,
+        "policy": "zeroed_gui_headless_xp",
+    }
+    state["api_calls"].append(api)
+
+    def read_fault(address: int, size: int) -> None:
+        if not _range_has_permissions(engine, address, size,
+                                      unicorn_module.UC_PROT_READ, mapped_ranges):
+            raise _GuestPointerFault("read", address & 0xFFFFFFFF, size)
+
+    def write_fault(address: int, size: int) -> None:
+        if (address == 0 or
+                not _range_has_permissions(engine, address, size,
+                                           unicorn_module.UC_PROT_WRITE,
+                                           mapped_ranges)):
+            raise _GuestPointerFault("write", address & 0xFFFFFFFF, size)
+
+    try:
+        read_fault(esp, 8)
+        return_address = _read_u32(engine, esp)
+        output = _read_u32(engine, esp + 4)
+        api.update(return_address=return_address, argument=output,
+                   arguments=[output], output_size=STARTUPINFOA_SIZE)
+
+        # Windows defines cb as the structure size. The guest policy uses a
+        # fixed zeroed startup record with cb set and dwFlags left at zero;
+        # it does not inherit real host handles, coordinates, or flags.
+        write_fault(output, STARTUPINFOA_SIZE)
+        startup_info = bytearray(STARTUPINFOA_SIZE)
+        struct.pack_into("<I", startup_info, 0, STARTUPINFOA_SIZE)
+        engine.mem_write(output, bytes(startup_info))
+
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        api.update(outcome="success", result=None, dw_flags=0,
+                   last_error_policy="preserved",
+                   esp_after=(esp + 8) & 0xFFFFFFFF)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": size}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
+def _get_std_handle(engine: Any, registers: Any, unicorn_module: Any,
+                    import_row: dict[str, Any],
+                    mapped_ranges: list[tuple[int, int]],
+                    state: dict[str, Any]) -> bool:
+    """Return NULL for the three standard streams in the headless guest.
+
+    This process has no console and no inherited or redirected standard
+    handles. Unknown selectors remain unsupported and do not fabricate an
+    API result or LastError value.
+    """
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    try:
+        if not _range_has_permissions(engine, esp, 8,
+                                      unicorn_module.UC_PROT_READ,
+                                      mapped_ranges):
+            raise _GuestPointerFault("read", esp, 8)
+        return_address = _read_u32(engine, esp)
+        selector = _read_u32(engine, esp + 4)
+        if selector not in STD_HANDLE_SELECTORS:
+            return False
+
+        stream = {
+            STD_INPUT_HANDLE: "stdin",
+            STD_OUTPUT_HANDLE: "stdout",
+            STD_ERROR_HANDLE: "stderr",
+        }[selector]
+        state["api_calls"].append({
+            "library": import_row["library"],
+            "name": import_row["name"],
+            "import_index": import_row["index"],
+            "tag": IMPORT_BASE + import_row["index"],
+            "call_ip": state["last_ip"],
+            "esp_before": esp,
+            "argument_count": 1,
+            "return_address": return_address,
+            "argument": selector,
+            "arguments": [selector],
+            "stream": stream,
+            "policy": "no_console_no_inherited_handles",
+            "outcome": "success",
+            "result": 0,
+            "last_error_policy": "preserved",
+            "esp_after": (esp + 8) & 0xFFFFFFFF,
+        })
+        engine.reg_write(registers.UC_X86_REG_EAX, 0)
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = {
+            "access": access,
+            "address": int(address),
+            "size": size,
+        }
+        return False
+
+
+def _get_file_type(engine: Any, registers: Any, unicorn_module: Any,
+                   import_row: dict[str, Any],
+                   mapped_ranges: list[tuple[int, int]],
+                   state: dict[str, Any]) -> bool:
+    """Model the observed invalid-handle result in the no-file guest process.
+
+    The guest issues no file handles. Only NULL and INVALID_HANDLE_VALUE are
+    modeled here; other nonzero handles remain unsupported instead of being
+    assigned a fabricated file type.
+    """
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+
+    def stop_memory(access: str, address: int, size: int) -> bool:
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = address & 0xFFFFFFFF
+        state["memory_fault"] = {
+            "access": access,
+            "address": int(address),
+            "size": size,
+        }
+        return False
+
+    try:
+        if not _range_has_permissions(engine, esp, 8,
+                                      unicorn_module.UC_PROT_READ,
+                                      mapped_ranges):
+            raise _GuestPointerFault("read", esp, 8)
+        return_address = _read_u32(engine, esp)
+        handle = _read_u32(engine, esp + 4)
+        if handle not in (0, 0xFFFFFFFF):
+            return False
+
+        teb = int(state.get("tls_current_teb", TEB_BASE))
+        if teb == 0:
+            state["status"] = "GUEST_STOP_API_STATE"
+            state["target"] = 0
+            state["api_state_fault"] = {
+                "api": import_row["name"],
+                "address": 0,
+                "reason": "no_current_teb",
+            }
+            return False
+        last_error_address = teb + LAST_ERROR_OFFSET
+        if (teb < 0 or teb > 0xFFFFFFFF or last_error_address < 0 or
+                last_error_address > 0xFFFFFFFF or
+                last_error_address + 4 > 0x100000000 or
+                not _range_has_permissions(engine, last_error_address, 4,
+                                           unicorn_module.UC_PROT_WRITE,
+                                           mapped_ranges)):
+            fault_address = min(max(last_error_address, 0), 0xFFFFFFFF)
+            raise _GuestPointerFault("write", fault_address, 4)
+
+        api = {
+            "library": import_row["library"],
+            "name": import_row["name"],
+            "import_index": import_row["index"],
+            "tag": IMPORT_BASE + import_row["index"],
+            "call_ip": state["last_ip"],
+            "esp_before": esp,
+            "argument_count": 1,
+            "return_address": return_address,
+            "argument": handle,
+            "arguments": [handle],
+            "outcome": "invalid_handle",
+            "result": 0,
+            "last_error_after": ERROR_INVALID_HANDLE,
+            "last_error_policy": "set_invalid_handle",
+            "esp_after": (esp + 8) & 0xFFFFFFFF,
+        }
+        _write_u32(engine, last_error_address, ERROR_INVALID_HANDLE)
+        state["api_calls"].append(api)
+        engine.reg_write(registers.UC_X86_REG_EAX, 0)
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        return stop_memory(access, address, size)
+
+
+def _set_handle_count(engine: Any, registers: Any, unicorn_module: Any,
+                      import_row: dict[str, Any],
+                      mapped_ranges: list[tuple[int, int]],
+                      state: dict[str, Any]) -> bool:
+    """Apply the Windows Win32 no-op contract and return the requested UINT."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    try:
+        if not _range_has_permissions(engine, esp, 8,
+                                      unicorn_module.UC_PROT_READ,
+                                      mapped_ranges):
+            raise _GuestPointerFault("read", esp, 8)
+        return_address = _read_u32(engine, esp)
+        requested_count = _read_u32(engine, esp + 4)
+
+        state["api_calls"].append({
+            "library": import_row["library"],
+            "name": import_row["name"],
+            "import_index": import_row["index"],
+            "tag": IMPORT_BASE + import_row["index"],
+            "call_ip": state["last_ip"],
+            "esp_before": esp,
+            "argument_count": 1,
+            "return_address": return_address,
+            "argument": requested_count,
+            "arguments": [requested_count],
+            "outcome": "success",
+            "policy": "windows_win32_no_effect",
+            "result": requested_count,
+            "last_error_policy": "preserved",
+            "esp_after": (esp + 8) & 0xFFFFFFFF,
+        })
+        engine.reg_write(registers.UC_X86_REG_EAX, requested_count)
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = {
+            "access": access,
+            "address": int(address),
+            "size": size,
+        }
+        return False
+
+
+def _guest_process_import(engine: Any, registers: Any, unicorn_module: Any,
+                          import_row: dict[str, Any],
+                          mapped_ranges: list[tuple[int, int]],
+                          state: dict[str, Any]) -> bool:
+    """Model the configured process strings, leases, and code-page imports."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    name = import_row["name"]
+    if name in PROCESS_ENVIRONMENT_FREES:
+        argument_count = 1
+    elif name in PROCESS_ENVIRONMENT_GETTERS or name in PROCESS_CODE_PAGES or name == "GetCommandLineA":
+        argument_count = 0
+    else:
+        return False
+    frame_size = 4 * (argument_count + 1)
+
+    def stop_memory(access: str, address: int, size: int) -> bool:
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = address & 0xFFFFFFFF
+        state["memory_fault"] = {
+            "access": access,
+            "address": int(address),
+            "size": size,
+        }
+        return False
+
+    def stop_state(reason: str, **details: Any) -> bool:
+        state["status"] = "GUEST_STOP_API_STATE"
+        state["target"] = PROCESS_BASE
+        state["api_state_fault"] = {
+            "api": name,
+            "address": PROCESS_BASE,
+            "reason": reason,
+            **details,
+        }
+        return False
+
+    try:
+        if not _range_has_permissions(engine, esp, frame_size,
+                                      unicorn_module.UC_PROT_READ,
+                                      mapped_ranges):
+            raise _GuestPointerFault("read", esp, frame_size)
+        frame = bytes(engine.mem_read(esp, frame_size))
+        return_address = struct.unpack_from("<I", frame, 0)[0]
+        argument = (struct.unpack_from("<I", frame, 4)[0]
+                    if argument_count else None)
+
+        process = state.get("process")
+        if not isinstance(process, dict) or process.get("initialized") != 1:
+            state["status"] = "GUEST_STOP_API_STATE"
+            state["target"] = PROCESS_BASE
+            state["api_state_fault"] = {
+                "api": import_row["name"],
+                "address": PROCESS_BASE,
+                "reason": "process_not_initialized",
+            }
+            return False
+
+        outcome = "success"
+        last_error_policy = "preserved"
+        last_error_before = None
+        last_error_after = None
+        reference_field = None
+        string_address = None
+        string_size = 0
+        if name == "GetCommandLineA":
+            result = int(process["command_line_address"])
+            string_size = int(process["command_line_size"])
+            if (result < 0 or result > 0xFFFFFFFF or string_size <= 0 or
+                    string_size > 0x100000000 - result or
+                    not _range_has_permissions(engine, result, string_size,
+                                               unicorn_module.UC_PROT_READ,
+                                               mapped_ranges)):
+                fault_address = min(max(result, 0), 0xFFFFFFFF)
+                raise _GuestPointerFault("read", fault_address, string_size)
+            string_address = result
+        elif name in PROCESS_ENVIRONMENT_GETTERS:
+            is_wide = name == "GetEnvironmentStringsW"
+            reference_field = "environment_w_refs" if is_wide else "environment_a_refs"
+            string_address = int(process["environment_w_address"] if is_wide
+                                  else process["environment_a_address"])
+            string_size = 4 if is_wide else 2
+            references = int(process[reference_field])
+            if references < 0 or references > PROCESS_ENV_LEASE_CAP:
+                return stop_state("environment_reference_count_invalid",
+                                  encoding="wide" if is_wide else "narrow",
+                                  references=references)
+            if references >= PROCESS_ENV_LEASE_CAP:
+                teb = int(state.get("tls_current_teb", TEB_BASE))
+                if teb == 0:
+                    return stop_state("no_current_teb")
+                if teb < 0 or teb > 0xFFFFFFFF:
+                    fault_address = min(max(teb, 0), 0xFFFFFFFF)
+                    raise _GuestPointerFault("write", fault_address, 4)
+                last_error_address = teb + LAST_ERROR_OFFSET
+                if last_error_address > 0xFFFFFFFF:
+                    raise _GuestPointerFault("write", 0xFFFFFFFF, 4)
+                if not _range_has_permissions(
+                        engine, last_error_address, 4,
+                        unicorn_module.UC_PROT_WRITE, mapped_ranges):
+                    raise _GuestPointerFault("write", last_error_address, 4)
+                _write_u32(engine, last_error_address, ERROR_NOT_ENOUGH_MEMORY)
+                last_error_after = ERROR_NOT_ENOUGH_MEMORY
+                last_error_policy = "set_error_8"
+                outcome = "lease_limit"
+                result = 0
+            else:
+                if (string_address < 0 or string_address > 0xFFFFFFFF or
+                        string_size > 0x100000000 - string_address or
+                        not _range_has_permissions(
+                            engine, string_address, string_size,
+                            unicorn_module.UC_PROT_READ, mapped_ranges)):
+                    fault_address = min(max(string_address, 0), 0xFFFFFFFF)
+                    raise _GuestPointerFault("read", fault_address, string_size)
+                process[reference_field] = references + 1
+                result = string_address
+        elif name in PROCESS_ENVIRONMENT_FREES:
+            is_wide = name == "FreeEnvironmentStringsW"
+            reference_field = "environment_w_refs" if is_wide else "environment_a_refs"
+            expected_address = int(process["environment_w_address"] if is_wide
+                                   else process["environment_a_address"])
+            references = int(process[reference_field])
+            if argument != expected_address or references <= 0:
+                return stop_state(
+                    "environment_free_mismatch",
+                    encoding="wide" if is_wide else "narrow",
+                    pointer=int(argument), expected_pointer=expected_address,
+                    references=references)
+            process[reference_field] = references - 1
+            result = 1
+        else:
+            result = PROCESS_CODE_PAGES.get(name)
+            if result is None:
+                return False
+
+        api = {
+            "library": import_row["library"],
+            "name": name,
+            "import_index": import_row["index"],
+            "tag": IMPORT_BASE + import_row["index"],
+            "call_ip": state["last_ip"],
+            "esp_before": esp,
+            "argument_count": argument_count,
+            "return_address": return_address,
+            "argument": argument,
+            "arguments": [] if argument_count == 0 else [argument],
+            "outcome": outcome,
+            "policy": PROCESS_PROFILE,
+            "result": result,
+            "last_error_policy": last_error_policy,
+            "esp_after": (esp + frame_size) & 0xFFFFFFFF,
+        }
+        if last_error_before is not None:
+            api["last_error_before"] = last_error_before
+        if last_error_after is not None:
+            api["last_error_after"] = last_error_after
+        if string_address is not None:
+            api["string_address"] = string_address
+            api["string_size"] = string_size
+        if reference_field is not None:
+            api["references_after"] = int(process[reference_field])
+        state["api_calls"].append(api)
+        engine.reg_write(registers.UC_X86_REG_EAX, result)
+        engine.reg_write(registers.UC_X86_REG_ESP,
+                         (esp + frame_size) & 0xFFFFFFFF)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        return stop_memory(access, address, size)
 
 
 def _round_up(value: int, granule: int) -> int:
@@ -1321,6 +1834,8 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         struct.pack_into("<I", teb, address, value)
     engine.mem_write(TEB_BASE, bytes(teb))
 
+    process_state = _initialize_process_arena(engine, image_base, image_size, uc)
+
     # The native loader starts with zeroed committed pages and the same return
     # sentinel that tests/boot.c pushes before calling the entry function.
     start_esp = INITIAL_ESP - 4
@@ -1346,6 +1861,7 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
     mapped_ranges = [
         (image_base, image_base + image_size),
         (TEB_BASE, TEB_BASE + TEB_SIZE),
+        (PROCESS_BASE, PROCESS_BASE + PROCESS_COMMITTED_SIZE),
         (STACK_LO, STACK_HI),
     ]
 
@@ -1369,6 +1885,7 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "tls_slot_count": 0,
         "tls_threads": {TEB_BASE: 1},
         "tls_current_teb": TEB_BASE,
+        "process": process_state,
         "resume": False,
         "memory_fault": None,
     }
@@ -1388,6 +1905,46 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
                     _get_version_ex_a(engine, xr, row, mapped_ranges, state)
                 elif row["name"] == "GetModuleHandleA":
                     _get_module_handle_a(engine, xr, row, mapped_ranges, image_base, state)
+                elif row["name"] == "GetStartupInfoA":
+                    handled = _get_startup_info_a(engine, xr, uc, row,
+                                                  mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "GetStdHandle":
+                    handled = _get_std_handle(engine, xr, uc, row,
+                                              mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "GetFileType":
+                    handled = _get_file_type(engine, xr, uc, row,
+                                             mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "SetHandleCount":
+                    handled = _set_handle_count(engine, xr, uc, row,
+                                                mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] in PROCESS_CODE_PAGES or row["name"] == "GetCommandLineA" or row["name"] in PROCESS_IMPORTS:
+                    handled = _guest_process_import(engine, xr, uc, row,
+                                                    mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
                 elif row["name"] == "GetCurrentThreadId":
                     handled = _get_current_thread_id(engine, xr, uc, row,
                                                      mapped_ranges, state)
@@ -1575,12 +2132,27 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
     if boundary_key in {
         ("kernel32.dll", "GetVersionExA"),
         ("kernel32.dll", "GetModuleHandleA"),
+        ("kernel32.dll", "GetStartupInfoA"),
         ("kernel32.dll", "GetCurrentThreadId"),
+        ("kernel32.dll", "SetHandleCount"),
+        ("kernel32.dll", "GetCommandLineA"),
+        *(('kernel32.dll', name) for name in PROCESS_IMPORTS),
+        ("kernel32.dll", "GetACP"),
+        ("kernel32.dll", "GetOEMCP"),
     } or (boundary_key in {
         ("kernel32.dll", "HeapCreate"),
         ("kernel32.dll", "HeapAlloc"),
     } and not state["boundary_call"]):
         raise RuntimeError("startup oracle stopped at a supported import instead of applying its contract")
+    if (boundary_key == ("kernel32.dll", "GetStdHandle") and
+            (not state["boundary_call"] or
+             not state["boundary_call"]["arguments"] or
+             state["boundary_call"]["arguments"][0] in STD_HANDLE_SELECTORS)):
+        raise RuntimeError("startup oracle stopped at a supported standard-handle selector")
+    if (boundary_key == ("kernel32.dll", "GetFileType") and
+            state["boundary_call"] and state["boundary_call"]["arguments"] and
+            state["boundary_call"]["arguments"][0] in (0, 0xFFFFFFFF)):
+        raise RuntimeError("startup oracle stopped at a supported invalid file handle")
     if boundary_key[0] == "kernel32.dll" and boundary_key[1] in CRITICAL_SECTION_IMPORTS:
         raise RuntimeError("startup oracle stopped at a supported critical-section import instead of applying its contract")
     if boundary_key[0] == "kernel32.dll" and boundary_key[1] in TLS_IMPORTS:
@@ -1599,6 +2171,9 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
     stack_window = bytes(engine.mem_read(stack_hash_start, stack_hash_end - stack_hash_start))
     image_state = bytes(engine.mem_read(image_base, image_size))
     teb_state = bytes(engine.mem_read(TEB_BASE, TEB_SIZE))
+    process_hash_start = int(process_state["base"])
+    process_hash_size = int(process_state["committed_size"])
+    process_bytes = bytes(engine.mem_read(process_hash_start, process_hash_size))
     active_heaps = sorted(state["heaps"].values(), key=lambda heap: heap["slot"])
     active_critical_sections = [
         {"address": address, **dict(section)}
@@ -1672,6 +2247,7 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "critical_sections": active_critical_sections,
         "tls_slot_count": int(state["tls_slot_count"]),
         "tls_thread_count": len(state["tls_threads"]),
+        "process_state": dict(process_state),
         "state_heaps": heap_slots,
         "instructions": int(state["instructions"]),
         "calls": int(state["calls"]),
@@ -1692,6 +2268,9 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "heap_hash_start": heap_hash_start,
         "heap_hash_size": heap_hash_size,
         "heap_hash64": _fnv1a64(heap_state),
+        "process_hash_start": process_hash_start,
+        "process_hash_size": process_hash_size,
+        "process_hash64": _fnv1a64(process_bytes),
         "stack_base": STACK_LO,
         "stack_size": STACK_SIZE,
         "stack_initial_esp": start_esp,

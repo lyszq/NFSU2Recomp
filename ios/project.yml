@@ -28,6 +28,10 @@ targets:
       - path: ../runtime/guest_heap.c
       - path: ../runtime/guest_critical.c
       - path: ../runtime/guest_tls.c
+      - path: ../runtime/guest_process.c
+      - path: ../runtime/guest_startup.c
+      - path: ../runtime/guest_error.c
+      - path: ../runtime/guest_stdio.c
       - path: tests/cpu_flags_test.c
     settings:
       base:
@@ -42,8 +46,8 @@ targets:
       path: NFSU2iOS/Info.plist
       properties:
         CFBundleDisplayName: NFSU2 iOS
-        CFBundleShortVersionString: '0.8.0'
-        CFBundleVersion: '12'
+        CFBundleShortVersionString: '0.9.0'
+        CFBundleVersion: '14'
         LSRequiresIPhoneOS: true
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true

@@ -84,10 +84,52 @@ static int tls_contract(void) {
     CHECK(!memcmp(&c,&expected,sizeof c));
     return 0;
 }
+static int startup_and_stdio_contract(void) {
+    GuestWindows windows={.image_base=0x400000u}; uint32_t fault=0;
+    GuestImport api={0,"KERNEL32.dll","GetStdHandle"};
+    CPU c=setup(0), expected=c;
+    put(STACK+4,0xFFFFFFF5u); eflags_set(&c,0xcd5u); expected=c;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1);
+    expected.eax=0; expected.eip=0x401005; expected.esp+=8;
+    CHECK(!memcmp(&c,&expected,sizeof c) && get(TEB+0x34)==999);
+    api.name="GetFileType"; c=setup(0); put(STACK+4,0); eflags_set(&c,0xcd5u); expected=c;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1);
+    expected.eax=0; expected.eip=0x401005; expected.esp+=8;
+    CHECK(!memcmp(&c,&expected,sizeof c) && get(TEB+0x34)==6);
+    api.name="GetLastError"; c=setup(0); eflags_set(&c,0xcd5u); expected=c;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1);
+    expected.eax=6; expected.eip=0x401005; expected.esp+=4;
+    CHECK(!memcmp(&c,&expected,sizeof c));
+    api.name="SetLastError"; c=setup(0); put(STACK+4,42); eflags_set(&c,0xcd5u); expected=c;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1);
+    expected.eip=0x401005; expected.esp+=8;
+    CHECK(!memcmp(&c,&expected,sizeof c) && get(TEB+0x34)==42);
+    api.name="GetStartupInfoA"; c=setup(0); put(STACK+4,BUFFER); eflags_set(&c,0xcd5u); expected=c;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1);
+    expected.eip=0x401005; expected.esp+=8;
+    CHECK(!memcmp(&c,&expected,sizeof c) && get(BUFFER)==68 && get(TEB+0x34)==42);
+    GuestPEImage img={.image_base=0x400000u,.image_size=0x100000u};
+    CHECK(!guest_process_init(&windows.process,&img));
+    api.name="GetCommandLineA"; c=setup(0); eflags_set(&c,0xcd5u); expected=c;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1);
+    expected.eax=GUEST_PROCESS_COMMAND; expected.eip=0x401005; expected.esp+=4;
+    CHECK(!memcmp(&c,&expected,sizeof c));
+    api.name="GetACP"; c=setup(0); eflags_set(&c,0xcd5u); expected=c;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1);
+    expected.eax=1252; expected.eip=0x401005; expected.esp+=4;
+    CHECK(!memcmp(&c,&expected,sizeof c));
+    api.name="GetOEMCP"; c=setup(0); eflags_set(&c,0xcd5u); expected=c;
+    CHECK(guest_windows_import(&c,&api,&windows,&fault)==1);
+    expected.eax=437; expected.eip=0x401005; expected.esp+=4;
+    CHECK(!memcmp(&c,&expected,sizeof c));
+    CHECK(!guest_windows_cleanup(&windows));
+    return 0;
+}
 int main(void) {
     CHECK(!guest_memory_init());
     CHECK(!guest_memory_commit(STACK,0x30000));
     CHECK(!tls_contract());
+    CHECK(!startup_and_stdio_contract());
     GuestImport api={0,"KeRnEl32.DlL","GetVersionExA"}; uint32_t fault=0;
     GuestWindows windows={.image_base=0x400000u};
     for (uint32_t size=148; size<=156; size+=8) {

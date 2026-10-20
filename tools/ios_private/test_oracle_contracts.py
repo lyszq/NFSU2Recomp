@@ -20,8 +20,18 @@ from unicorn import x86_const
 from startup_oracle import (
     CRITICAL_SECTION_MAX_COUNT,
     CRITICAL_SECTION_SIZE,
+    ERROR_INVALID_HANDLE,
     ERROR_NOT_ENOUGH_MEMORY,
     EFLAGS_MASK,
+    PROCESS_BASE,
+    PROCESS_COMMAND_LINE,
+    PROCESS_COMMAND_LINE_BYTES,
+    PROCESS_COMMITTED_SIZE,
+    PROCESS_ENV_A_BASE,
+    PROCESS_ENV_LEASE_CAP,
+    PROCESS_ENV_W_BASE,
+    PROCESS_PROFILE,
+    PROCESS_RESERVED_SIZE,
     HEAP_ALLOC_SUPPORTED_FLAGS,
     HEAP_BASE,
     HEAP_GRANULE,
@@ -37,10 +47,20 @@ from startup_oracle import (
     TEB_TLS_SLOTS_OFFSET,
     TEB_BASE,
     TEB_SIZE,
+    STARTUPINFOA_SIZE,
+    STD_ERROR_HANDLE,
+    STD_INPUT_HANDLE,
+    STD_OUTPUT_HANDLE,
     _critical_section_import,
     _get_current_thread_id,
+    _get_file_type,
+    _get_std_handle,
+    _get_startup_info_a,
     _heap_alloc,
     _heap_create,
+    _guest_process_import,
+    _initialize_process_arena,
+    _set_handle_count,
     _tls_import,
 )
 
@@ -55,6 +75,7 @@ LAST_ERROR_SENTINEL = 0x76543210
 THREAD_ID = 1
 TLS_TEB_2 = 0x00D00000
 TLS_VALUE_BASE = 0x00600000
+READ_ONLY_BASE = 0x00700000
 
 
 class CriticalSectionOracleTests(unittest.TestCase):
@@ -841,6 +862,600 @@ class CurrentThreadIdOracleTests(unittest.TestCase):
         self.assert_preserved_registers()
 
 
+class StartupInfoOracleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
+        self.engine.mem_map(STRUCT_BASE, PAGE_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_map(STACK_BASE, PAGE_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_map(TEB_BASE, TEB_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_write(TEB_BASE + 0x34,
+                              struct.pack("<I", LAST_ERROR_SENTINEL))
+        self.mapped_ranges = [
+            (STRUCT_BASE, STRUCT_BASE + PAGE_SIZE),
+            (STACK_BASE, STACK_BASE + PAGE_SIZE),
+            (TEB_BASE, TEB_BASE + TEB_SIZE),
+        ]
+        self.state = {
+            "last_ip": 0x0010A0B0,
+            "api_calls": [],
+            "resume": False,
+            "status": None,
+        }
+        self.register_values = {
+            x86_const.UC_X86_REG_EAX: EAX_SENTINEL,
+            x86_const.UC_X86_REG_ECX: 0x11111111,
+            x86_const.UC_X86_REG_EDX: 0x22222222,
+            x86_const.UC_X86_REG_EBX: 0x33333333,
+            x86_const.UC_X86_REG_EBP: 0x44444444,
+            x86_const.UC_X86_REG_ESI: 0x55555555,
+            x86_const.UC_X86_REG_EDI: 0x66666666,
+        }
+
+    def _call(self, output: int, *, esp: int = STACK_BASE) -> dict:
+        frame = struct.pack("<II", RETURN_ADDRESS, output & 0xFFFFFFFF)
+        self.engine.mem_write(esp, frame)
+        self.engine.reg_write(x86_const.UC_X86_REG_ESP, esp)
+        self.engine.reg_write(x86_const.UC_X86_REG_EIP, IMPORT_BASE + 19)
+        self.engine.reg_write(x86_const.UC_X86_REG_EFLAGS, FLAGS_SENTINEL)
+        for register, value in self.register_values.items():
+            self.engine.reg_write(register, value)
+        flags_before = (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                        EFLAGS_MASK)
+        handled = _get_startup_info_a(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "GetStartupInfoA", "index": 19},
+            self.mapped_ranges, self.state)
+        return {
+            "handled": handled,
+            "frame": frame,
+            "flags_before": flags_before,
+            "esp_before": esp,
+            "eax_after": self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+            "esp_after": self.engine.reg_read(x86_const.UC_X86_REG_ESP),
+            "eip_after": self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+            "flags_after": (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                            EFLAGS_MASK),
+        }
+
+    def _assert_cpu_registers_preserved(self) -> None:
+        for register, value in self.register_values.items():
+            self.assertEqual(self.engine.reg_read(register), value)
+
+    def test_zeroed_structure_void_abi_and_exact_write_extent(self) -> None:
+        output = STRUCT_BASE + 0x100
+        self.engine.mem_write(output, bytes([0xA5]) * (STARTUPINFOA_SIZE + 1))
+        result = self._call(output)
+
+        expected = bytearray(STARTUPINFOA_SIZE)
+        struct.pack_into("<I", expected, 0, STARTUPINFOA_SIZE)
+        self.assertTrue(result["handled"])
+        self.assertEqual(bytes(self.engine.mem_read(output, STARTUPINFOA_SIZE)),
+                         bytes(expected))
+        self.assertEqual(self.engine.mem_read(output + STARTUPINFOA_SIZE, 1),
+                         b"\xA5")
+        self.assertEqual(result["eax_after"], EAX_SENTINEL)
+        self.assertEqual(result["eip_after"], RETURN_ADDRESS)
+        self.assertEqual(result["esp_after"], STACK_BASE + 8)
+        self.assertEqual(result["flags_after"], result["flags_before"])
+        self._assert_cpu_registers_preserved()
+        self.assertEqual(
+            struct.unpack("<I", self.engine.mem_read(TEB_BASE + 0x34, 4))[0],
+            LAST_ERROR_SENTINEL,
+        )
+        self.assertEqual(self.state["api_calls"][-1]["arguments"], [output])
+        self.assertEqual(self.state["api_calls"][-1]["output_size"], 68)
+        self.assertEqual(self.state["api_calls"][-1]["dw_flags"], 0)
+        self.assertEqual(self.state["api_calls"][-1]["last_error_policy"],
+                         "preserved")
+
+    def test_output_may_alias_return_slot_because_frame_is_captured_first(self) -> None:
+        result = self._call(STACK_BASE)
+        expected = bytearray(STARTUPINFOA_SIZE)
+        struct.pack_into("<I", expected, 0, STARTUPINFOA_SIZE)
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(bytes(self.engine.mem_read(STACK_BASE,
+                                                    STARTUPINFOA_SIZE)),
+                         bytes(expected))
+        self.assertEqual(result["eip_after"], RETURN_ADDRESS)
+        self.assertEqual(result["esp_after"], STACK_BASE + 8)
+        self.assertEqual(result["eax_after"], EAX_SENTINEL)
+        self.assertEqual(result["flags_after"], result["flags_before"])
+        self._assert_cpu_registers_preserved()
+
+    def test_null_cross_range_and_read_only_outputs_stop_before_any_write(self) -> None:
+        self.engine.mem_map(0, PAGE_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_write(0, bytes([0x3C]) * PAGE_SIZE)
+        self.mapped_ranges.append((0, PAGE_SIZE))
+
+        cross_range = STRUCT_BASE + PAGE_SIZE - 16
+        self.engine.mem_write(cross_range, bytes([0x5A]) * 16)
+
+        self.engine.mem_map(READ_ONLY_BASE, PAGE_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_write(READ_ONLY_BASE, bytes([0xC3]) * PAGE_SIZE)
+        self.engine.mem_protect(READ_ONLY_BASE, PAGE_SIZE, unicorn.UC_PROT_READ)
+        self.mapped_ranges.append((READ_ONLY_BASE, READ_ONLY_BASE + PAGE_SIZE))
+
+        cases = [
+            ("null", 0, 0, PAGE_SIZE),
+            ("cross_range", cross_range, cross_range, 16),
+            ("read_only", READ_ONLY_BASE, READ_ONLY_BASE, STARTUPINFOA_SIZE),
+        ]
+        for label, pointer, snapshot_start, snapshot_size in cases:
+            with self.subTest(label=label):
+                if label == "null":
+                    # A mapped page zero still does not make a null API
+                    # output pointer valid under this guest contract.
+                    original = bytes(self.engine.mem_read(snapshot_start,
+                                                          snapshot_size))
+                else:
+                    original = bytes(self.engine.mem_read(snapshot_start,
+                                                          snapshot_size))
+                self.state["status"] = None
+                self.state["resume"] = False
+                result = self._call(pointer)
+
+                self.assertFalse(result["handled"])
+                self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+                self.assertEqual(self.state["target"], pointer)
+                self.assertEqual(self.state["memory_fault"]["size"],
+                                 STARTUPINFOA_SIZE)
+                self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP),
+                                 STACK_BASE)
+                self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                                 IMPORT_BASE + 19)
+                self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                                 EAX_SENTINEL)
+                self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                                 EFLAGS_MASK, result["flags_before"])
+                self._assert_cpu_registers_preserved()
+                self.assertEqual(bytes(self.engine.mem_read(snapshot_start,
+                                                            snapshot_size)),
+                                 original)
+                self.assertFalse(self.state["resume"])
+                self.assertEqual(self.state["api_calls"][-1]["outcome"],
+                                 "invalid_pointer")
+                self.assertEqual(
+                    struct.unpack("<I", self.engine.mem_read(TEB_BASE + 0x34, 4))[0],
+                    LAST_ERROR_SENTINEL,
+                )
+
+
+class StdHandleOracleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
+        self.engine.mem_map(STACK_BASE, PAGE_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_map(TEB_BASE, TEB_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_write(TEB_BASE + 0x34,
+                              struct.pack("<I", LAST_ERROR_SENTINEL))
+        self.mapped_ranges = [
+            (STACK_BASE, STACK_BASE + PAGE_SIZE),
+            (TEB_BASE, TEB_BASE + TEB_SIZE),
+        ]
+        self.state = {
+            "last_ip": 0x0010B0C0,
+            "api_calls": [],
+            "resume": False,
+            "status": None,
+        }
+        self.register_values = {
+            x86_const.UC_X86_REG_EAX: EAX_SENTINEL,
+            x86_const.UC_X86_REG_ECX: 0x11111111,
+            x86_const.UC_X86_REG_EDX: 0x22222222,
+            x86_const.UC_X86_REG_EBX: 0x33333333,
+            x86_const.UC_X86_REG_EBP: 0x44444444,
+            x86_const.UC_X86_REG_ESI: 0x55555555,
+            x86_const.UC_X86_REG_EDI: 0x66666666,
+        }
+
+    def _call(self, selector: int, *, esp: int = STACK_BASE) -> dict:
+        frame = struct.pack("<II", RETURN_ADDRESS, selector & 0xFFFFFFFF)
+        self.engine.mem_write(esp, frame)
+        self.engine.reg_write(x86_const.UC_X86_REG_ESP, esp)
+        self.engine.reg_write(x86_const.UC_X86_REG_EIP, IMPORT_BASE + 23)
+        self.engine.reg_write(x86_const.UC_X86_REG_EFLAGS, FLAGS_SENTINEL)
+        for register, value in self.register_values.items():
+            self.engine.reg_write(register, value)
+        flags_before = (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                        EFLAGS_MASK)
+        handled = _get_std_handle(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "GetStdHandle", "index": 23},
+            self.mapped_ranges, self.state)
+        return {
+            "handled": handled,
+            "frame": frame,
+            "flags_before": flags_before,
+            "esp_after": self.engine.reg_read(x86_const.UC_X86_REG_ESP),
+            "eip_after": self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+            "eax_after": self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+            "flags_after": (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                            EFLAGS_MASK),
+        }
+
+    def _assert_nonresult_registers_preserved(self) -> None:
+        for register, value in self.register_values.items():
+            if register != x86_const.UC_X86_REG_EAX:
+                self.assertEqual(self.engine.reg_read(register), value)
+
+    def test_all_three_standard_selectors_return_null_with_stdcall_abi(self) -> None:
+        expected = (
+            (STD_INPUT_HANDLE, "stdin"),
+            (STD_OUTPUT_HANDLE, "stdout"),
+            (STD_ERROR_HANDLE, "stderr"),
+        )
+        for selector, stream in expected:
+            with self.subTest(stream=stream):
+                self.state["api_calls"] = []
+                self.state["resume"] = False
+                self.state["status"] = None
+                frame_before = struct.pack("<II", RETURN_ADDRESS, selector)
+                result = self._call(selector)
+
+                self.assertTrue(result["handled"])
+                self.assertEqual(result["eax_after"], 0)
+                self.assertEqual(result["eip_after"], RETURN_ADDRESS)
+                self.assertEqual(result["esp_after"], STACK_BASE + 8)
+                self.assertEqual(result["flags_after"], result["flags_before"])
+                self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, 8)),
+                                 frame_before)
+                self._assert_nonresult_registers_preserved()
+                self.assertEqual(
+                    struct.unpack("<I", self.engine.mem_read(TEB_BASE + 0x34, 4))[0],
+                    LAST_ERROR_SENTINEL,
+                )
+                self.assertEqual(len(self.state["api_calls"]), 1)
+                api = self.state["api_calls"][0]
+                self.assertEqual(api["argument"], selector)
+                self.assertEqual(api["stream"], stream)
+                self.assertEqual(api["result"], 0)
+                self.assertEqual(api["policy"],
+                                 "no_console_no_inherited_handles")
+
+    def test_unknown_selector_remains_unsupported_without_fake_result(self) -> None:
+        selector = 1
+        result = self._call(selector)
+
+        self.assertFalse(result["handled"])
+        self.assertIsNone(self.state["status"])
+        self.assertFalse(self.state["resume"])
+        self.assertEqual(self.state["api_calls"], [])
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP),
+                         STACK_BASE)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 23)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                         EFLAGS_MASK, result["flags_before"])
+        self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, 8)),
+                         result["frame"])
+        self._assert_nonresult_registers_preserved()
+        self.assertEqual(
+            struct.unpack("<I", self.engine.mem_read(TEB_BASE + 0x34, 4))[0],
+            LAST_ERROR_SENTINEL,
+        )
+
+    def test_unreadable_full_stack_frame_stops_without_cpu_or_api_mutation(self) -> None:
+        esp = STACK_BASE + PAGE_SIZE - 4
+        self.engine.mem_write(esp, struct.pack("<I", RETURN_ADDRESS))
+        self.engine.reg_write(x86_const.UC_X86_REG_ESP, esp)
+        self.engine.reg_write(x86_const.UC_X86_REG_EIP, IMPORT_BASE + 23)
+        self.engine.reg_write(x86_const.UC_X86_REG_EFLAGS, FLAGS_SENTINEL)
+        for register, value in self.register_values.items():
+            self.engine.reg_write(register, value)
+        flags_before = (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                        EFLAGS_MASK)
+
+        handled = _get_std_handle(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "GetStdHandle", "index": 23},
+            self.mapped_ranges, self.state)
+
+        self.assertFalse(handled)
+        self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+        self.assertEqual(self.state["target"], esp)
+        self.assertEqual(self.state["memory_fault"],
+                         {"access": "read", "address": esp, "size": 8})
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), esp)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 23)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                         EFLAGS_MASK, flags_before)
+        self.assertEqual(self.state["api_calls"], [])
+        self._assert_nonresult_registers_preserved()
+        self.assertEqual(
+            struct.unpack("<I", self.engine.mem_read(TEB_BASE + 0x34, 4))[0],
+            LAST_ERROR_SENTINEL,
+        )
+
+
+class FileTypeOracleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
+        self.engine.mem_map(STACK_BASE, PAGE_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_map(TEB_BASE, TEB_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_write(TEB_BASE + 0x34,
+                              struct.pack("<I", LAST_ERROR_SENTINEL))
+        self.mapped_ranges = [
+            (STACK_BASE, STACK_BASE + PAGE_SIZE),
+            (TEB_BASE, TEB_BASE + TEB_SIZE),
+        ]
+        self.state = {
+            "last_ip": 0x0010C0D0,
+            "api_calls": [],
+            "tls_current_teb": TEB_BASE,
+            "resume": False,
+            "status": None,
+        }
+        self.register_values = {
+            x86_const.UC_X86_REG_EAX: EAX_SENTINEL,
+            x86_const.UC_X86_REG_ECX: 0x11111111,
+            x86_const.UC_X86_REG_EDX: 0x22222222,
+            x86_const.UC_X86_REG_EBX: 0x33333333,
+            x86_const.UC_X86_REG_EBP: 0x44444444,
+            x86_const.UC_X86_REG_ESI: 0x55555555,
+            x86_const.UC_X86_REG_EDI: 0x66666666,
+        }
+
+    def _call(self, handle: int, *, teb: int = TEB_BASE) -> dict:
+        frame = struct.pack("<II", RETURN_ADDRESS, handle & 0xFFFFFFFF)
+        self.engine.mem_write(STACK_BASE, frame)
+        self.engine.reg_write(x86_const.UC_X86_REG_ESP, STACK_BASE)
+        self.engine.reg_write(x86_const.UC_X86_REG_EIP, IMPORT_BASE + 37)
+        self.engine.reg_write(x86_const.UC_X86_REG_EFLAGS, FLAGS_SENTINEL)
+        for register, value in self.register_values.items():
+            self.engine.reg_write(register, value)
+        self.state.update(tls_current_teb=teb, resume=False, status=None)
+        flags_before = (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                        EFLAGS_MASK)
+        handled = _get_file_type(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "GetFileType", "index": 37},
+            self.mapped_ranges, self.state)
+        return {
+            "handled": handled,
+            "frame": frame,
+            "flags_before": flags_before,
+            "eax_after": self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+            "esp_after": self.engine.reg_read(x86_const.UC_X86_REG_ESP),
+            "eip_after": self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+            "flags_after": (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                            EFLAGS_MASK),
+        }
+
+    def _assert_nonresult_registers_preserved(self) -> None:
+        for register, value in self.register_values.items():
+            if register != x86_const.UC_X86_REG_EAX:
+                self.assertEqual(self.engine.reg_read(register), value)
+
+    def _assert_last_error(self, expected: int) -> None:
+        self.assertEqual(
+            struct.unpack("<I", self.engine.mem_read(TEB_BASE + 0x34, 4))[0],
+            expected,
+        )
+
+    def test_null_and_invalid_value_handles_return_unknown_and_set_error(self) -> None:
+        for handle in (0, 0xFFFFFFFF):
+            with self.subTest(handle=handle):
+                self.engine.mem_write(TEB_BASE + 0x34,
+                                      struct.pack("<I", LAST_ERROR_SENTINEL))
+                self.state["api_calls"] = []
+                result = self._call(handle)
+
+                self.assertTrue(result["handled"])
+                self.assertEqual(result["eax_after"], 0)
+                self.assertEqual(result["eip_after"], RETURN_ADDRESS)
+                self.assertEqual(result["esp_after"], STACK_BASE + 8)
+                self.assertEqual(result["flags_after"], result["flags_before"])
+                self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, 8)),
+                                 result["frame"])
+                self._assert_nonresult_registers_preserved()
+                self._assert_last_error(ERROR_INVALID_HANDLE)
+                self.assertEqual(len(self.state["api_calls"]), 1)
+                api = self.state["api_calls"][0]
+                self.assertEqual(api["argument"], handle)
+                self.assertEqual(api["outcome"], "invalid_handle")
+                self.assertEqual(api["result"], 0)
+                self.assertEqual(api["last_error_after"], ERROR_INVALID_HANDLE)
+
+    def test_other_nonzero_handles_remain_unsupported_without_fake_file_type(self) -> None:
+        handle = 0x100
+        result = self._call(handle)
+
+        self.assertFalse(result["handled"])
+        self.assertIsNone(self.state["status"])
+        self.assertFalse(self.state["resume"])
+        self.assertEqual(self.state["api_calls"], [])
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP),
+                         STACK_BASE)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 37)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                         EFLAGS_MASK, result["flags_before"])
+        self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, 8)),
+                         result["frame"])
+        self._assert_nonresult_registers_preserved()
+        self._assert_last_error(LAST_ERROR_SENTINEL)
+
+    def test_teb_zero_is_state_stop_and_invalid_teb_ranges_are_memory_stops(self) -> None:
+        zero_teb = self._call(0, teb=0)
+        self.assertFalse(zero_teb["handled"])
+        self.assertEqual(self.state["status"], "GUEST_STOP_API_STATE")
+        self.assertEqual(self.state["api_state_fault"]["reason"],
+                         "no_current_teb")
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP),
+                         STACK_BASE)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 37)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(zero_teb["flags_after"], zero_teb["flags_before"])
+        self.assertEqual(self.state["api_calls"], [])
+        self._assert_last_error(LAST_ERROR_SENTINEL)
+
+        for teb, fault_address in ((TLS_TEB_2, TLS_TEB_2 + 0x34),
+                                   (0xFFFFFFF0, 0xFFFFFFFF)):
+            with self.subTest(teb=hex(teb)):
+                result = self._call(0, teb=teb)
+                self.assertFalse(result["handled"])
+                self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+                self.assertEqual(self.state["target"], fault_address)
+                self.assertEqual(self.state["memory_fault"]["access"], "write")
+                self.assertEqual(self.state["memory_fault"]["address"],
+                                 fault_address)
+                self.assertEqual(self.state["memory_fault"]["size"], 4)
+                self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP),
+                                 STACK_BASE)
+                self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                                 IMPORT_BASE + 37)
+                self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                                 EAX_SENTINEL)
+                self.assertEqual(result["flags_after"], result["flags_before"])
+                self.assertEqual(self.state["api_calls"], [])
+                self._assert_last_error(LAST_ERROR_SENTINEL)
+
+    def test_unreadable_full_call_frame_faults_without_guest_mutation(self) -> None:
+        esp = STACK_BASE + PAGE_SIZE - 4
+        self.engine.mem_write(esp, struct.pack("<I", RETURN_ADDRESS))
+        self.engine.reg_write(x86_const.UC_X86_REG_ESP, esp)
+        self.engine.reg_write(x86_const.UC_X86_REG_EIP, IMPORT_BASE + 37)
+        self.engine.reg_write(x86_const.UC_X86_REG_EFLAGS, FLAGS_SENTINEL)
+        for register, value in self.register_values.items():
+            self.engine.reg_write(register, value)
+        flags_before = (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                        EFLAGS_MASK)
+
+        handled = _get_file_type(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "GetFileType", "index": 37},
+            self.mapped_ranges, self.state)
+
+        self.assertFalse(handled)
+        self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+        self.assertEqual(self.state["target"], esp)
+        self.assertEqual(self.state["memory_fault"],
+                         {"access": "read", "address": esp, "size": 8})
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), esp)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 37)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                         EFLAGS_MASK, flags_before)
+        self.assertEqual(self.state["api_calls"], [])
+        self._assert_nonresult_registers_preserved()
+        self._assert_last_error(LAST_ERROR_SENTINEL)
+
+
+class SetHandleCountOracleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
+        self.engine.mem_map(STACK_BASE, PAGE_SIZE, unicorn.UC_PROT_ALL)
+        self.mapped_ranges = [(STACK_BASE, STACK_BASE + PAGE_SIZE)]
+        self.state = {
+            "last_ip": 0x0010D0E0,
+            "api_calls": [],
+            "tls_current_teb": 0,
+            "resume": False,
+            "status": None,
+        }
+        self.register_values = {
+            x86_const.UC_X86_REG_EAX: EAX_SENTINEL,
+            x86_const.UC_X86_REG_ECX: 0x11111111,
+            x86_const.UC_X86_REG_EDX: 0x22222222,
+            x86_const.UC_X86_REG_EBX: 0x33333333,
+            x86_const.UC_X86_REG_EBP: 0x44444444,
+            x86_const.UC_X86_REG_ESI: 0x55555555,
+            x86_const.UC_X86_REG_EDI: 0x66666666,
+        }
+
+    def _call(self, count: int, *, esp: int = STACK_BASE) -> dict:
+        frame = struct.pack("<II", RETURN_ADDRESS, count & 0xFFFFFFFF)
+        self.engine.mem_write(esp, frame)
+        self.engine.reg_write(x86_const.UC_X86_REG_ESP, esp)
+        self.engine.reg_write(x86_const.UC_X86_REG_EIP, IMPORT_BASE + 41)
+        self.engine.reg_write(x86_const.UC_X86_REG_EFLAGS, FLAGS_SENTINEL)
+        for register, value in self.register_values.items():
+            self.engine.reg_write(register, value)
+        flags_before = (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                        EFLAGS_MASK)
+        handled = _set_handle_count(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "SetHandleCount", "index": 41},
+            self.mapped_ranges, self.state)
+        return {
+            "handled": handled,
+            "frame": frame,
+            "flags_before": flags_before,
+            "eax_after": self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+            "esp_after": self.engine.reg_read(x86_const.UC_X86_REG_ESP),
+            "eip_after": self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+            "flags_after": (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                            EFLAGS_MASK),
+        }
+
+    def _assert_nonresult_registers_preserved(self) -> None:
+        for register, value in self.register_values.items():
+            if register != x86_const.UC_X86_REG_EAX:
+                self.assertEqual(self.engine.reg_read(register), value)
+
+    def test_requested_uint_is_returned_without_teb_or_last_error_access(self) -> None:
+        for count in (0, 512, 0xFFFFFFFF):
+            with self.subTest(count=count):
+                self.state.update(api_calls=[], resume=False, status=None)
+                result = self._call(count)
+
+                self.assertTrue(result["handled"])
+                self.assertEqual(result["eax_after"], count)
+                self.assertEqual(result["eip_after"], RETURN_ADDRESS)
+                self.assertEqual(result["esp_after"], STACK_BASE + 8)
+                self.assertEqual(result["flags_after"], result["flags_before"])
+                self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, 8)),
+                                 result["frame"])
+                self._assert_nonresult_registers_preserved()
+                self.assertEqual(len(self.state["api_calls"]), 1)
+                api = self.state["api_calls"][0]
+                self.assertEqual(api["argument"], count)
+                self.assertEqual(api["result"], count)
+                self.assertEqual(api["policy"], "windows_win32_no_effect")
+
+    def test_unreadable_full_call_frame_stops_before_cpu_or_api_mutation(self) -> None:
+        esp = STACK_BASE + PAGE_SIZE - 4
+        self.engine.mem_write(esp, struct.pack("<I", RETURN_ADDRESS))
+        self.engine.reg_write(x86_const.UC_X86_REG_ESP, esp)
+        self.engine.reg_write(x86_const.UC_X86_REG_EIP, IMPORT_BASE + 41)
+        self.engine.reg_write(x86_const.UC_X86_REG_EFLAGS, FLAGS_SENTINEL)
+        for register, value in self.register_values.items():
+            self.engine.reg_write(register, value)
+        flags_before = (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                        EFLAGS_MASK)
+
+        handled = _set_handle_count(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "SetHandleCount", "index": 41},
+            self.mapped_ranges, self.state)
+
+        self.assertFalse(handled)
+        self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+        self.assertEqual(self.state["target"], esp)
+        self.assertEqual(self.state["memory_fault"],
+                         {"access": "read", "address": esp, "size": 8})
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), esp)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 41)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                         EFLAGS_MASK, flags_before)
+        self.assertEqual(self.state["api_calls"], [])
+        self._assert_nonresult_registers_preserved()
+
+
 class HeapAllocOracleTests(unittest.TestCase):
     def setUp(self) -> None:
         self.engine = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
@@ -1028,6 +1643,423 @@ class HeapAllocOracleTests(unittest.TestCase):
         result = self.alloc(heap, 0, 1)
         self.assert_stdcall(result, 0)
         self.assertEqual(self.state["heaps"][0], metadata_before)
+
+
+class ProcessOracleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.engine = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
+        self.engine.mem_map(STACK_BASE, PAGE_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_map(TEB_BASE, TEB_SIZE, unicorn.UC_PROT_ALL)
+        self.engine.mem_write(TEB_BASE + 0x34,
+                              struct.pack("<I", LAST_ERROR_SENTINEL))
+        self.mapped_ranges = [
+            (STACK_BASE, STACK_BASE + PAGE_SIZE),
+            (TEB_BASE, TEB_BASE + TEB_SIZE),
+        ]
+        self.process = _initialize_process_arena(
+            self.engine, 0x00400000, 0x1000, unicorn)
+        self.mapped_ranges.append(
+            (PROCESS_BASE, PROCESS_BASE + PROCESS_COMMITTED_SIZE))
+        self.state = {
+            "last_ip": 0x00102030,
+            "api_calls": [],
+            "process": self.process,
+            "resume": False,
+            "status": None,
+        }
+        self.register_values = {
+            x86_const.UC_X86_REG_EAX: EAX_SENTINEL,
+            x86_const.UC_X86_REG_ECX: 0x11111111,
+            x86_const.UC_X86_REG_EDX: 0x22222222,
+            x86_const.UC_X86_REG_EBX: 0x33333333,
+            x86_const.UC_X86_REG_EBP: 0x44444444,
+            x86_const.UC_X86_REG_ESI: 0x55555555,
+            x86_const.UC_X86_REG_EDI: 0x66666666,
+        }
+
+    def _prepare_cpu(self, *, esp: int = STACK_BASE,
+                     argument: int | None = None) -> None:
+        if esp == STACK_BASE:
+            frame = ((RETURN_ADDRESS,) if argument is None else
+                     (RETURN_ADDRESS, argument & 0xFFFFFFFF))
+            self.engine.mem_write(esp, struct.pack("<" + "I" * len(frame), *frame))
+        self.engine.reg_write(x86_const.UC_X86_REG_ESP, esp)
+        self.engine.reg_write(x86_const.UC_X86_REG_EIP, IMPORT_BASE + 43)
+        self.engine.reg_write(x86_const.UC_X86_REG_EFLAGS, FLAGS_SENTINEL)
+        for register, value in self.register_values.items():
+            self.engine.reg_write(register, value)
+
+    def _call(self, name: str, *, argument: int | None = None,
+              esp: int = STACK_BASE) -> dict:
+        self._prepare_cpu(esp=esp, argument=argument)
+        flags_before = (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                        EFLAGS_MASK)
+        handled = _guest_process_import(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": name, "index": 43},
+            self.mapped_ranges, self.state)
+        return {
+            "handled": handled,
+            "flags_before": flags_before,
+            "eax_after": self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+            "esp_after": self.engine.reg_read(x86_const.UC_X86_REG_ESP),
+            "eip_after": self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+            "flags_after": (self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                            EFLAGS_MASK),
+        }
+
+    def _assert_nonresult_registers_preserved(self) -> None:
+        for register, value in self.register_values.items():
+            if register != x86_const.UC_X86_REG_EAX:
+                self.assertEqual(self.engine.reg_read(register), value)
+
+    def _assert_last_error(self) -> None:
+        actual = struct.unpack(
+            "<I", self.engine.mem_read(TEB_BASE + 0x34, 4))[0]
+        self.assertEqual(actual, LAST_ERROR_SENTINEL)
+
+    def test_arena_contains_only_canonical_process_strings_and_zero_fill(self) -> None:
+        data = bytes(self.engine.mem_read(PROCESS_BASE, PROCESS_COMMITTED_SIZE))
+        self.assertEqual(data[:len(PROCESS_COMMAND_LINE_BYTES)],
+                         PROCESS_COMMAND_LINE_BYTES)
+        self.assertEqual(data[len(PROCESS_COMMAND_LINE_BYTES):0x1000],
+                         bytes(0x1000 - len(PROCESS_COMMAND_LINE_BYTES)))
+        self.assertEqual(data[0x1000:0x1002], b"\0\0")
+        self.assertEqual(data[0x2000:0x2004], b"\0\0\0\0")
+        self.assertEqual(data[0x2004:], bytes(PROCESS_COMMITTED_SIZE - 0x2004))
+        self.assertEqual(self.process["initialized"], 1)
+        self.assertEqual(self.process["base"], PROCESS_BASE)
+        self.assertEqual(self.process["reserved_size"], PROCESS_RESERVED_SIZE)
+        self.assertEqual(self.process["committed_size"], PROCESS_COMMITTED_SIZE)
+        self.assertEqual(self.process["profile"], PROCESS_PROFILE)
+        self.assertEqual(self.process["command_line"], PROCESS_COMMAND_LINE)
+        self.assertEqual(self.process["environment_a_address"], PROCESS_ENV_A_BASE)
+        self.assertEqual(self.process["environment_w_address"], PROCESS_ENV_W_BASE)
+        self.assertEqual((self.process["environment_a_refs"],
+                          self.process["environment_w_refs"]), (0, 0))
+        region = next(region for region in self.engine.mem_regions()
+                      if region[0] == PROCESS_BASE)
+        self.assertEqual(region[1], PROCESS_BASE + PROCESS_COMMITTED_SIZE - 1)
+        self.assertEqual(region[2] & (unicorn.UC_PROT_READ | unicorn.UC_PROT_WRITE),
+                         unicorn.UC_PROT_READ | unicorn.UC_PROT_WRITE)
+        self.assertEqual(region[2] & unicorn.UC_PROT_EXEC, 0)
+
+    def test_three_configured_process_queries_obey_zero_arg_x86_abi(self) -> None:
+        expected = {
+            "GetCommandLineA": PROCESS_BASE,
+            "GetACP": 1252,
+            "GetOEMCP": 437,
+        }
+        for name, result_value in expected.items():
+            with self.subTest(name=name):
+                self.state.update(api_calls=[], resume=False, status=None)
+                result = self._call(name)
+                self.assertTrue(result["handled"])
+                self.assertEqual(result["eax_after"], result_value)
+                self.assertEqual(result["esp_after"], STACK_BASE + 4)
+                self.assertEqual(result["eip_after"], RETURN_ADDRESS)
+                self.assertEqual(result["flags_after"], result["flags_before"])
+                self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, 4)),
+                                 struct.pack("<I", RETURN_ADDRESS))
+                self._assert_nonresult_registers_preserved()
+                self._assert_last_error()
+                self.assertTrue(self.state["resume"])
+                self.assertEqual(len(self.state["api_calls"]), 1)
+                self.assertEqual(self.state["api_calls"][0]["name"], name)
+                self.assertEqual(self.state["api_calls"][0]["result"], result_value)
+                self.assertEqual(self.state["api_calls"][0]["last_error_policy"],
+                                 "preserved")
+        self.assertEqual(bytes(self.engine.mem_read(
+            PROCESS_BASE, len(PROCESS_COMMAND_LINE_BYTES))),
+            PROCESS_COMMAND_LINE_BYTES)
+
+    def test_environment_leases_return_stable_encoding_specific_empty_blocks(self) -> None:
+        cases = (
+            ("GetEnvironmentStrings", "FreeEnvironmentStringsA",
+             PROCESS_ENV_A_BASE, "environment_a_refs", b"\0\0"),
+            ("GetEnvironmentStringsW", "FreeEnvironmentStringsW",
+             PROCESS_ENV_W_BASE, "environment_w_refs", b"\0\0\0\0"),
+        )
+        for getter, freer, address, field, content in cases:
+            with self.subTest(encoding=field):
+                self.state.update(api_calls=[], resume=False, status=None)
+                first = self._call(getter)
+                second = self._call(getter)
+                self.assertTrue(first["handled"] and second["handled"])
+                self.assertEqual(first["eax_after"], address)
+                self.assertEqual(second["eax_after"], address)
+                self.assertEqual(first["esp_after"], STACK_BASE + 4)
+                self.assertEqual(second["eip_after"], RETURN_ADDRESS)
+                self.assertEqual(first["flags_after"], first["flags_before"])
+                self.assertEqual(second["flags_after"], second["flags_before"])
+                self.assertEqual(self.process[field], 2)
+                self.assertEqual(bytes(self.engine.mem_read(address, len(content))),
+                                 content)
+                self._assert_last_error()
+
+                release = self._call(freer, argument=address)
+                self.assertTrue(release["handled"])
+                self.assertEqual(release["eax_after"], 1)
+                self.assertEqual(release["esp_after"], STACK_BASE + 8)
+                self.assertEqual(release["eip_after"], RETURN_ADDRESS)
+                self.assertEqual(release["flags_after"], release["flags_before"])
+                self.assertEqual(self.process[field], 1)
+                self._assert_nonresult_registers_preserved()
+                self._assert_last_error()
+                self.assertEqual(self.state["api_calls"][-1]["references_after"], 1)
+
+    def test_environment_lease_cap_returns_null_and_sets_last_error_8(self) -> None:
+        cases = (
+            ("GetEnvironmentStrings", "environment_a_refs", PROCESS_ENV_A_BASE),
+            ("GetEnvironmentStringsW", "environment_w_refs", PROCESS_ENV_W_BASE),
+        )
+        for getter, field, address in cases:
+            with self.subTest(encoding=field):
+                self.state.update(api_calls=[], resume=False, status=None)
+                self.process[field] = 0
+                self.engine.mem_write(TEB_BASE + 0x34,
+                                      struct.pack("<I", LAST_ERROR_SENTINEL))
+                for count in range(1, PROCESS_ENV_LEASE_CAP + 1):
+                    acquired = self._call(getter)
+                    self.assertTrue(acquired["handled"])
+                    self.assertEqual(acquired["eax_after"], address)
+                    self.assertEqual(self.process[field], count)
+                    self.assertEqual(struct.unpack(
+                        "<I", self.engine.mem_read(TEB_BASE + 0x34, 4))[0],
+                        LAST_ERROR_SENTINEL)
+
+                result = self._call(getter)
+                self.assertTrue(result["handled"])
+                self.assertEqual(result["eax_after"], 0)
+                self.assertEqual(result["esp_after"], STACK_BASE + 4)
+                self.assertEqual(result["eip_after"], RETURN_ADDRESS)
+                self.assertEqual(result["flags_after"], result["flags_before"])
+                self.assertEqual(self.process[field], PROCESS_ENV_LEASE_CAP)
+                self.assertEqual(len(self.state["api_calls"]),
+                                 PROCESS_ENV_LEASE_CAP + 1)
+                self.assertEqual(struct.unpack(
+                    "<I", self.engine.mem_read(TEB_BASE + 0x34, 4))[0],
+                    ERROR_NOT_ENOUGH_MEMORY)
+                api = self.state["api_calls"][-1]
+                self.assertEqual(api["outcome"], "lease_limit")
+                self.assertEqual(api["last_error_policy"], "set_error_8")
+                self.assertEqual(api["last_error_after"], ERROR_NOT_ENOUGH_MEMORY)
+
+    def test_invalid_free_and_duplicate_free_stop_without_consuming_a_lease(self) -> None:
+        acquired = self._call("GetEnvironmentStrings")
+        self.assertEqual(acquired["eax_after"], PROCESS_ENV_A_BASE)
+        self.assertEqual(self.process["environment_a_refs"], 1)
+        self.state.update(api_calls=[], resume=False, status=None)
+
+        wrong_pointer = PROCESS_ENV_A_BASE + 1
+        invalid = self._call("FreeEnvironmentStringsA",
+                             argument=wrong_pointer)
+        self.assertFalse(invalid["handled"])
+        self.assertEqual(self.state["status"], "GUEST_STOP_API_STATE")
+        self.assertEqual(self.state["api_state_fault"]["reason"],
+                         "environment_free_mismatch")
+        self.assertEqual(self.state["api_state_fault"]["pointer"], wrong_pointer)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), STACK_BASE)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 43)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(invalid["flags_after"], invalid["flags_before"])
+        self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, 8)),
+                         struct.pack("<II", RETURN_ADDRESS, wrong_pointer))
+        self.assertEqual(self.process["environment_a_refs"], 1)
+        self.assertEqual(self.state["api_calls"], [])
+        self._assert_last_error()
+
+        self.state.update(api_calls=[], resume=False, status=None)
+        released = self._call("FreeEnvironmentStringsA",
+                              argument=PROCESS_ENV_A_BASE)
+        self.assertTrue(released["handled"])
+        self.assertEqual(released["eax_after"], 1)
+        self.assertEqual(self.process["environment_a_refs"], 0)
+        self.state.update(api_calls=[], resume=False, status=None)
+
+        duplicate = self._call("FreeEnvironmentStringsA",
+                               argument=PROCESS_ENV_A_BASE)
+        self.assertFalse(duplicate["handled"])
+        self.assertEqual(self.state["status"], "GUEST_STOP_API_STATE")
+        self.assertEqual(self.state["api_state_fault"]["reason"],
+                         "environment_free_mismatch")
+        self.assertEqual(self.process["environment_a_refs"], 0)
+        self.assertEqual(self.state["api_calls"], [])
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), STACK_BASE)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 43)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self._assert_last_error()
+
+    def test_cap_preflight_and_environment_read_faults_preserve_lease_state(self) -> None:
+        self.process["environment_w_refs"] = PROCESS_ENV_LEASE_CAP
+        self.state["tls_current_teb"] = 0
+        self.state.update(api_calls=[], resume=False, status=None)
+        self._prepare_cpu()
+        flags_before = self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) & EFLAGS_MASK
+        result = _guest_process_import(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "GetEnvironmentStringsW",
+             "index": 43},
+            self.mapped_ranges, self.state)
+        self.assertFalse(result)
+        self.assertEqual(self.state["status"], "GUEST_STOP_API_STATE")
+        self.assertEqual(self.state["api_state_fault"]["reason"], "no_current_teb")
+        self.assertEqual(self.process["environment_w_refs"], PROCESS_ENV_LEASE_CAP)
+        self.assertEqual(self.state["api_calls"], [])
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), STACK_BASE)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 43)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                         EFLAGS_MASK, flags_before)
+        self._assert_last_error()
+
+        self.process["environment_w_refs"] = PROCESS_ENV_LEASE_CAP
+        self.state["tls_current_teb"] = 0x00D00000
+        self.state.update(api_calls=[], resume=False, status=None)
+        self._prepare_cpu()
+        result = _guest_process_import(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "GetEnvironmentStringsW",
+             "index": 43},
+            self.mapped_ranges, self.state)
+        self.assertFalse(result)
+        self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+        self.assertEqual(self.state["memory_fault"], {
+            "access": "write", "address": 0x00D00000 + 0x34, "size": 4,
+        })
+        self.assertEqual(self.process["environment_w_refs"], PROCESS_ENV_LEASE_CAP)
+        self.assertEqual(self.state["api_calls"], [])
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), STACK_BASE)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 43)
+        self._assert_last_error()
+
+        self.state["tls_current_teb"] = TEB_BASE
+        self.process["environment_w_refs"] = 0
+        self.mapped_ranges = [pair for pair in self.mapped_ranges
+                              if pair[0] != PROCESS_BASE]
+        self.state.update(api_calls=[], resume=False, status=None)
+        result = self._call("GetEnvironmentStrings")
+        self.assertFalse(result["handled"])
+        self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+        self.assertEqual(self.state["memory_fault"], {
+            "access": "read", "address": PROCESS_ENV_A_BASE, "size": 2,
+        })
+        self.assertEqual(self.process["environment_a_refs"], 0)
+        self.assertEqual(self.state["api_calls"], [])
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self._assert_last_error()
+
+    def test_free_validates_the_complete_call_frame_before_consuming(self) -> None:
+        self.process["environment_a_refs"] = 1
+        bad_esp = STACK_BASE + PAGE_SIZE - 4
+        self.state.update(api_calls=[], resume=False, status=None)
+        result = self._call("FreeEnvironmentStringsA",
+                            argument=PROCESS_ENV_A_BASE, esp=bad_esp)
+        self.assertFalse(result["handled"])
+        self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+        self.assertEqual(self.state["memory_fault"], {
+            "access": "read", "address": bad_esp, "size": 8,
+        })
+        self.assertEqual(self.process["environment_a_refs"], 1)
+        self.assertEqual(self.state["api_calls"], [])
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), bad_esp)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 43)
+        self._assert_last_error()
+
+    def test_uninitialized_process_is_state_stop_without_cpu_or_api_mutation(self) -> None:
+        self.state["process"] = {"initialized": 0}
+        self._prepare_cpu()
+        before = {register: self.engine.reg_read(register)
+                  for register in self.register_values}
+        before_eip = self.engine.reg_read(x86_const.UC_X86_REG_EIP)
+        before_esp = self.engine.reg_read(x86_const.UC_X86_REG_ESP)
+        result = _guest_process_import(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "GetACP", "index": 43},
+            self.mapped_ranges, self.state)
+        self.assertFalse(result)
+        self.assertEqual(self.state["status"], "GUEST_STOP_API_STATE")
+        self.assertEqual(self.state["target"], PROCESS_BASE)
+        self.assertEqual(self.state["api_state_fault"]["reason"],
+                         "process_not_initialized")
+        self.assertEqual(self.state["api_calls"], [])
+        self.assertFalse(self.state["resume"])
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP), before_eip)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), before_esp)
+        for register, value in before.items():
+            self.assertEqual(self.engine.reg_read(register), value)
+        self._assert_last_error()
+
+    def test_frame_and_returned_command_line_faults_are_transactional(self) -> None:
+        bad_esp = STACK_BASE + PAGE_SIZE - 2
+        self.state.update(api_calls=[], resume=False, status=None)
+        self._prepare_cpu(esp=bad_esp)
+        flags_before = self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) & EFLAGS_MASK
+        result = _guest_process_import(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "GetACP", "index": 43},
+            self.mapped_ranges, self.state)
+        self.assertFalse(result)
+        self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+        self.assertEqual(self.state["memory_fault"],
+                         {"access": "read", "address": bad_esp, "size": 4})
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), bad_esp)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 43)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                         EFLAGS_MASK, flags_before)
+        self.assertEqual(self.state["api_calls"], [])
+        self._assert_nonresult_registers_preserved()
+
+        self.state.update(api_calls=[], resume=False, status=None)
+        self._prepare_cpu()
+        self.mapped_ranges = [pair for pair in self.mapped_ranges
+                              if pair[0] != PROCESS_BASE]
+        flags_before = self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) & EFLAGS_MASK
+        result = _guest_process_import(
+            self.engine, x86_const, unicorn,
+            {"library": "KERNEL32.dll", "name": "GetCommandLineA", "index": 43},
+            self.mapped_ranges, self.state)
+        self.assertFalse(result)
+        self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+        self.assertEqual(self.state["memory_fault"],
+                         {"access": "read", "address": PROCESS_BASE,
+                          "size": len(PROCESS_COMMAND_LINE_BYTES)})
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), STACK_BASE)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         IMPORT_BASE + 43)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX),
+                         EAX_SENTINEL)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS) &
+                         EFLAGS_MASK, flags_before)
+        self.assertEqual(self.state["api_calls"], [])
+        self._assert_nonresult_registers_preserved()
+        self._assert_last_error()
+
+    def test_initialization_rejects_image_and_existing_vm_overlap(self) -> None:
+        with self.assertRaisesRegex(ValueError, "image overlaps"):
+            _initialize_process_arena(
+                self.engine, PROCESS_BASE + 0x100, 0x100, unicorn)
+
+        other = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
+        other.mem_map(PROCESS_BASE + 0x3000, 0x1000, unicorn.UC_PROT_READ)
+        with self.assertRaisesRegex(ValueError, "existing accessible VM region"):
+            _initialize_process_arena(other, 0x00400000, 0x1000, unicorn)
 
 
 if __name__ == "__main__":

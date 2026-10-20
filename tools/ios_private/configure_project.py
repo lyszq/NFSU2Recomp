@@ -13,6 +13,6 @@ target["sources"].extend({"path": "../gen/ios-private/" + name}
                          for name in ["lifted.c", "private_probe.c", "startup_lifted.c", "startup_probe.c"])
 target["settings"]["base"]["HEADER_SEARCH_PATHS"] = ["$(inherited)", "$(SRCROOT)/../runtime"]
 target["settings"]["base"]["GCC_PREPROCESSOR_DEFINITIONS"] = ["$(inherited)", "NFS_PRIVATE_PROBE=1", "NFS_PRIVATE_STARTUP=1"]
-target["info"]["properties"]["CFBundleShortVersionString"] = "0.8.1"
-target["info"]["properties"]["CFBundleVersion"] = "13"
+target["info"]["properties"]["CFBundleShortVersionString"] = "0.9.1"
+target["info"]["properties"]["CFBundleVersion"] = "15"
 (root / "ios/project-private.yml").write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8", newline="\n")
