@@ -108,10 +108,11 @@ static int heap_import(CPU *c, const GuestImport *import, GuestWindows *windows,
      * provide. Stop before altering state rather than silently drop flags. */
     if ((create && (a & ~1u)) || (alloc && (b & ~9u)) ||
         ((release || size) && (b & ~1u))) return 0;
+    void *error = NULL;
     if (!alloc && !size) {
         if (!c->fs_base) { *fault=0; return -2; }
         uint64_t error_at=(uint64_t)c->fs_base+0x34u;
-        void *error=error_at<=UINT32_MAX ? guest_memory_pointer((uint32_t)error_at,4,1) : NULL;
+        error=error_at<=UINT32_MAX ? guest_memory_pointer((uint32_t)error_at,4,1) : NULL;
         if (!error) { *fault=error_at>UINT32_MAX ? UINT32_MAX : (uint32_t)error_at; return -1; }
     }
     int rc;
