@@ -112,3 +112,19 @@ Independent x86 and native execution must match all trace/register/memory hashes
 and object counts. Version 0.7.1/build 11 is the new combined device probe;
 physical confirmation is pending. All earlier build-specific boundaries above
 are historical. Keep the private artifact and provenance private.
+
+The private workflow first verifies actual lifted entry execution twice on Linux,
+then repeats generation/native execution on the macOS host before making the
+iOS ARM64 IPA. Both hosts use run_native_probe.sh, which records its real host
+architecture. Only diagnostic text leaves the Linux runner; EXE and generated
+C remain private and are removed locally during cleanup.
+
+The normal macOS host remains macos-15. If its runner queue stalls, select the
+standard ARM64 macos-26 runner without changing the game/runtime code:
+
+```powershell
+python tools/ios_private/provision.py --dispatch --macos-runner macos-26
+```
+
+Runner-label reference:
+https://docs.github.com/en/actions/reference/runners/github-hosted-runners

@@ -79,6 +79,8 @@ def main():
     parser.add_argument("--create", action="store_true", help="create a new PRIVATE control repository if absent")
     parser.add_argument("--exe", type=Path, help="upload only the authenticated EXE as a PRIVATE release asset")
     parser.add_argument("--dispatch", action="store_true", help="start the configured private workflow")
+    parser.add_argument("--macos-runner", choices=["macos-15", "macos-26"], default="macos-15",
+                        help="standard ARM64 macOS runner; keep 15 as the default, 26 as a queue fallback")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.repository):
         raise ValueError("invalid repository name")
@@ -139,9 +141,9 @@ def main():
         client.private()
         branch = client.private()["default_branch"]
         client.api(f"/repos/{client.repository}/actions/workflows/ios-private.yml/dispatches",
-                   "POST", body={"ref": branch})
+                   "POST", body={"ref": branch, "inputs": {"macos_runner": args.macos_runner}})
     print(json.dumps({"repository": client.repository, "private": client.private()["private"],
-                      "source_sha": sha, "dispatched": args.dispatch,
+                      "source_sha": sha, "dispatched": args.dispatch, "macos_runner": args.macos_runner,
                       "url": f"https://github.com/{client.repository}/actions"}, indent=2))
 
 

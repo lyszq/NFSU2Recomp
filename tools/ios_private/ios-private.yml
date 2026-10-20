@@ -2,6 +2,14 @@
 name: Private native game-entry probe IPA
 on:
   workflow_dispatch:
+    inputs:
+      macos_runner:
+        description: Native ARM64 macOS build host
+        type: choice
+        default: macos-15
+        options:
+          - macos-15
+          - macos-26
 permissions:
   contents: read
 env:
@@ -62,7 +70,7 @@ jobs:
   private-ios:
     if: github.event.repository.private == true
     needs: native-reference-linux
-    runs-on: macos-15
+    runs-on: ${{ inputs.macos_runner || 'macos-15' }}
     timeout-minutes: 40
     steps:
       - name: Require private repository and pinned public source
