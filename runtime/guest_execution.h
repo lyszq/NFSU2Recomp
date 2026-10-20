@@ -8,6 +8,9 @@ typedef struct GuestImport {
     uint32_t iat;
     const char *library, *name;
 } GuestImport;
+/* 1 = completed stdcall, 0 = unsupported without side effects, -1 = memory
+ * fault (address returned through fault). Handler validates before mutation. */
+typedef int (*GuestImportHandler)(CPU *, const GuestImport *, void *, uint32_t *fault);
 enum GuestStop {
     GUEST_STOP_RETURN = 1, GUEST_STOP_IMPORT, GUEST_STOP_UNRESOLVED,
     GUEST_STOP_INSTRUCTION, GUEST_STOP_MEMORY, GUEST_STOP_BUDGET,
@@ -16,7 +19,7 @@ enum GuestStop {
 typedef struct GuestExecutionResult {
     enum GuestStop stop;
     uint32_t ip, target, import_index;
-    uint64_t instructions, calls, trace_hash;
+    uint64_t instructions, calls, trace_hash, imports_handled;
     uint32_t maximum_depth;
     CPU cpu;
 } GuestExecutionResult;
@@ -25,6 +28,8 @@ typedef struct GuestExecutionConfig {
     const GuestImport *imports;
     uint32_t import_count, instruction_budget, depth_limit;
     uint64_t timeout_ns;
+    GuestImportHandler import_handler;
+    void *import_context;
 } GuestExecutionConfig;
 
 /* Validate every IAT slot before writing any. Uses the upstream 0xF... tag

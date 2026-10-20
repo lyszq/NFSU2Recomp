@@ -54,6 +54,13 @@ void guest_execution_call(CPU *cpu, uint32_t target) {
         uint32_t index = target - GUEST_IMPORT_BASE;
         if (index < active->config.import_count) {
             active->result.import_index = index;
+            if (active->config.import_handler) {
+                uint32_t fault = 0;
+                int handled = active->config.import_handler(cpu, &active->config.imports[index],
+                    active->config.import_context, &fault);
+                if (handled < 0) stop(GUEST_STOP_MEMORY, fault);
+                if (handled > 0) { active->result.imports_handled++; return; }
+            }
             stop(GUEST_STOP_IMPORT, target);
         }
         stop(GUEST_STOP_UNRESOLVED, target);
@@ -102,6 +109,8 @@ int guest_execution_run(const GuestExecutionConfig *config, CPU *cpu, uint32_t e
         !config->depth_limit || config->depth_limit > 128 || !config->timeout_ns ||
         config->import_count > 4096 || (config->import_count && !config->imports)) return EINVAL;
     if (active) return EBUSY;
+    for (uint32_t i=0;i<config->import_count;i++)
+        if (!config->imports[i].library || !config->imports[i].name) return EINVAL;
     Execution *execution = calloc(1, sizeof *execution);
     if (!execution) return ENOMEM;
     execution->config = *config;
