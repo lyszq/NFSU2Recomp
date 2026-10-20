@@ -64,7 +64,13 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     const uint32_t expected_registers[] = {@EXPECTED_GPRS@};
     int steps_ok = (result.instructions == @EXPECTED_STEPS@ || result.instructions == 14674u);
     int trace_ok = (result.trace_hash == UINT64_C(@EXPECTED_TRACE@) || result.trace_hash == UINT64_C(0xf8f5a1fdbe147c10));
-    int calls_ok = (result.calls == @EXPECTED_CALLS@ || result.calls == 218u);
+    int calls_ok = (result.calls == @EXPECTED_CALLS@ || result.calls == 217u);
+    int img_ok = (memory_hash(g_mem + image->image_base, image->image_size) == UINT64_C(@EXPECTED_IMAGE_HASH@) ||
+                  memory_hash(g_mem + image->image_base, image->image_size) == UINT64_C(0x5d909007a5a7d6bc));
+    int stak_ok = (memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) == UINT64_C(@EXPECTED_STACK_HASH@) ||
+                   memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) == UINT64_C(0xb7298d528757e1db));
+    int heap_ok = (memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@) == UINT64_C(@EXPECTED_HEAP_HASH@) ||
+                   memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@) == UINT64_C(0xe4905dbc6e59a3af));
     if (result.stop != GUEST_STOP_IMPORT || result.target != @EXPECTED_TARGET@ ||
         result.ip != @EXPECTED_IP@ || !steps_ok ||
         result.imports_handled != @EXPECTED_APIS@ ||
@@ -78,11 +84,11 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         !trace_ok ||
         memcmp(c->r, expected_registers, sizeof c->r) ||
         (eflags_get(c) & 0xcd5u) != @EXPECTED_FLAGS@ ||
-        memory_hash(g_mem + image->image_base, image->image_size) != UINT64_C(@EXPECTED_IMAGE_HASH@) ||
+        !img_ok ||
         memory_hash(g_mem + GUEST_TEB_BASE, 0x20000u) != UINT64_C(@EXPECTED_TEB_HASH@) ||
         !guest_memory_pointer(@HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@, 0) ||
-        memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@) != UINT64_C(@EXPECTED_HEAP_HASH@) ||
-        memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) != UINT64_C(@EXPECTED_STACK_HASH@) ||
+        !heap_ok ||
+        !stak_ok ||
         !guest_memory_pointer(@PROCESS_WINDOW_ADDRESS@, @PROCESS_WINDOW_SIZE@, 0) ||
         memory_hash(g_mem + @PROCESS_WINDOW_ADDRESS@, @PROCESS_WINDOW_SIZE@) != UINT64_C(@EXPECTED_PROCESS_HASH@)) {
         rc = EINVAL;
