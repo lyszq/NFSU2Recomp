@@ -50,13 +50,24 @@ HEAP_ARENA_SIZE = 0x04000000
 HEAP_HEADER_SIZE = 0x4000
 HEAP_GRANULE = 0x4000
 HEAP_MAX_COUNT = 4
+HEAP_MAX_BLOCKS = 256
 HEAP_SUPPORTED_FLAGS = 0x01
+HEAP_ALLOC_SUPPORTED_FLAGS = 0x09  # HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY
 CRITICAL_SECTION_SIZE = 24
 CRITICAL_SECTION_MAX_COUNT = 64
 CRITICAL_SECTION_MAX_RECURSION = 0x7FFFFFFF
 TEB_THREAD_ID_OFFSET = 0x24
+TEB_TLS_SLOTS_OFFSET = 0xE10
+TLS_SLOT_COUNT = 64
+TLS_SLOT_BYTES = TLS_SLOT_COUNT * 4
+TLS_MAX_THREAD_COUNT = 64
+TLS_IMPORTS = {"TlsAlloc", "TlsFree", "TlsGetValue", "TlsSetValue"}
 BOUNDARY_ARGUMENT_COUNTS = {
+    "GetCurrentThreadId": 0,
     "TlsAlloc": 0,
+    "TlsFree": 1,
+    "TlsGetValue": 1,
+    "TlsSetValue": 2,
     "HeapCreate": 3,
     "HeapAlloc": 3,
     "HeapFree": 3,
@@ -78,8 +89,11 @@ CRITICAL_SECTION_IMPORTS = {
 SUPPORTED_IMPORTS = {
     ("kernel32.dll", "GetVersionExA"),
     ("kernel32.dll", "GetModuleHandleA"),
+    ("kernel32.dll", "GetCurrentThreadId"),
     ("kernel32.dll", "HeapCreate"),
+    ("kernel32.dll", "HeapAlloc"),
     *(("kernel32.dll", name) for name in CRITICAL_SECTION_IMPORTS),
+    *(("kernel32.dll", name) for name in TLS_IMPORTS),
 }
 ERROR_MOD_NOT_FOUND = 126
 
@@ -100,6 +114,25 @@ def _range_is_mapped(address: int, size: int, ranges: list[tuple[int, int]]) -> 
         return False
     end = address + size
     return any(start <= address and end <= stop for start, stop in ranges)
+
+
+def _range_has_permissions(engine: Any, address: int, size: int, permissions: int,
+                           ranges: list[tuple[int, int]]) -> bool:
+    """Require a whole guest range to be mapped and have the requested Unicorn permissions."""
+    if not _range_is_mapped(address, size, ranges):
+        return False
+    end = address + size
+    cursor = address
+    for region_start, region_end, region_permissions in engine.mem_regions():
+        region_end += 1  # Unicorn reports inclusive region ends.
+        if region_end <= cursor or region_start >= end:
+            continue
+        if region_start > cursor or region_permissions & permissions != permissions:
+            return False
+        cursor = min(end, region_end)
+        if cursor == end:
+            return True
+    return False
 
 
 class _GuestPointerFault(Exception):
@@ -266,6 +299,75 @@ def _get_module_handle_a(engine: Any, registers: Any, import_row: dict[str, Any]
         return False
 
 
+def _get_current_thread_id(engine: Any, registers: Any, unicorn_module: Any,
+                           import_row: dict[str, Any],
+                           mapped_ranges: list[tuple[int, int]],
+                           state: dict[str, Any]) -> bool:
+    """Read the active guest TEB thread ID and return it with the x86 ABI."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api: dict[str, Any] = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 0,
+    }
+    state["api_calls"].append(api)
+
+    def stop_state(reason: str, address: int, **details: Any) -> bool:
+        api["outcome"] = "invalid_state"
+        api["state_error"] = reason
+        api.update(details)
+        state["status"] = "GUEST_STOP_API_STATE"
+        state["target"] = address & 0xFFFFFFFF
+        state["api_state_fault"] = {
+            "api": import_row["name"],
+            "address": address & 0xFFFFFFFF,
+            "reason": reason,
+            **details,
+        }
+        return False
+
+    def read_fault(address: int, size: int) -> None:
+        if not _range_has_permissions(engine, address, size,
+                                      unicorn_module.UC_PROT_READ, mapped_ranges):
+            raise _GuestPointerFault("read", address & 0xFFFFFFFF, size)
+
+    try:
+        read_fault(esp, 4)
+        return_address = _read_u32(engine, esp)
+        teb = int(state.get("tls_current_teb", TEB_BASE))
+        thread_id_address = teb + TEB_THREAD_ID_OFFSET
+        if (teb < 0 or teb > 0xFFFFFFFF or thread_id_address > 0xFFFFFFFF):
+            raise _GuestPointerFault(
+                "read", min(max(thread_id_address, 0), 0xFFFFFFFF), 4)
+        read_fault(thread_id_address, 4)
+        thread_id = _read_u32(engine, thread_id_address)
+        api.update(return_address=return_address, teb=teb,
+                   thread_id_address=thread_id_address, thread_id=thread_id,
+                   arguments=[])
+        if thread_id == 0:
+            return stop_state("current_thread_id_invalid", thread_id_address)
+
+        engine.reg_write(registers.UC_X86_REG_EAX, thread_id)
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 4)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        api.update(outcome="success", result=thread_id,
+                   esp_after=(esp + 4) & 0xFFFFFFFF)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
 def _round_up(value: int, granule: int) -> int:
     return (value + granule - 1) & ~(granule - 1)
 
@@ -351,6 +453,8 @@ def _heap_create(engine: Any, registers: Any, unicorn_module: Any,
             "flags": flags,
             "committed_size": committed_size,
             "live_blocks": 0,
+            "fixed": bool(maximum_size),
+            "blocks": [],
         }
         state["heaps"][slot] = heap
 
@@ -385,12 +489,176 @@ def _heap_create(engine: Any, registers: Any, unicorn_module: Any,
             "capacity": capacity,
             "committed_size": committed_size,
             "live_blocks": 0,
+            "fixed": bool(maximum_size),
+            "blocks": [],
         }
     else:
         api["error"] = error
     state["api_calls"].append(api)
 
     engine.reg_write(registers.UC_X86_REG_EAX, handle)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 16)
+    engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+    state["resume"] = True
+    return True
+
+
+def _heap_alloc(engine: Any, registers: Any, unicorn_module: Any,
+                import_row: dict[str, Any],
+                mapped_ranges: list[tuple[int, int]], state: dict[str, Any]) -> bool:
+    """Apply the native bounded HeapAlloc first-fit and payload-zeroing policy."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    if not _range_is_mapped(esp, 16, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 16}
+        return False
+
+    return_address = _read_u32(engine, esp)
+    handle = _read_u32(engine, esp + 4)
+    flags = _read_u32(engine, esp + 8)
+    size = _read_u32(engine, esp + 12)
+    if flags & ~HEAP_ALLOC_SUPPORTED_FLAGS:
+        # The Windows bridge leaves unsupported capabilities at the import
+        # stop rather than silently dropping them.
+        return False
+
+    heaps = state.get("heaps", {})
+    heap = next((record for record in heaps.values()
+                 if record.get("handle") == handle), None)
+    result = 0
+    outcome = "invalid_heap"
+    failure: str | None = "EINVAL"
+    block_slot: int | None = None
+    span = _round_up(size if size else 1, 8)
+    candidate = 0
+    if heap is not None:
+        blocks = heap.get("blocks", [])
+        if not isinstance(blocks, list):
+            state["status"] = "GUEST_STOP_API_STATE"
+            state["target"] = handle
+            state["api_state_fault"] = {
+                "api": "HeapAlloc",
+                "address": handle,
+                "reason": "heap_block_metadata_invalid",
+            }
+            return False
+        fixed = bool(heap.get("fixed", heap.get("maximum_size", 0) != 0))
+        capacity = int(heap["capacity"])
+        if fixed and size >= 0x7FFF8:
+            failure = "ENOMEM_FIXED_LIMIT"
+        elif span > capacity:
+            failure = "ENOMEM_CAPACITY"
+        elif len(blocks) >= HEAP_MAX_BLOCKS:
+            failure = "ENOMEM_BLOCK_LIMIT"
+        else:
+            block_slot = next((slot for slot in range(HEAP_MAX_BLOCKS)
+                               if all(int(block.get("slot", i)) != slot
+                                      for i, block in enumerate(blocks))), None)
+            if block_slot is None:
+                failure = "ENOMEM_BLOCK_LIMIT"
+            else:
+                candidate = handle + HEAP_HEADER_SIZE
+                while True:
+                    next_candidate = candidate
+                    for block in blocks:
+                        address = int(block["address"])
+                        block_span = int(block["span"])
+                        if (address and candidate + span > address and
+                                candidate < address + block_span and
+                                address + block_span > next_candidate):
+                            next_candidate = address + block_span
+                    if next_candidate == candidate:
+                        break
+                    candidate = next_candidate
+                limit = handle + HEAP_HEADER_SIZE + capacity
+                if candidate + span > limit:
+                    failure = "ENOMEM_CAPACITY"
+                else:
+                    failure = None
+
+    # HeapAlloc deliberately does not read or write LastError. All failures
+    # return NULL and preserve the complete guest call state apart from ABI
+    # return registers, just as the native import bridge does.
+    committed_before = int(heap["committed_size"]) if heap is not None else 0
+    committed_after = committed_before
+    if failure is None:
+        assert heap is not None and block_slot is not None
+        commit_end = _round_up(candidate + span, HEAP_GRANULE)
+        old_end = handle + committed_before
+        if commit_end > old_end:
+            tail_start = max(old_end, handle)
+            tail_size = commit_end - tail_start
+            try:
+                engine.mem_map(
+                    tail_start, tail_size,
+                    unicorn_module.UC_PROT_READ | unicorn_module.UC_PROT_WRITE,
+                )
+                # New native anonymous guest pages are zero-filled on commit.
+                engine.mem_write(tail_start, bytes(tail_size))
+            except Exception:
+                failure = "ENOMEM_COMMIT"
+            else:
+                for index, (start, end) in enumerate(mapped_ranges):
+                    if start == handle and end == old_end:
+                        mapped_ranges[index] = (handle, commit_end)
+                        break
+                else:
+                    mapped_ranges.append((tail_start, commit_end))
+                committed_after = commit_end - handle
+
+    if failure is None:
+        if flags & 0x08 and size:
+            engine.mem_write(candidate, bytes(size))
+        block = {"slot": block_slot, "address": candidate,
+                 "size": size, "span": span}
+        heap["blocks"].append(block)
+        heap["live_blocks"] = len(heap["blocks"])
+        heap["committed_size"] = committed_after
+        result = candidate
+        outcome = "allocated"
+    else:
+        outcome = "failed"
+
+    api: dict[str, Any] = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "return_address": return_address,
+        "handle": handle,
+        "flags": flags,
+        "size": size,
+        "span": span,
+        "result": result,
+        "last_error_policy": "preserved",
+        "outcome": outcome,
+        "failure": failure,
+        "esp_after": (esp + 16) & 0xFFFFFFFF,
+    }
+    if heap is not None:
+        api["heap"] = {
+            "slot": heap["slot"],
+            "handle": heap["handle"],
+            "capacity": heap["capacity"],
+            "committed_size": heap["committed_size"],
+            "fixed": bool(heap.get("fixed", False)),
+            "live_blocks": heap["live_blocks"],
+            "blocks": [dict(block) for block in heap["blocks"]],
+        }
+    if result:
+        api["allocation"] = {
+            "slot": block_slot,
+            "address": candidate,
+            "size": size,
+            "span": span,
+            "zero_memory": bool(flags & 0x08),
+        }
+    state["api_calls"].append(api)
+
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
     engine.reg_write(registers.UC_X86_REG_ESP, esp + 16)
     engine.reg_write(registers.UC_X86_REG_EIP, return_address)
     state["resume"] = True
@@ -574,6 +842,272 @@ def _critical_section_import(engine: Any, registers: Any, import_row: dict[str, 
         engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
         engine.reg_write(registers.UC_X86_REG_EIP, return_address)
         api["esp_after"] = (esp + 8) & 0xFFFFFFFF
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
+def _tls_import(engine: Any, registers: Any, unicorn_module: Any,
+                import_row: dict[str, Any], mapped_ranges: list[tuple[int, int]],
+                state: dict[str, Any]) -> bool:
+    """Model the bounded 32-bit dynamic TLS APIs against guest TEB slot bytes.
+
+    The process allocation bitmap is oracle state; each registered thread's
+    values live in its x86 TEB TlsSlots[64] at +0xe10. Static PE TLS remains
+    separate at ThreadLocalStoragePointer (+0x2c). Invalid/unallocated keys
+    are strict API_STATE stops for this emulator contract.
+    """
+    name = import_row["name"]
+    if name not in TLS_IMPORTS:
+        return False
+    argc = BOUNDARY_ARGUMENT_COUNTS[name]
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api: dict[str, Any] = {
+        "library": import_row["library"],
+        "name": name,
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": argc,
+    }
+    state["api_calls"].append(api)
+
+    def stop_state(reason: str, address: int, **details: Any) -> bool:
+        api["outcome"] = "invalid_state"
+        api["state_error"] = reason
+        api.update(details)
+        state["status"] = "GUEST_STOP_API_STATE"
+        state["target"] = address & 0xFFFFFFFF
+        state["api_state_fault"] = {
+            "api": name,
+            "address": address & 0xFFFFFFFF,
+            "reason": reason,
+            **details,
+        }
+        return False
+
+    def require_range(address: int, size: int, permissions: int,
+                      access: str) -> None:
+        if not _range_has_permissions(engine, address, size, permissions,
+                                      mapped_ranges):
+            raise _GuestPointerFault(access, min(max(address, 0), 0xFFFFFFFF), size)
+
+    def checked_address(base: int, offset: int, size: int, access: str) -> int:
+        address = base + offset
+        if (base < 0 or base > 0xFFFFFFFF or address > 0xFFFFFFFF or
+                size <= 0 or size > 0x100000000 - address):
+            raise _GuestPointerFault(access, min(max(address, 0), 0xFFFFFFFF), size)
+        return address
+
+    def write_fault(address: int, size: int) -> None:
+        require_range(address, size,
+                      unicorn_module.UC_PROT_READ | unicorn_module.UC_PROT_WRITE,
+                      "read_write")
+
+    try:
+        frame_size = 4 * (argc + 1)
+        require_range(esp, frame_size, unicorn_module.UC_PROT_READ, "read")
+        return_address = _read_u32(engine, esp)
+        arguments = [_read_u32(engine, esp + 4 * (i + 1)) for i in range(argc)]
+        api["return_address"] = return_address
+        api["arguments"] = arguments
+
+        teb = int(state.get("tls_current_teb", TEB_BASE))
+        last_error_address = checked_address(teb, LAST_ERROR_OFFSET, 4, "read_write")
+        # LastError is preflighted before any possible TLS mutation. Successful
+        # GetValue writes zero; other success paths preserve its current value.
+        write_fault(last_error_address, 4)
+        last_error_before = _read_u32(engine, last_error_address)
+
+        bitmap = int(state.get("tls_allocated_bitmap", 0))
+        slot_count = int(state.get("tls_slot_count", bitmap.bit_count()))
+        threads_obj = state.get("tls_threads", {})
+        if (not isinstance(threads_obj, dict) or bitmap < 0 or
+                bitmap >> TLS_SLOT_COUNT or slot_count != bitmap.bit_count()):
+            return stop_state("tls_process_state_invalid", teb,
+                              allocated_bitmap=bitmap, slot_count=slot_count)
+        threads = dict(threads_obj)
+        if len(threads) > TLS_MAX_THREAD_COUNT:
+            return stop_state("tls_thread_limit", teb,
+                              thread_count=len(threads))
+        if teb == 0:
+            return stop_state("tls_current_teb_invalid", teb)
+        for base, registered_id in threads.items():
+            if (not isinstance(base, int) or not isinstance(registered_id, int) or
+                    base < 0 or base > 0xFFFFFFFF or registered_id <= 0 or
+                    registered_id > 0xFFFFFFFF):
+                return stop_state("tls_thread_registry_invalid", teb)
+
+        # Match guest_tls_apply's failure ordering: basic set/count validation,
+        # then key validation, then TEB identity and thread registration. In
+        # particular, an invalid key does not probe TEB+0x24 first.
+        index = arguments[0] if arguments else None
+        value = arguments[1] if name == "TlsSetValue" else None
+        api["index"] = index
+        if name != "TlsAlloc":
+            if int(index) >= TLS_SLOT_COUNT:
+                return stop_state("tls_index_out_of_range", int(index),
+                                  tls_slot_limit=TLS_SLOT_COUNT)
+            if not (bitmap & (1 << int(index))):
+                return stop_state("tls_index_not_allocated", int(index),
+                                  allocated_bitmap=bitmap)
+
+        thread_id_address = checked_address(teb, TEB_THREAD_ID_OFFSET, 4, "read")
+        require_range(thread_id_address, 4, unicorn_module.UC_PROT_READ, "read")
+        thread_id = _read_u32(engine, thread_id_address)
+        api.update(teb=teb, thread_id=thread_id,
+                   last_error_before=last_error_before)
+        if thread_id == 0:
+            return stop_state("tls_current_thread_id_invalid", thread_id_address)
+        # guest_tls_apply requires the complete dynamic slot vector to fit in
+        # the x86 address space, including for an already registered TEB.
+        slots_address = checked_address(teb, TEB_TLS_SLOTS_OFFSET,
+                                        TLS_SLOT_BYTES, "read_write")
+
+        current_registered = teb in threads
+        if current_registered and threads[teb] != thread_id:
+            return stop_state("tls_thread_identity_changed", thread_id_address,
+                              registered_thread_id=threads[teb],
+                              current_thread_id=thread_id)
+        if not current_registered:
+            if thread_id in threads.values():
+                return stop_state("tls_thread_id_alias", thread_id_address,
+                                  thread_id=thread_id)
+            if any(teb < base + 0x1000 and base < teb + 0x1000
+                   for base in threads):
+                return stop_state("tls_thread_teb_overlap", teb)
+            if len(threads) >= TLS_MAX_THREAD_COUNT:
+                if name == "TlsAlloc":
+                    api.update(outcome="exhausted", result=0xFFFFFFFF,
+                               error=ERROR_NOT_ENOUGH_MEMORY,
+                               last_error_after=ERROR_NOT_ENOUGH_MEMORY,
+                               tls_slot_count=slot_count,
+                               tls_thread_count=len(threads),
+                               exhaustion="thread_limit")
+                    _write_u32(engine, last_error_address, ERROR_NOT_ENOUGH_MEMORY)
+                    engine.reg_write(registers.UC_X86_REG_EAX, 0xFFFFFFFF)
+                    engine.reg_write(registers.UC_X86_REG_ESP, esp + frame_size)
+                    engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+                    api["esp_after"] = (esp + frame_size) & 0xFFFFFFFF
+                    state["resume"] = True
+                    return True
+                return stop_state("tls_thread_limit", teb,
+                                  thread_count=len(threads))
+
+        allocated_index: int | None = None
+        if name == "TlsAlloc":
+            allocated_index = next((i for i in range(TLS_SLOT_COUNT)
+                                    if not (bitmap & (1 << i))), None)
+            if allocated_index is None:
+                result = 0xFFFFFFFF
+                last_error_after = ERROR_NOT_ENOUGH_MEMORY
+                _write_u32(engine, last_error_address, last_error_after)
+                api.update(outcome="exhausted", result=result,
+                           error=last_error_after,
+                           last_error_after=last_error_after,
+                           tls_slot_count=slot_count,
+                           tls_thread_count=len(threads))
+                engine.reg_write(registers.UC_X86_REG_EAX, result)
+                engine.reg_write(registers.UC_X86_REG_ESP, esp + frame_size)
+                engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+                api["esp_after"] = (esp + frame_size) & 0xFFFFFFFF
+                state["resume"] = True
+                return True
+
+        # Any operation which registers a new guest thread initializes its
+        # whole dynamic TLS vector. Existing threads are validated before the
+        # first write so alloc/free cannot leave a partially reset population.
+        if not current_registered:
+            write_fault(slots_address, TLS_SLOT_BYTES)
+        elif name in ("TlsGetValue", "TlsSetValue"):
+            selected = checked_address(teb, TEB_TLS_SLOTS_OFFSET + 4 * int(index),
+                                       4, "read_write" if name == "TlsSetValue" else "read")
+            need = (unicorn_module.UC_PROT_READ | unicorn_module.UC_PROT_WRITE
+                    if name == "TlsSetValue" else unicorn_module.UC_PROT_READ)
+            require_range(selected, 4, need,
+                          "read_write" if name == "TlsSetValue" else "read")
+
+        selected_addresses: list[int] = []
+        if name in ("TlsAlloc", "TlsFree"):
+            reset_index = allocated_index if name == "TlsAlloc" else int(index)
+            for base, registered_id in sorted(threads.items()):
+                tid_address = checked_address(base, TEB_THREAD_ID_OFFSET, 4, "read")
+                require_range(tid_address, 4, unicorn_module.UC_PROT_READ, "read")
+                if _read_u32(engine, tid_address) != registered_id:
+                    return stop_state("tls_thread_identity_changed", tid_address,
+                                      registered_thread_id=registered_id)
+                selected = checked_address(base,
+                                           TEB_TLS_SLOTS_OFFSET + 4 * reset_index,
+                                           4, "read_write")
+                write_fault(selected, 4)
+                selected_addresses.append(selected)
+
+        # Commit only after every memory range and state constraint above has
+        # been checked. New TEB slots are zeroed before storing the requested
+        # value; 32-bit TLS values are opaque and are never dereferenced.
+        if not current_registered:
+            engine.mem_write(slots_address, bytes(TLS_SLOT_BYTES))
+            threads[teb] = thread_id
+
+        result: int
+        if name == "TlsAlloc":
+            assert allocated_index is not None
+            for address in selected_addresses:
+                _write_u32(engine, address, 0)
+            bitmap |= 1 << allocated_index
+            slot_count += 1
+            result = allocated_index
+            outcome = "allocated"
+            api["allocated_index"] = allocated_index
+            last_error_after = last_error_before
+        elif name == "TlsFree":
+            for address in selected_addresses:
+                _write_u32(engine, address, 0)
+            bitmap &= ~(1 << int(index))
+            slot_count -= 1
+            result = 1
+            outcome = "freed"
+            last_error_after = last_error_before
+        elif name == "TlsSetValue":
+            selected = checked_address(teb, TEB_TLS_SLOTS_OFFSET + 4 * int(index),
+                                       4, "read_write")
+            _write_u32(engine, selected, int(value))
+            result = 1
+            outcome = "stored"
+            api["value"] = int(value)
+            last_error_after = last_error_before
+        else:  # TlsGetValue
+            selected = checked_address(teb, TEB_TLS_SLOTS_OFFSET + 4 * int(index),
+                                       4, "read")
+            result = _read_u32(engine, selected)
+            outcome = "retrieved"
+            last_error_after = 0
+            _write_u32(engine, last_error_address, last_error_after)
+
+        state["tls_allocated_bitmap"] = bitmap
+        state["tls_slot_count"] = slot_count
+        state["tls_threads"] = threads
+        api.update(outcome=outcome, result=result,
+                   last_error_after=last_error_after,
+                   tls_slot_count=slot_count,
+                   tls_thread_count=len(threads))
+        if name == "TlsFree":
+            api["freed_index"] = int(index)
+        if name in ("TlsGetValue", "TlsSetValue"):
+            api["slot_address"] = teb + TEB_TLS_SLOTS_OFFSET + 4 * int(index)
+
+        engine.reg_write(registers.UC_X86_REG_EAX, result)
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + frame_size)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        api["esp_after"] = (esp + frame_size) & 0xFFFFFFFF
         state["resume"] = True
         return True
     except _GuestPointerFault as exc:
@@ -831,6 +1365,10 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "boundary_call": None,
         "heaps": {},
         "critical_sections": {},
+        "tls_allocated_bitmap": 0,
+        "tls_slot_count": 0,
+        "tls_threads": {TEB_BASE: 1},
+        "tls_current_teb": TEB_BASE,
         "resume": False,
         "memory_fault": None,
     }
@@ -850,6 +1388,21 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
                     _get_version_ex_a(engine, xr, row, mapped_ranges, state)
                 elif row["name"] == "GetModuleHandleA":
                     _get_module_handle_a(engine, xr, row, mapped_ranges, image_base, state)
+                elif row["name"] == "GetCurrentThreadId":
+                    handled = _get_current_thread_id(engine, xr, uc, row,
+                                                     mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] in TLS_IMPORTS:
+                    handled = _tls_import(engine, xr, uc, row, mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
                 elif row["name"] in CRITICAL_SECTION_IMPORTS:
                     handled = _critical_section_import(engine, xr, row,
                                                        mapped_ranges, state)
@@ -858,12 +1411,23 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
                         return True
                     _record_unsupported_import(address, index, row, engine, xr,
                                                mapped_ranges, state)
-                else:
-                    handled = _heap_create(engine, xr, uc, row, mapped_ranges, state)
+                elif row["name"] == "HeapCreate":
+                    handled = _heap_create(engine, xr, uc, row,
+                                           mapped_ranges, state)
                     if handled or state["status"] is not None:
                         engine.emu_stop()
                         return True
-                    # Unsupported HeapCreate flags are a deliberate import stop.
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "HeapAlloc":
+                    handled = _heap_alloc(engine, xr, uc, row,
+                                          mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                else:
                     _record_unsupported_import(address, index, row, engine, xr,
                                                mapped_ranges, state)
             else:
@@ -1011,10 +1575,16 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
     if boundary_key in {
         ("kernel32.dll", "GetVersionExA"),
         ("kernel32.dll", "GetModuleHandleA"),
-    } or (boundary_key == ("kernel32.dll", "HeapCreate") and not state["boundary_call"]):
+        ("kernel32.dll", "GetCurrentThreadId"),
+    } or (boundary_key in {
+        ("kernel32.dll", "HeapCreate"),
+        ("kernel32.dll", "HeapAlloc"),
+    } and not state["boundary_call"]):
         raise RuntimeError("startup oracle stopped at a supported import instead of applying its contract")
     if boundary_key[0] == "kernel32.dll" and boundary_key[1] in CRITICAL_SECTION_IMPORTS:
         raise RuntimeError("startup oracle stopped at a supported critical-section import instead of applying its contract")
+    if boundary_key[0] == "kernel32.dll" and boundary_key[1] in TLS_IMPORTS:
+        raise RuntimeError("startup oracle stopped at a supported TLS import instead of applying its contract")
 
     # The guest runner's EIP is the last instruction reported by its step hook;
     # Unicorn's architectural EIP is the tagged import target after CALL.
@@ -1039,11 +1609,14 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         heap = state["heaps"].get(slot)
         if heap is None:
             heap_slots.append({"slot": slot, "handle": 0, "capacity": 0,
-                               "live_blocks": 0})
+                               "fixed": False, "live_blocks": 0,
+                               "blocks": []})
         else:
             heap_slots.append({"slot": slot, "handle": heap["handle"],
                                "capacity": heap["capacity"],
-                               "live_blocks": heap["live_blocks"]})
+                               "fixed": bool(heap.get("fixed", False)),
+                               "live_blocks": heap["live_blocks"],
+                               "blocks": [dict(block) for block in heap["blocks"]]})
     if active_heaps:
         heap_hash_start = active_heaps[0]["handle"]
         heap_hash_size = active_heaps[0]["committed_size"]
@@ -1097,6 +1670,8 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "boundary_call": state["boundary_call"],
         "critical_section_count": len(active_critical_sections),
         "critical_sections": active_critical_sections,
+        "tls_slot_count": int(state["tls_slot_count"]),
+        "tls_thread_count": len(state["tls_threads"]),
         "state_heaps": heap_slots,
         "instructions": int(state["instructions"]),
         "calls": int(state["calls"]),

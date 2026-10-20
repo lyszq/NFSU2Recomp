@@ -59,6 +59,18 @@ static int tls_contract(void) {
     CHECK(guest_windows_import(&c,&api,&windows,&fault)==-1 && fault==UINT32_MAX);
     CHECK(!memcmp(&c,&expected,sizeof c) && !memcmp(&snapshot,&windows.tls,sizeof snapshot));
     CHECK(!guest_windows_cleanup(&windows) && !guest_tls_count(&windows.tls));
+    api.name="GetCurrentThreadId"; c=setup(0); eflags_set(&c,0xcd5u); expected=c;
+    put(TEB+0x24,123);
+    CHECK(guest_windows_import(&c,&api,NULL,&fault)==1);
+    expected.eax=123; expected.eip=0x401005; expected.esp+=4;
+    CHECK(!memcmp(&c,&expected,sizeof c) && get(TEB+0x34)==999);
+    c=setup(0); put(TEB+0x24,0); expected=c;
+    CHECK(guest_windows_import(&c,&api,NULL,&fault)==-2 && fault==TEB+0x24);
+    CHECK(!memcmp(&c,&expected,sizeof c) && get(TEB+0x34)==999);
+    c=setup(0); c.fs_base=UINT32_MAX-0x10u; expected=c;
+    CHECK(guest_windows_import(&c,&api,NULL,&fault)==-1 && fault==UINT32_MAX);
+    CHECK(!memcmp(&c,&expected,sizeof c));
+    put(TEB+0x24,1);
     return 0;
 }
 int main(void) {

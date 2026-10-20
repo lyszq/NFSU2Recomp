@@ -134,3 +134,30 @@ when ARM host queues are unavailable. Its CLI test executes native x86_64 C;
 Xcode still cross-compiles the actual application to ARM64 and the IPA link-map
 and lipo checks stay required. An Intel host test is not physical ARM64 execution;
 the 0.7.1 iPad check remains necessary regardless of which build host is used.
+
+
+## Shared dynamic TLS and CRT heap probe (0.8.1)
+
+The current device build is 0.8.1/build 13. It adds a bounded process TLS key
+allocator with per-guest-TEB values, key reuse, transactional zeroing and explicit
+thread lifecycle. Dynamic slots use the x86 XP guest layout at TEB+0xe10; the
+static PE TLS vector at +0x2c is preserved. The policy caps both keys and attached
+threads at 64, excludes expansion slots, and stops invalid/unallocated-key use
+as API_STATE. This strict policy is not a Windows invalid-use guarantee. Successful
+TlsGetValue clears LastError, other TLS success paths preserve it; bounded
+allocation exhaustion returns TLS_OUT_OF_INDEXES with explicit LastError 8 policy.
+The observed GetCurrentThreadId import reads the actual guest TEB identity.
+
+The independent reference now also models the existing real native HeapAlloc
+contract. The authenticated entry must stop before GetStartupInfoA after 1,602
+instructions, 99 dispatch calls and 23 handled API invocations, with 14 native
+critical sections, one TLS key/thread, and two live heap blocks. The harness
+compares heap allocation metadata in addition to the full image/TEB/stack/heap
+hashes, trace, GPR/EFLAGS, budgets and object counts. Generation emits 65 real
+static functions and retains the 48-case leaf regression; no success stubs or
+runtime JIT are used. The synthetic x86 compatibility suite has 22 tests.
+
+Physical confirmation of this new build is pending. The last device-confirmed
+combined build remains 0.6.1. Historical boundary descriptions above remain for
+provenance. The private workflow must pass on Linux and macOS before the new
+unsigned ARM64 IPA is delivered; a build-host test is not an iPad test.

@@ -6,6 +6,19 @@
 
 static uint32_t read32(const void *p) { uint32_t v; memcpy(&v, p, 4); return v; }
 static void write32(void *p, uint32_t v) { memcpy(p, &v, 4); }
+static int identity_import(CPU *c,const GuestImport *import,uint32_t *fault) {
+    if (strcmp(import->name,"GetCurrentThreadId")) return 0;
+    const void *stack=guest_memory_pointer(c->esp,4,0);
+    if (!stack) { *fault=c->esp; return -1; }
+    uint32_t ret=read32(stack);
+    uint64_t at=(uint64_t)c->fs_base+0x24u;
+    const void *identity=at<=UINT32_MAX ? guest_memory_pointer((uint32_t)at,4,0) : NULL;
+    if (!identity) { *fault=at>UINT32_MAX ? UINT32_MAX : (uint32_t)at; return -1; }
+    uint32_t id=read32(identity);
+    if (!id) { *fault=(uint32_t)at; return -2; }
+    c->eax=id; c->eip=ret; c->esp+=4u;
+    return 1;
+}
 static int tls_import(CPU *c,const GuestImport *import,GuestWindows *windows,uint32_t *fault) {
     GuestTLSOperation op; unsigned nargs;
     if (!strcmp(import->name,"TlsAlloc")) { op=GUEST_TLS_ALLOC; nargs=0; }
@@ -110,7 +123,9 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
     int module = !strcmp(import->name, "GetModuleHandleA");
     if (strcasecmp(import->library, "KERNEL32.dll")) return 0;
     if (!version && !module) {
-        int handled=tls_import(c,import,context,fault);
+        int handled=identity_import(c,import,fault);
+        if (handled) return handled;
+        handled=tls_import(c,import,context,fault);
         if (handled) return handled;
         handled=critical_import(c,import,context,fault);
         return handled ? handled : heap_import(c,import,context,fault);
