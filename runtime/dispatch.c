@@ -1,6 +1,7 @@
 /* Dolayli cagri dispatch: guest adres -> lift edilmis native fonksiyon.
  * O(1) dogrudan indeks tablosu (.text buyuklugunde uint32 dizisi).      */
 #include "cpu.h"
+#include "guest_dispatch.h"
 uint64_t g_icall_hits = 0;
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,7 +14,7 @@ extern const uint32_t g_fn_count;
 #define TEXT_BASE 0x00401000u
 #define TEXT_SIZE 0x00381af1u
 
-static uint32_t *g_idx;
+static GuestDispatch g_static_dispatch;
 
 /* istatistik */
 uint64_t g_stat_indirect_ok = 0, g_stat_indirect_miss = 0, g_stat_unsupported = 0;
@@ -26,19 +27,13 @@ extern void (*g_backtrace_fn)(struct CPU*,int);
 void guest_backtrace(CPU*,int);
 
 void dispatch_init(void){
-    if (g_idx) return;
+    if (g_static_dispatch.indices) return;
+    int rc = guest_dispatch_init(&g_static_dispatch, TEXT_BASE, TEXT_SIZE,
+                                 g_fn_addr, g_fn_ptr, g_fn_count);
+    if (rc){ fprintf(stderr,"dispatch initialization failed: %d\n",rc); exit(1); }
     g_backtrace_fn = (void(*)(struct CPU*,int))guest_backtrace;
-    g_idx = calloc(TEXT_SIZE, sizeof(uint32_t));
-    if (!g_idx){ fprintf(stderr,"dispatch tablosu ayrilamadi\n"); exit(1); }
-    uint32_t dup = 0, oob = 0;
-    for (uint32_t i = 0; i < g_fn_count; i++){
-        uint32_t a = g_fn_addr[i];
-        if (a - TEXT_BASE >= TEXT_SIZE){ oob++; continue; }
-        if (g_idx[a - TEXT_BASE]) dup++;
-        g_idx[a - TEXT_BASE] = i + 1;
-    }
-    fprintf(stderr, "dispatch: %u fonksiyon kayitli (%u yinelenen, %u aralik disi), tablo %.1f MB\n",
-            g_fn_count, dup, oob, TEXT_SIZE*4.0/1048576.0);
+    fprintf(stderr,"dispatch: %u functions registered, shared table %.1f MB\n",
+            g_fn_count, TEXT_SIZE*4.0/1048576.0);
 }
 
 int  win32_call(CPU*, uint32_t);
@@ -78,8 +73,8 @@ void dispatch_indirect(CPU *c, uint32_t addr){
       if (g_efx_stat && addr - 0x650000u < 0x40000u) efx_stat_note(c, addr); }
     uint32_t off = addr - TEXT_BASE;
     if (off < TEXT_SIZE){
-        uint32_t k = g_idx[off];
-        if (k){
+        GuestFunction resolved = guest_dispatch_lookup(&g_static_dispatch, addr);
+        if (resolved){
             /* ICALL=<adres>: o fonksiyona yapilan DOLAYLI cagrilari say ve
              * ilk birkacinda cagri zincirini dok.  Sanal cagrilar statik
              * grafla gorunmedigi icin gerekli. */
@@ -102,7 +97,7 @@ void dispatch_indirect(CPU *c, uint32_t addr){
                     guest_backtrace(c, 10);
                 }
             }
-            g_stat_indirect_ok++; g_fn_ptr[k-1](c); return; }
+            g_stat_indirect_ok++; resolved(c); return; }
     }
     /* Lift edilmis karsiligi yok.  Oyun bu adrese CALISMA ANINDA kod
      * uretmis olabilir (NFSU2'nin malzeme boru hatti bunu yogun yapar).

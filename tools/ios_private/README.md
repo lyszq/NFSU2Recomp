@@ -58,3 +58,23 @@ Native host success and a linked ARM64 binary are separate from an iPad PASS.
 This milestone executes one isolated actual game function. It does not invoke
 the game entry point, dispatch the complete engine, bind imports, or render a
 game scene. Full boot, renderer, audio and input integration remain future work.
+
+
+## Entry probe (0.5.1)
+
+The physical iPad v0.4.1 leaf regression was confirmed on 20 October 2026.
+The new build also generates a bounded authentic entry call graph, routes both
+direct and indirect guest calls through shared native dispatch, and compares
+the initial entry prefix with an independent original-x86 reference.
+
+The expected boundary is `KERNEL32.dll!GetVersionExA`, after 40 original
+instructions. No API result is supplied or fabricated. An exact match reports
+`VERIFIED ENTRY STOP` with the missing API, instruction/call counts and state
+verification. This proves the real entry prefix up to that boundary; it does not
+mean CRT initialization, game startup or rendering have completed. Press the
+same LOAD VERIFIED GAME IMAGE button and share the full diagnostic.
+
+The private artifact name stays stable for repeat builds. Only IPA, provenance
+and diagnostics are retained there; entry-generated C and the EXE stay out of Git
+and public artifacts. The native runner is bounded and uses no JIT or x86
+interpreter on iOS. Unicorn remains a build-host-only reference engine.

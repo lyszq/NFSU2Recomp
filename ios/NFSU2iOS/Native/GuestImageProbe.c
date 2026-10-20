@@ -7,6 +7,9 @@
 /* This symbol MUST be supplied by privately generated, native compiled C.
  * There is deliberately no weak/dummy implementation or fallback success. */
 int nfs_private_lifted_probe(char *out, size_t capacity);
+#ifdef NFS_PRIVATE_STARTUP
+int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capacity);
+#endif
 #endif
 
 int nfs_guest_image_probe(const uint8_t *exe, size_t length, char *out, size_t capacity) {
@@ -21,6 +24,9 @@ int nfs_guest_image_probe(const uint8_t *exe, size_t length, char *out, size_t c
     } else {
 #ifdef NFS_PRIVATE_PROBE
         rc = nfs_private_lifted_probe(out, capacity);
+#ifdef NFS_PRIVATE_STARTUP
+        if (!rc) rc = nfs_private_startup_probe(&image, out, capacity);
+#endif
 #else
         (void)snprintf(out, capacity,
             "PASS | verified EXE mapped into shared guest VM | base=%08x size=%u "

@@ -72,7 +72,7 @@ struct ContentView: View {
                             .foregroundStyle(.white)
                     }
 
-                    Text("APPLE SILICON · STAGE 4: REAL PE IMAGE")
+                    Text("APPLE SILICON · STAGE 5: NATIVE ENTRY PROBE")
                         .font(.system(.caption, design: .monospaced, weight: .semibold))
                         .tracking(1.1)
                         .foregroundStyle(.mint)
@@ -101,7 +101,7 @@ struct ContentView: View {
                             .font(.system(.caption, design: .monospaced, weight: .bold))
                             .foregroundStyle(.mint)
 
-                        Text("Tests the shared macOS/iOS guest memory core, CPU flags, stack operations, address limits and page permissions. It does not boot NFSU2.")
+                        Text("Tests the shared macOS/iOS guest memory and dispatcher core, CPU flags, stack operations, address limits and page permissions. It does not boot NFSU2.")
                             .font(.footnote)
                             .foregroundStyle(.white.opacity(0.7))
 

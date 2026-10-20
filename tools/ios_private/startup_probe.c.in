@@ -1,0 +1,66 @@
+/* Authored harness template. The substituted values come from PRIVATE original
+ * x86 execution. Do not commit the generated version under gen/ios-private. */
+#include "guest_execution.h"
+#include "guest_bootstrap.h"
+#include "guest_memory.h"
+#include <errno.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <string.h>
+extern const uint32_t nfs_startup_addresses[], nfs_startup_count;
+extern const GuestFunction nfs_startup_functions[];
+extern const GuestImport nfs_startup_imports[];
+extern const uint32_t nfs_startup_import_count;
+static uint64_t memory_hash(const void *source, size_t size) {
+    const uint8_t *bytes = source;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (size_t i = 0; i < size; ++i) { hash ^= bytes[i]; hash *= UINT64_C(1099511628211); }
+    return hash;
+}
+int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capacity) {
+    GuestDispatch table = {0};
+    CPU context;
+    CPU *c = &context;
+    GuestExecutionResult result = {0};
+    int rc = guest_execution_bind_imports(image, nfs_startup_imports, nfs_startup_import_count);
+    if (rc) goto failed;
+    rc = guest_bootstrap_init(c, image);
+    if (rc) goto failed;
+    rc = guest_dispatch_init(&table, 0x00401000u, 0x00381af1u,
+                             nfs_startup_addresses, nfs_startup_functions, nfs_startup_count);
+    if (rc) goto failed;
+    GuestExecutionConfig config = {&table, nfs_startup_imports, nfs_startup_import_count,
+                                    100000u, 64u, UINT64_C(2000000000)};
+    PUSH32(0xdeadc0deu);
+    rc = guest_execution_run(&config, c, image->entry_point, &result);
+    if (rc) goto failed;
+    const uint32_t expected_registers[] = {@EXPECTED_GPRS@};
+    if (result.stop != GUEST_STOP_IMPORT || result.target != @EXPECTED_TARGET@ ||
+        result.ip != @EXPECTED_IP@ || result.instructions != @EXPECTED_STEPS@ ||
+        result.trace_hash != UINT64_C(@EXPECTED_TRACE@) ||
+        memcmp(c->r, expected_registers, sizeof c->r) ||
+        (eflags_get(c) & 0xcd5u) != @EXPECTED_FLAGS@ ||
+        memory_hash(g_mem + image->image_base, image->image_size) != UINT64_C(@EXPECTED_IMAGE_HASH@) ||
+        memory_hash(g_mem + GUEST_TEB_BASE, 0x20000u) != UINT64_C(@EXPECTED_TEB_HASH@) ||
+        memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) != UINT64_C(@EXPECTED_STACK_HASH@)) {
+        rc = EINVAL;
+        (void)snprintf(out, capacity,
+            "FAIL | actual entry/reference mismatch | stop=%d ip=%08x target=%08x steps=%" PRIu64
+            " trace=%016" PRIx64 " | no game boot",
+            result.stop, result.ip, result.target, result.instructions, result.trace_hash);
+        guest_dispatch_destroy(&table);
+        return rc;
+    }
+    const GuestImport *import = &nfs_startup_imports[result.import_index];
+    (void)snprintf(out, capacity,
+        "VERIFIED ENTRY STOP | 0075bcc7 -> %08x | %s!%s not implemented | "
+        "%" PRIu64 " instructions / %" PRIu64 " dispatch calls / %u registered functions | "
+        "x86 trace + GPR/EFLAGS + image/TEB/stack match | leaf regression PASS | no JIT | no game boot",
+        result.ip, import->library, import->name, result.instructions, result.calls, nfs_startup_count);
+    guest_dispatch_destroy(&table);
+    return 0;
+failed:
+    guest_dispatch_destroy(&table);
+    (void)snprintf(out, capacity, "FAIL | native entry setup/execution | error=%d", rc);
+    return rc;
+}

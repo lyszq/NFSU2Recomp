@@ -3,6 +3,7 @@
 #include "GuestSmoke.h"
 #include "../../../runtime/cpu.h"
 #include "../../../runtime/guest_memory.h"
+#include "../../../runtime/guest_dispatch.h"
 #include "../../tests/cpu_flags_test.h"
 #include <errno.h>
 #include <stdio.h>
@@ -12,6 +13,22 @@ static int fail(char *out, size_t n, const char *phase, int err) {
     (void)snprintf(out, n, "FAIL | %s | error=%d (%s) | no game code executed",
                    phase, err, err ? strerror(err) : "assertion");
     return 1;
+}
+
+/* Handwritten dispatcher ABI unit probe, not a replacement game function. */
+static void dispatch_abi_probe(CPU *c) { c->eax += 3u; }
+static int test_dispatch(char *out, size_t n) {
+    GuestDispatch table = {0};
+    uint32_t addresses[] = {0x400010u};
+    GuestFunction functions[] = {dispatch_abi_probe};
+    int rc = guest_dispatch_init(&table, 0x400000u, 64u, addresses, functions, 1);
+    if (rc) return fail(out, n, "shared dispatcher init", rc);
+    CPU cpu = {0}; cpu.eax = 7;
+    GuestFunction function = guest_dispatch_lookup(&table, addresses[0]);
+    if (function) function(&cpu);
+    int valid = function && cpu.eax == 10 && !guest_dispatch_lookup(&table, 0x400011u);
+    guest_dispatch_destroy(&table);
+    return valid ? 0 : fail(out, n, "shared exact-address dispatcher", 0);
 }
 
 static int test_guest_memory(char *out, size_t n, size_t *page_size) {
@@ -96,10 +113,11 @@ int nfs_guest_smoke_run(char *diagnostics, size_t capacity) {
     /* Never tear down a live game mapping if a future caller runs this probe. */
     if (g_mem) return fail(diagnostics, capacity, "guest runtime already active", EBUSY);
     if (nfs_cpu_flags_test(diagnostics, capacity)) return 1;
+    if (test_dispatch(diagnostics, capacity)) return 1;
     size_t page_size = 0;
     if (test_guest_memory(diagnostics, capacity, &page_size)) return 1;
     (void)snprintf(diagnostics, capacity,
-        "PASS | shared guest_memory.c | upstream CPU/EFLAGS reference tests | "
+        "PASS | shared memory + dispatcher | upstream CPU/EFLAGS reference tests | "
         "4 GiB VM + low/PE/heap/high/top addresses | protection + overflow checks | "
         "PUSH/POP + ESP wrap | page %zu KiB | no JIT | no game code executed",
         page_size / 1024u);

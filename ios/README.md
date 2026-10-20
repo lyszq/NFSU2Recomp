@@ -107,3 +107,46 @@ native execution with 48 independent x86 reference cases, and builds version
 Unicorn reference is not bundled into the app. Only the private IPA can run
 this function probe; the public IPA reports image loading only. Neither boots
 the engine or provides gameplay.
+
+
+## Stage 5: real entry prefix and strict shared dispatch
+
+On 20 October 2026 the user supplied a physical iPad v0.4.1 PASS for the actual
+statically lifted `sub_0048b1e0`, including all 48 x86 reference cases. That
+confirms the isolated real function on-device, separately from full boot.
+
+`runtime/guest_dispatch.c` extracts the existing O(1) address-index mechanism.
+The macOS `dispatch.c` and native iOS probes both use this implementation.
+It rejects duplicate/out-of-range/null entries and has explicit teardown.
+`runtime/guest_bootstrap.c` also shares the existing macOS CPU/TEB/PEB/stack
+initializer with the private iOS entry probe. The desktop PE loader now exports
+its real image size/entry metadata for that initializer. Full macOS gameplay
+has not been rerun; CI checks the modified desktop dispatcher and boot syntax.
+
+`runtime/guest_execution.c` is a strict, bounded static execution adapter.
+It preserves the upstream CPU and PUSH/POP ABI, validates IAT slots before
+binding, and records exact stop reasons. No unresolved call is popped/swallowed;
+unsupported instructions, invalid memory, import boundaries, depth, instruction
+budget and timeout stop execution. Register/memory effects at a stop remain
+visible for diagnostics; this is not rollback or automatic continuation.
+The existing desktop dynamic x86 fallback is not linked into this iOS adapter.
+
+Private generation compiles 64 reachable real entry functions plus the previous
+leaf regression (a bounded subset, not the complete game). Unliftable functions
+are omitted; there are no replacement game-function stubs. Every generated
+instruction has a budget/trace hook, direct calls use the shared dispatcher,
+and typed memory accesses use checked whole-range translation. Unchecked bulk
+operations and desktop no-op traps stop explicitly. The 14 MiB O(1) lookup table
+is currently preserved for consistency; mobile table compression is future work.
+
+The private 0.5.1 probe maps the authentic image and initializes its process
+layout, then enters `0x0075bcc7`. Independent original-x86 execution reaches
+`KERNEL32.dll!GetVersionExA` at callsite `0x0075bce7` after 40 instructions,
+4 dispatcher calls and two actual helper functions. Both implementations stop
+before supplying any API result. The native test must match GPR/EFLAGS,
+address trace, full image and TEB hashes, and an 8 KiB stack window. A matching
+result is **VERIFIED ENTRY STOP**, never a full-boot or gameplay PASS.
+
+Next: implement the actual `GetVersionExA` compatibility contract, then continue
+through subsequent module/command-line/CRT imports with explicit diagnostics.
+The app still has no game renderer, audio, input or playable scene.

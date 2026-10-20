@@ -21,7 +21,7 @@ WHICH="${1:-both}"
 SURUM="$(tr -cd '0-9' < "$ROOT/SURUM" 2>/dev/null)"; SURUM="${SURUM:-0}"
 case "$WHICH" in both|orig|hd) ;; *) echo "kullanim: ./link.sh [orig|hd]"; exit 1 ;; esac
 
-CSRC="mem guest_memory dispatch genexec win32 win32_ext com debug res fileio overrides d3dx_hle vsemu enhance perflog"
+CSRC="mem guest_memory guest_dispatch guest_bootstrap dispatch genexec win32 win32_ext com debug res fileio overrides d3dx_hle vsemu enhance perflog"
 MSRC="metal audio bundle"
 FW="-lm -framework Cocoa -framework Metal -framework QuartzCore -framework ImageIO -framework CoreGraphics -framework CoreServices -framework AudioToolbox"
 SHARDS="out/obj/shard_*.o out/obj/fntab.o out/obj/stubs.o"

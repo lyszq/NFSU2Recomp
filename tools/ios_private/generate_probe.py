@@ -78,7 +78,7 @@ def generate(exe, output):
             stack = list(engine.mem_read(ESP - 16, 32))
             vectors.append((argument, flags, before, after, eip, after_flags, stack))
     output.mkdir(parents=True, exist_ok=True)
-    (output / "lifted.c").write_text('#include "cpu.h"\n' + lifted + '\n')
+    (output / "lifted.c").write_text('#include "cpu.h"\n' + lifted + '\n', encoding='utf-8', newline='\n')
     rows = []
     for arg, flags, before, after, eip, expected_flags, stack in vectors:
         words = lambda values: ",".join(f"0x{v:08x}u" for v in values)
@@ -124,7 +124,7 @@ int nfs_private_lifted_probe(char *out, size_t capacity) {
     return 0;
 }
 '''.replace("VECTORS", ",\n".join(rows))
-    (output / "private_probe.c").write_text(harness)
+    (output / "private_probe.c").write_text(harness, encoding="utf-8", newline="\n")
     manifest = {"executable_sha256": EXE_SHA, "function_va": f"{FUNCTION:08x}",
                 "instruction_count": 7, "function_bytes": 16,
                 "function_sha256": hashlib.sha256(code).hexdigest(),
@@ -132,7 +132,7 @@ int nfs_private_lifted_probe(char *out, size_t capacity) {
                 "vectors": len(vectors), "runtime_jit": False}
     for name in ["lifted.c", "private_probe.c"]:
         manifest[name + "_sha256"] = hashlib.sha256((output / name).read_bytes()).hexdigest()
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8", newline="\n")
     print("PASS | authenticated private generation | function=0048b1e0 | 48 x86 oracle cases")
 
 

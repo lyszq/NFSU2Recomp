@@ -12,6 +12,7 @@
 void (*g_backtrace_fn)(struct CPU*,int) = 0;   /* dispatch.c kurar */
 CPU *g_cur_cpu = 0;
 
+uint32_t g_image_size = 0, g_image_entry = 0;
 uint32_t g_image_base = 0x400000u, g_res_dir_va = 0, g_res_dir_size = 0;
 
 /* izleme durumu: her derlemede tanimli olmali (debug.c opsiyonel) */
@@ -203,6 +204,7 @@ int mem_load_pe(const char *path){
     uint16_t optsz = *(uint16_t*)(nt+20);
     uint32_t base  = *(uint32_t*)(nt+24+28);
     uint32_t imgsz = *(uint32_t*)(nt+24+56);
+    g_image_size = imgsz; g_image_entry = base + *(uint32_t*)(nt+24+16);
     /* DataDirectory[2] = RESOURCE */
     { /* PE32: DataDirectory opsiyonel basligin 96. baytinda; RESOURCE = indeks 2 */
       uint32_t dd = 24 + 96 + 2*8;

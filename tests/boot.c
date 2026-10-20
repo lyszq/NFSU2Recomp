@@ -1,5 +1,6 @@
 /* Entry point'ten baslatma denemesi: nereye kadar gidiyor? */
 #include "cpu.h"
+#include "guest_bootstrap.h"
 #include "decls.h"
 #include <stdio.h>
 #include <string.h>
@@ -153,25 +154,13 @@ int main(int argc,char**argv){
     else if (getenv("VERBOSE")) win32_set_trace_max(400u);
     { const char*w = getenv("WATCH_ADDR"); if (w) watch_arm((uint32_t)strtoul(w,0,0)); }
 
-    /* TEB (fs:) */
-    MR32(TEB_BASE+0x00)=0xFFFFFFFFu;      /* SEH zinciri sonu   */
-    MR32(TEB_BASE+0x04)=STACK_HI;         /* StackBase          */
-    MR32(TEB_BASE+0x08)=STACK_LO;         /* StackLimit         */
-    MR32(TEB_BASE+0x18)=TEB_BASE;         /* Self               */
-    MR32(TEB_BASE+0x20)=100;              /* ProcessId          */
-    MR32(TEB_BASE+0x24)=1;                /* ThreadId           */
-    MR32(TEB_BASE+0x2C)=TEB_BASE+0x1000;  /* TLS dizisi         */
-    MR32(TEB_BASE+0x30)=PEB_BASE;         /* PEB                */
-    mem_commit(PEB_BASE,0x1000);
-    MR32(PEB_BASE+0x08)=0x00400000u;      /* ImageBaseAddress   */
-    MR32(PEB_BASE+0xA4)=5; MR32(PEB_BASE+0xA8)=1;
-
+    /* The same CPU/TEB/PEB/stack initializer is used by native iOS probes. */
+    { extern uint32_t g_image_base;
+      extern uint32_t g_image_size, g_image_entry;
+      GuestPEImage loaded = { .image_base = g_image_base, .image_size = g_image_size,
+                              .entry_point = g_image_entry };
+      if (guest_bootstrap_init(&cpu, &loaded)) return 1; }
     { extern CPU *g_cur_cpu; g_cur_cpu = &cpu; }
-    memset(&cpu,0,sizeof cpu);
-    cpu.esp = STACK_HI - 0x1000u;
-    cpu.top = 0; cpu.fcw = 0x037f;
-    cpu.fs_base = TEB_BASE;
-    cpu.gs_base = TEB_BASE;
 
     /* CPUBENCH=1: konuk thread'in gercekten hangi hizda kostugunu olc.
      * Ayni dongu kabuktan 2.00 sn suruyor; surec icinde cok daha uzun
