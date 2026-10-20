@@ -32,7 +32,15 @@ targets:
       - path: ../runtime/guest_startup.c
       - path: ../runtime/guest_error.c
       - path: ../runtime/guest_stdio.c
+      - path: ../runtime/guest_locale.c
       - path: tests/cpu_flags_test.c
+    dependencies:
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: QuartzCore.framework
+      - sdk: GameController.framework
+      - sdk: AVFoundation.framework
+      - sdk: AudioToolbox.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.lyszq.nfsu2ios
@@ -41,23 +49,29 @@ targets:
         GCC_C_LANGUAGE_STANDARD: gnu11
         LD_GENERATE_MAP_FILE: 'YES'
         SWIFT_OBJC_BRIDGING_HEADER: NFSU2iOS/Native/NFSU2BridgingHeader.h
+        HEADER_SEARCH_PATHS:
+          - $(inherited)
+          - $(SRCROOT)/../runtime
+          - $(SRCROOT)/NFSU2iOS/Native
         INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: 'YES'
+        INFOPLIST_KEY_UIRequiresFullScreen: 'YES'
+        INFOPLIST_KEY_UIInterfaceOrientation: 'UIInterfaceOrientationLandscapeRight'
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: 'UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight'
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: 'UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight'
     info:
       path: NFSU2iOS/Info.plist
       properties:
         CFBundleDisplayName: NFSU2 iOS
-        CFBundleShortVersionString: '0.9.0'
-        CFBundleVersion: '14'
+        CFBundleShortVersionString: '0.10.0'
+        CFBundleVersion: '16'
         LSRequiresIPhoneOS: true
+        UIRequiresFullScreen: true
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
-          - UIInterfaceOrientationPortrait
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
         UISupportedInterfaceOrientations~ipad:
-          - UIInterfaceOrientationPortrait
-          - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight

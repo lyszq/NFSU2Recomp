@@ -19,6 +19,7 @@ on:
       - 'runtime/guest_startup.*'
       - 'runtime/guest_error.*'
       - 'runtime/guest_stdio.*'
+      - 'runtime/guest_locale.*'
       - 'runtime/dispatch.c'
       - 'runtime/mem.c'
       - 'tests/guest_memory*'
@@ -26,6 +27,8 @@ on:
       - 'tests/guest_dispatch*'
       - 'tests/guest_execution*'
       - 'tests/guest_windows*'
+      - 'tests/guest_locale*'
+      - 'tests/guest_wchar*'
       - 'tests/guest_heap*'
       - 'tests/guest_critical*'
       - 'tests/guest_tls*'
@@ -83,6 +86,8 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/NFSU2DerivedData" \
             CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
             build
 
       - name: Verify ARM64 and shared runtime linkage

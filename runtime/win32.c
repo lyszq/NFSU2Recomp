@@ -441,10 +441,75 @@ int win32_call(CPU *c, uint32_t idx){
         uint32_t dst=ARG(c,4); int dl=(int)ARG(c,5);
         if(sl<0) sl=(int)strlen((char*)(g_mem+src))+1;
         if(dl==0){ r=(uint32_t)sl; } else { int k=0; for(;k<sl&&k<dl;k++) MR16(dst+2u*k)=MR8(src+k); r=(uint32_t)k; } }
-    else if (!strcmp(n,"WideCharToMultiByte")){ uint32_t src=ARG(c,2); int sl=(int)ARG(c,3);
-        uint32_t dst=ARG(c,4); int dl=(int)ARG(c,5);
-        if(sl<0){ sl=0; while(MR16(src+2u*sl)) sl++; sl++; }
-        if(dl==0){ r=(uint32_t)sl; } else { int k=0; for(;k<sl&&k<dl;k++) MR8(dst+k)=(uint8_t)MR16(src+2u*k); r=(uint32_t)k; } }
+    else if (!strcmp(n,"WideCharToMultiByte")){
+        uint32_t cp           = ARG(c, 0);
+        uint32_t fl           = ARG(c, 1);
+        uint32_t src          = ARG(c, 2);
+        int      sl           = (int)ARG(c, 3);
+        uint32_t dst          = ARG(c, 4);
+        int      dl           = (int)ARG(c, 5);
+        uint32_t def_char_ptr = ARG(c, 6);
+        uint32_t used_def_ptr = ARG(c, 7);
+        (void)fl; (void)cp;
+
+        if (sl == 0 || dl < 0 || src == 0 || (dl > 0 && dst == 0)) {
+            if (c->fs_base) MR32(c->fs_base + 0x34u) = 87; /* ERROR_INVALID_PARAMETER */
+            r = 0;
+        } else {
+            uint32_t src_len = 0;
+            if (sl < 0) {
+                while (MR16(src + 2u * src_len)) src_len++;
+                src_len++; /* Null sonlandirici dahil */
+            } else {
+                src_len = (uint32_t)sl;
+            }
+
+            uint32_t needed = src_len; /* CP_ACP (1252) SBCS */
+            if (dl == 0) {
+                r = needed; /* Query modu */
+            } else if ((uint32_t)dl < needed) {
+                if (c->fs_base) MR32(c->fs_base + 0x34u) = 122; /* ERROR_INSUFFICIENT_BUFFER */
+                r = 0;
+            } else {
+                uint8_t def_c = def_char_ptr ? MR8(def_char_ptr) : '?';
+                int used_def = 0;
+                for (uint32_t k = 0; k < src_len; k++) {
+                    uint16_t w = MR16(src + 2u * k);
+                    if (w <= 0x7F) {
+                        MR8(dst + k) = (uint8_t)w;
+                    } else if (w >= 0xA0 && w <= 0xFF) {
+                        MR8(dst + k) = (uint8_t)w;
+                    } else {
+                        uint8_t sp = 0;
+                        switch (w) {
+                            case 0x20AC: sp = 0x80; break; case 0x201A: sp = 0x82; break;
+                            case 0x0192: sp = 0x83; break; case 0x201E: sp = 0x84; break;
+                            case 0x2026: sp = 0x85; break; case 0x2020: sp = 0x86; break;
+                            case 0x2021: sp = 0x87; break; case 0x02C6: sp = 0x88; break;
+                            case 0x2030: sp = 0x89; break; case 0x0160: sp = 0x8A; break;
+                            case 0x2039: sp = 0x8B; break; case 0x0152: sp = 0x8C; break;
+                            case 0x017D: sp = 0x8E; break; case 0x2018: sp = 0x91; break;
+                            case 0x2019: sp = 0x92; break; case 0x201C: sp = 0x93; break;
+                            case 0x201D: sp = 0x94; break; case 0x2022: sp = 0x95; break;
+                            case 0x2013: sp = 0x96; break; case 0x2014: sp = 0x97; break;
+                            case 0x02DC: sp = 0x98; break; case 0x2122: sp = 0x99; break;
+                            case 0x0161: sp = 0x9A; break; case 0x203A: sp = 0x9B; break;
+                            case 0x0153: sp = 0x9C; break; case 0x017E: sp = 0x9E; break;
+                            case 0x0178: sp = 0x9F; break; default:     sp = 0;    break;
+                        }
+                        if (sp) {
+                            MR8(dst + k) = sp;
+                        } else {
+                            MR8(dst + k) = def_c;
+                            used_def = 1;
+                        }
+                    }
+                }
+                if (used_def_ptr) MR32(used_def_ptr) = used_def ? 1 : 0;
+                r = needed;
+            }
+        }
+    }
     else if (!strcmp(n,"GetStringTypeW")||!strcmp(n,"GetStringTypeA")){
         /* A: (LCID,dwInfoType,src,cch,out)  W: (dwInfoType,src,cch,out) */
         int aform = (n[13]=='A');

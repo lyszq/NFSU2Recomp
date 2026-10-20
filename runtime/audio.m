@@ -9,6 +9,10 @@
  * tamponlar farkli hizda/kanalda olabilir (en yakin komsu ornekleme). */
 #import <AudioToolbox/AudioToolbox.h>
 #import <AudioUnit/AudioUnit.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#import <AVFoundation/AVFoundation.h>
+#endif
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -444,15 +448,66 @@ static OSStatus au_cb(void *ud, AudioUnitRenderActionFlags *flags,
  * tamamen bizim ekledigimiz gecikmeydi ve oyunun kendi DirectSound
  * gecikmesinin (~275 ms) uzerine biniyordu.  AudioUnit aygitin kendi
  * dilimiyle (genelde 512 kare = 11.6 ms) calisir. */
+#if TARGET_OS_IPHONE
+static int audio_setup_ios_session(void){
+    @autoreleasepool {
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+        NSError *err = nil;
+
+        BOOL ok = [session setCategory:AVAudioSessionCategoryPlayback
+                           withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                                 error:&err];
+        if (!ok || err){
+            fprintf(stderr, "  [ses-ios] AVAudioSession setCategory hatasi: %s\n",
+                    err ? [[err localizedDescription] UTF8String] : "bilinmiyor");
+            return 0;
+        }
+
+        [session setPreferredIOBufferDuration:0.01 error:&err];
+        if (err){
+            fprintf(stderr, "  [ses-ios] setPreferredIOBufferDuration uyarisi: %s\n",
+                    [[err localizedDescription] UTF8String]);
+            err = nil;
+        }
+
+        [session setPreferredSampleRate:(double)OUT_RATE error:&err];
+        if (err){
+            fprintf(stderr, "  [ses-ios] setPreferredSampleRate uyarisi: %s\n",
+                    [[err localizedDescription] UTF8String]);
+            err = nil;
+        }
+
+        ok = [session setActive:YES error:&err];
+        if (!ok || err){
+            fprintf(stderr, "  [ses-ios] AVAudioSession setActive hatasi: %s\n",
+                    err ? [[err localizedDescription] UTF8String] : "bilinmiyor");
+            return 0;
+        }
+
+        fprintf(stderr, "  [ses-ios] AVAudioSession basariyla baslatildi (Playback, MixWithOthers, 10ms tampon)\n");
+        return 1;
+    }
+}
+#endif
+
 static int au_start(const AudioStreamBasicDescription *f){
     AudioComponentDescription d;
     memset(&d, 0, sizeof d);
     d.componentType         = kAudioUnitType_Output;
+    #if TARGET_OS_IPHONE
+    d.componentSubType      = kAudioUnitSubType_RemoteIO;
+#else
     d.componentSubType      = kAudioUnitSubType_DefaultOutput;
+#endif
     d.componentManufacturer = kAudioUnitManufacturer_Apple;
     AudioComponent comp = AudioComponentFindNext(NULL, &d);
     if (!comp) return 0;
     if (AudioComponentInstanceNew(comp, &g_au) != noErr) return 0;
+#if TARGET_OS_IPHONE
+    { UInt32 enableOutput = 1;
+      AudioUnitSetProperty(g_au, kAudioOutputUnitProperty_EnableIO,
+                           kAudioUnitScope_Output, 0, &enableOutput, sizeof enableOutput); }
+#endif
     if (AudioUnitSetProperty(g_au, kAudioUnitProperty_StreamFormat,
                              kAudioUnitScope_Input, 0, f, sizeof *f) != noErr) goto fail;
     { UInt32 mx = FRAMES;
@@ -471,6 +526,12 @@ fail:
 void audio_init(void){
     if (g_audio_on) return;
     { const char *e = getenv("NOSOUND"); if (e && *e && *e != '0') return; }
+#if TARGET_OS_IPHONE
+    if (!audio_setup_ios_session()){
+        fprintf(stderr, "ses: iOS AVAudioSession baslatilamadi, ses devre disi\n");
+        return;
+    }
+#endif
     { const char *d = getenv("SNDDUMP");
       if (d && *d){ g_dump = fopen(d, "wb");
           fprintf(stderr, "ses: cikis dokumu -> %s (%d Hz s16le %d kanal)\n", d, OUT_RATE, OUT_CH); } }

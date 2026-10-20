@@ -119,7 +119,8 @@ jobs:
           xcodegen generate --spec project-private.yml
           xcodebuild -project NFSU2iOS.xcodeproj -scheme NFSU2iOS -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' \
-            -derivedDataPath "$RUNNER_TEMP/PrivateDerivedData" CODE_SIGNING_ALLOWED=NO build
+            -derivedDataPath "$RUNNER_TEMP/PrivateDerivedData" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
 
       - name: Verify actual function linkage and package private IPA
         working-directory: ${{ runner.temp }}/source
@@ -129,7 +130,7 @@ jobs:
           test "$(lipo -archs "$APP/NFSU2iOS")" = arm64
           MAP="$RUNNER_TEMP/PrivateDerivedData/Build/Intermediates.noindex/NFSU2iOS.build/Release-iphoneos/NFSU2iOS.build/NFSU2iOS-LinkMap-normal-arm64.txt"
           sed '/^# Dead Stripped Symbols/,$d' "$MAP" > "$RUNNER_TEMP/private-live-symbols.txt"
-          for SYMBOL in sub_0048b1e0 sub_0075bcc7 sub_00760da0 sub_0075c4d0 nfs_private_lifted_probe nfs_private_startup_probe guest_pe_load guest_dispatch_lookup guest_execution_run guest_bootstrap_init guest_windows_import guest_heap_create guest_critical_create guest_critical_cleanup guest_tls_apply guest_process_init; do
+          for SYMBOL in sub_0048b1e0 sub_0075bcc7 sub_00760da0 sub_0075c4d0 nfs_private_lifted_probe nfs_private_startup_probe guest_pe_load guest_dispatch_lookup guest_execution_run guest_bootstrap_init guest_windows_import guest_locale_import guest_heap_create guest_critical_create guest_critical_cleanup guest_tls_apply guest_process_init; do
             grep -E "[[:space:]]_$SYMBOL$" "$RUNNER_TEMP/private-live-symbols.txt" | tee -a "$RUNNER_TEMP/private-evidence.txt"
           done
           mkdir -p "$RUNNER_TEMP/private-ipa/Payload"

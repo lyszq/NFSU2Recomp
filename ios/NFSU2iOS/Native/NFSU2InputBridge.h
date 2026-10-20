@@ -1,0 +1,80 @@
+/*
+ * NFSU2 iOS Port - DirectInput (DIK_*) Klavye ve Kontrolcü Köprüsü
+ *
+ * DirectInput 8 klavye tarama kodları (DIK_*) tamponunu (g_keys[256]) yönetir.
+ * Swift dokunmatik kontrolleri ve GameController.framework (GCController)
+ * girdilerini doğrudan C çalışma zamanına (runtime/com.c) aktarır.
+ */
+
+#ifndef NFSU2_INPUT_BRIDGE_H
+#define NFSU2_INPUT_BRIDGE_H
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * DirectInput 8 Tarama Kodları (DIK_*)
+ * Need for Speed: Underground 2 varsayılan kontrol haritasıyla birebir eşleşir.
+ */
+#define NFSU2_DIK_ESCAPE          0x01  /* Menü / Duraklat / Geri */
+#define NFSU2_DIK_1               0x02
+#define NFSU2_DIK_2               0x03
+#define NFSU2_DIK_3               0x04
+#define NFSU2_DIK_TAB             0x0F
+#define NFSU2_DIK_Q               0x10  /* Vites Küçült (Manuel) */
+#define NFSU2_DIK_W               0x11  /* İkincil Gaz */
+#define NFSU2_DIK_E               0x12  /* Vites Yükselt (Manuel) */
+#define NFSU2_DIK_R               0x13  /* Araba Sıfırla (Reset Car) */
+#define NFSU2_DIK_RETURN          0x1C  /* Seç / Menü Enter */
+#define NFSU2_DIK_LCONTROL        0x1D
+#define NFSU2_DIK_A               0x1E  /* İkincil Sol */
+#define NFSU2_DIK_S               0x1F  /* İkincil Fren / Geri */
+#define NFSU2_DIK_D               0x20  /* İkincil Sağ */
+#define NFSU2_DIK_LSHIFT          0x2A  /* NOS / Nitro */
+#define NFSU2_DIK_C               0x2E  /* Kamera Görünümü Değiştir */
+#define NFSU2_DIK_B               0x30  /* Arkaya Bak (Look Back) */
+#define NFSU2_DIK_N               0x31  /* İkincil NOS */
+#define NFSU2_DIK_M               0x32  /* Harita / GPS */
+#define NFSU2_DIK_SPACE           0x39  /* El Freni (Handbrake) */
+#define NFSU2_DIK_UP              0xC8  /* Gaz / Hızlanma (Throttle) */
+#define NFSU2_DIK_LEFT            0xCB  /* Direksiyon Sol (Steer Left) */
+#define NFSU2_DIK_RIGHT           0xCD  /* Direksiyon Sağ (Steer Right) */
+#define NFSU2_DIK_DOWN            0xD0  /* Fren / Geri Vites (Brake/Reverse) */
+
+/*
+ * Swift -> C Köprü Fonksiyonları
+ */
+
+/* Belirli bir DIK_* tuşunun basılı olma durumunu ayarlar (1 = basılı, 0 = serbest) */
+void nfsu2_input_set_key(uint8_t dik_code, bool is_pressed);
+
+/* Tüm tuş tamponunu (g_keys) sıfırlar (arka plana atılınca veya duraklatmada çağrılır) */
+void nfsu2_input_clear_all(void);
+
+/* Belirli bir tuşun durumunu okur */
+bool nfsu2_input_get_key(uint8_t dik_code);
+
+/* DirectInput 256 baytlık klavye tablosunu doldurur (0x80 = basılı, 0x00 = basılı değil) */
+void nfsu2_input_fill_keyboard(uint8_t *dst, uint32_t count);
+
+/* Analog giriş yardımcıları: Analog tetik ve çubuk girdilerini dijital DIK_* kodlarına çevirir */
+void nfsu2_input_set_steering(float analog_x);  /* -1.0 (tam sol) .. +1.0 (tam sağ) */
+void nfsu2_input_set_throttle(float analog_val); /* 0.0 .. 1.0 */
+void nfsu2_input_set_brake(float analog_val);    /* 0.0 .. 1.0 */
+
+/*
+ * runtime/com.c ile geriye dönük uyumluluk:
+ * com.c metal_fill_keyboard() fonksiyonunu çağırır.
+ */
+void metal_fill_keyboard(unsigned char *dst, unsigned int n);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* NFSU2_INPUT_BRIDGE_H */

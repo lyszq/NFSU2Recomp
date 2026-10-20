@@ -109,6 +109,15 @@ BOUNDARY_ARGUMENT_COUNTS = {
     "TryEnterCriticalSection": 1,
     "LeaveCriticalSection": 1,
     "DeleteCriticalSection": 1,
+    "WideCharToMultiByte": 8,
+    "GetCPInfo": 2,
+    "GetModuleFileNameA": 3,
+    "GetStringTypeW": 4,
+    "GetStringTypeA": 5,
+    "LCMapStringW": 6,
+    "LCMapStringA": 6,
+    "MultiByteToWideChar": 6,
+    "SetUnhandledExceptionFilter": 1,
 }
 CRITICAL_SECTION_IMPORTS = {
     "InitializeCriticalSection",
@@ -133,8 +142,53 @@ SUPPORTED_IMPORTS = {
     ("kernel32.dll", "HeapAlloc"),
     *(("kernel32.dll", name) for name in CRITICAL_SECTION_IMPORTS),
     *(("kernel32.dll", name) for name in TLS_IMPORTS),
+    ("kernel32.dll", "WideCharToMultiByte"),
+    ("kernel32.dll", "GetCPInfo"),
+    ("kernel32.dll", "GetModuleFileNameA"),
+    ("kernel32.dll", "GetStringTypeW"),
+    ("kernel32.dll", "GetStringTypeA"),
+    ("kernel32.dll", "LCMapStringW"),
+    ("kernel32.dll", "LCMapStringA"),
+    ("kernel32.dll", "MultiByteToWideChar"),
+    ("kernel32.dll", "HeapFree"),
 }
 ERROR_MOD_NOT_FOUND = 126
+
+# Canonical Windows-1252 CT_CTYPE1 table matching runtime/guest_locale.c
+_CT_CTYPE1_CP1252 = [
+    0x0220, 0x0220, 0x0220, 0x0220, 0x0220, 0x0220, 0x0220, 0x0220,
+    0x0220, 0x0268, 0x0228, 0x0228, 0x0228, 0x0228, 0x0220, 0x0220,
+    0x0220, 0x0220, 0x0220, 0x0220, 0x0220, 0x0220, 0x0220, 0x0220,
+    0x0220, 0x0220, 0x0220, 0x0220, 0x0220, 0x0220, 0x0220, 0x0220,
+    0x0248, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210,
+    0x0210, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210,
+    0x0284, 0x0284, 0x0284, 0x0284, 0x0284, 0x0284, 0x0284, 0x0284,
+    0x0284, 0x0284, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210,
+    0x0210, 0x0381, 0x0381, 0x0381, 0x0381, 0x0381, 0x0381, 0x0301,
+    0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301,
+    0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301,
+    0x0301, 0x0301, 0x0301, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210,
+    0x0210, 0x0382, 0x0382, 0x0382, 0x0382, 0x0382, 0x0382, 0x0302,
+    0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302,
+    0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302,
+    0x0302, 0x0302, 0x0302, 0x0210, 0x0210, 0x0210, 0x0210, 0x0220,
+    0x0200, 0x0220, 0x0210, 0x0302, 0x0210, 0x0210, 0x0210, 0x0210,
+    0x0200, 0x0210, 0x0301, 0x0210, 0x0301, 0x0220, 0x0301, 0x0220,
+    0x0220, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210,
+    0x0200, 0x0200, 0x0302, 0x0210, 0x0302, 0x0220, 0x0302, 0x0301,
+    0x0248, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210,
+    0x0210, 0x0210, 0x0312, 0x0210, 0x0210, 0x0230, 0x0210, 0x0210,
+    0x0210, 0x0210, 0x0214, 0x0214, 0x0210, 0x0312, 0x0210, 0x0210,
+    0x0210, 0x0214, 0x0312, 0x0210, 0x0210, 0x0210, 0x0210, 0x0210,
+    0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301,
+    0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301,
+    0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0210,
+    0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0301, 0x0302,
+    0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302,
+    0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302,
+    0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0210,
+    0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302, 0x0302
+]
 
 
 def _fnv1a64(data: bytes | bytearray | memoryview) -> int:
@@ -1178,6 +1232,738 @@ def _heap_alloc(engine: Any, registers: Any, unicorn_module: Any,
     return True
 
 
+def _heap_free(engine: Any, registers: Any, unicorn_module: Any,
+               import_row: dict[str, Any],
+               mapped_ranges: list[tuple[int, int]],
+               state: dict[str, Any]) -> bool:
+    """Implement HeapFree (required companion to complete __setargv cleanup)."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 3,
+    }
+
+    if not _range_is_mapped(esp, 16, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 16}
+        return False
+
+    ret_addr = _read_u32(engine, esp)
+    handle = _read_u32(engine, esp + 4)
+    flags = _read_u32(engine, esp + 8)
+    lp_mem = _read_u32(engine, esp + 12)
+    api.update(return_address=ret_addr, handle=handle, flags=flags, address=lp_mem)
+
+    heaps = state.get("heaps", {})
+    heap = next((h for h in heaps.values() if h.get("handle") == handle), None)
+    if heap is not None and lp_mem:
+        blocks = heap.get("blocks", [])
+        heap["blocks"] = [b for b in blocks if b.get("address") != lp_mem]
+        heap["live_blocks"] = len(heap["blocks"])
+
+    result = 1
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 16)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
+    api["result"] = result
+    state["api_calls"].append(api)
+    state["resume"] = True
+    return True
+
+
+def _wide_char_to_multi_byte(engine: Any, registers: Any, unicorn_module: Any,
+                             import_row: dict[str, Any],
+                             mapped_ranges: list[tuple[int, int]],
+                             state: dict[str, Any]) -> bool:
+    """Implement WideCharToMultiByte for XP headless guest environment."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 8,
+    }
+
+    if not _range_is_mapped(esp, 36, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 36}
+        return False
+
+    ret_addr = _read_u32(engine, esp)
+    code_page = _read_u32(engine, esp + 4)
+    flags = _read_u32(engine, esp + 8)
+    lp_wc = _read_u32(engine, esp + 12)
+    cch_wc = struct.unpack("<i", engine.mem_read(esp + 16, 4))[0]
+    lp_mb = _read_u32(engine, esp + 20)
+    cb_mb = struct.unpack("<i", engine.mem_read(esp + 24, 4))[0]
+    lp_default = _read_u32(engine, esp + 28)
+    lp_used_default = _read_u32(engine, esp + 32)
+    api.update(return_address=ret_addr, code_page=code_page, flags=flags,
+               lp_wide_char_str=lp_wc, cch_wide_char=cch_wc,
+               lp_multi_byte_str=lp_mb, cb_multi_byte=cb_mb)
+
+    last_error_addr = TEB_BASE + LAST_ERROR_OFFSET
+    last_error_before = _read_u32(engine, last_error_addr)
+    api["last_error_before"] = last_error_before
+
+    if cch_wc == 0:
+        _write_u32(engine, last_error_addr, ERROR_INVALID_PARAMETER)
+        result = 0
+        api["outcome"] = "invalid_parameter"
+    else:
+        if cch_wc == -1:
+            chars = []
+            cur = lp_wc
+            while True:
+                if not _range_is_mapped(cur, 2, mapped_ranges):
+                    state["status"] = "GUEST_STOP_MEMORY"
+                    state["target"] = cur
+                    state["memory_fault"] = {"access": "read", "address": cur, "size": 2}
+                    return False
+                wc = struct.unpack("<H", engine.mem_read(cur, 2))[0]
+                chars.append(wc)
+                cur += 2
+                if wc == 0:
+                    break
+        else:
+            if not _range_is_mapped(lp_wc, cch_wc * 2, mapped_ranges):
+                state["status"] = "GUEST_STOP_MEMORY"
+                state["target"] = lp_wc
+                state["memory_fault"] = {"access": "read", "address": lp_wc, "size": cch_wc * 2}
+                return False
+            raw = bytes(engine.mem_read(lp_wc, cch_wc * 2))
+            chars = [struct.unpack_from("<H", raw, i * 2)[0] for i in range(cch_wc)]
+
+        s = "".join(chr(c) for c in chars)
+        enc = "cp1252" if code_page in (0, 1252) else ("cp437" if code_page == 1 else f"cp{code_page}")
+        try:
+            mb_bytes = s.encode(enc, errors="replace")
+        except Exception:
+            mb_bytes = s.encode("latin-1", errors="replace")
+
+        req_len = len(mb_bytes)
+        if cb_mb == 0:
+            result = req_len
+            api["outcome"] = "query_size"
+        else:
+            if cb_mb < req_len:
+                _write_u32(engine, last_error_addr, ERROR_INSUFFICIENT_BUFFER)
+                result = 0
+                api["outcome"] = "insufficient_buffer"
+            else:
+                if not _range_is_mapped(lp_mb, req_len, mapped_ranges):
+                    state["status"] = "GUEST_STOP_MEMORY"
+                    state["target"] = lp_mb
+                    state["memory_fault"] = {"access": "write", "address": lp_mb, "size": req_len}
+                    return False
+                engine.mem_write(lp_mb, mb_bytes)
+                if lp_used_default != 0:
+                    if not _range_is_mapped(lp_used_default, 4, mapped_ranges):
+                        state["status"] = "GUEST_STOP_MEMORY"
+                        state["target"] = lp_used_default
+                        state["memory_fault"] = {"access": "write", "address": lp_used_default, "size": 4}
+                        return False
+                    _write_u32(engine, lp_used_default, 0)
+                result = req_len
+                api["outcome"] = "converted"
+
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 36)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
+    api["result"] = result
+    state["api_calls"].append(api)
+    state["resume"] = True
+    return True
+
+
+def _get_cp_info(engine: Any, registers: Any, unicorn_module: Any,
+                 import_row: dict[str, Any],
+                 mapped_ranges: list[tuple[int, int]],
+                 state: dict[str, Any]) -> bool:
+    """Implement GetCPInfo returning SBCS Windows-1252 metrics."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 2,
+    }
+
+    if not _range_is_mapped(esp, 12, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 12}
+        return False
+
+    ret_addr = _read_u32(engine, esp)
+    code_page = _read_u32(engine, esp + 4)
+    lp_cp_info = _read_u32(engine, esp + 8)
+    api.update(return_address=ret_addr, code_page=code_page, lp_cp_info=lp_cp_info)
+
+    if not _range_is_mapped(lp_cp_info, 18, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = lp_cp_info
+        state["memory_fault"] = {"access": "write", "address": lp_cp_info, "size": 18}
+        return False
+
+    # MaxCharSize=1, DefaultChar='?', LeadByte=[0]*12
+    cpinfo_bytes = struct.pack("<IBB12sH", 1, 0x3F, 0x00, b"\x00" * 12, 0)
+    engine.mem_write(lp_cp_info, cpinfo_bytes)
+
+    result = 1
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 12)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
+    api["result"] = result
+    state["api_calls"].append(api)
+    state["resume"] = True
+    return True
+
+
+def _get_module_file_name_a(engine: Any, registers: Any, unicorn_module: Any,
+                            import_row: dict[str, Any],
+                            mapped_ranges: list[tuple[int, int]],
+                            image_base: int,
+                            state: dict[str, Any]) -> bool:
+    """Implement GetModuleFileNameA returning the configured executable path."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 3,
+    }
+
+    if not _range_is_mapped(esp, 16, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 16}
+        return False
+
+    ret_addr = _read_u32(engine, esp)
+    h_module = _read_u32(engine, esp + 4)
+    lp_filename = _read_u32(engine, esp + 8)
+    n_size = _read_u32(engine, esp + 12)
+    api.update(return_address=ret_addr, h_module=h_module,
+               lp_filename=lp_filename, n_size=n_size)
+
+    last_error_addr = TEB_BASE + LAST_ERROR_OFFSET
+    last_error_before = _read_u32(engine, last_error_addr)
+    api["last_error_before"] = last_error_before
+
+    if h_module not in (0, image_base):
+        _write_u32(engine, last_error_addr, ERROR_MOD_NOT_FOUND)
+        result = 0
+        api["outcome"] = "module_not_found"
+    elif n_size == 0:
+        result = 0
+        api["outcome"] = "zero_buffer"
+    else:
+        path_bytes = PROCESS_COMMAND_LINE.encode("ascii") + b"\0"
+        if len(path_bytes) <= n_size:
+            if not _range_is_mapped(lp_filename, len(path_bytes), mapped_ranges):
+                state["status"] = "GUEST_STOP_MEMORY"
+                state["target"] = lp_filename
+                state["memory_fault"] = {"access": "write", "address": lp_filename, "size": len(path_bytes)}
+                return False
+            engine.mem_write(lp_filename, path_bytes)
+            result = len(path_bytes) - 1
+            api["outcome"] = "success"
+        else:
+            if not _range_is_mapped(lp_filename, n_size, mapped_ranges):
+                state["status"] = "GUEST_STOP_MEMORY"
+                state["target"] = lp_filename
+                state["memory_fault"] = {"access": "write", "address": lp_filename, "size": n_size}
+                return False
+            engine.mem_write(lp_filename, path_bytes[:n_size])
+            _write_u32(engine, last_error_addr, ERROR_INSUFFICIENT_BUFFER)
+            result = n_size
+            api["outcome"] = "insufficient_buffer"
+
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 16)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
+    api["result"] = result
+    state["api_calls"].append(api)
+    state["resume"] = True
+    return True
+
+
+def _get_string_type_w(engine: Any, registers: Any, unicorn_module: Any,
+                       import_row: dict[str, Any],
+                       mapped_ranges: list[tuple[int, int]],
+                       state: dict[str, Any]) -> bool:
+    """Implement GetStringTypeW for Unicode character classification."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 4,
+    }
+
+    if not _range_is_mapped(esp, 20, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 20}
+        return False
+
+    ret_addr = _read_u32(engine, esp)
+    info_type = _read_u32(engine, esp + 4)
+    lp_src = _read_u32(engine, esp + 8)
+    cch_src = struct.unpack("<i", engine.mem_read(esp + 12, 4))[0]
+    lp_chartype = _read_u32(engine, esp + 16)
+    api.update(return_address=ret_addr, info_type=info_type,
+               lp_src=lp_src, cch_src=cch_src, lp_chartype=lp_chartype)
+
+    if cch_src == 0 or info_type != 1:
+        last_error_addr = TEB_BASE + LAST_ERROR_OFFSET
+        _write_u32(engine, last_error_addr, ERROR_INVALID_PARAMETER)
+        result = 0
+        api["outcome"] = "invalid_parameter"
+    else:
+        if cch_src == -1:
+            chars = []
+            cur = lp_src
+            while True:
+                if not _range_is_mapped(cur, 2, mapped_ranges):
+                    state["status"] = "GUEST_STOP_MEMORY"
+                    state["target"] = cur
+                    state["memory_fault"] = {"access": "read", "address": cur, "size": 2}
+                    return False
+                wc = struct.unpack("<H", engine.mem_read(cur, 2))[0]
+                chars.append(wc)
+                cur += 2
+                if wc == 0:
+                    break
+        else:
+            if not _range_is_mapped(lp_src, cch_src * 2, mapped_ranges):
+                state["status"] = "GUEST_STOP_MEMORY"
+                state["target"] = lp_src
+                state["memory_fault"] = {"access": "read", "address": lp_src, "size": cch_src * 2}
+                return False
+            raw = bytes(engine.mem_read(lp_src, cch_src * 2))
+            chars = [struct.unpack_from("<H", raw, i * 2)[0] for i in range(cch_src)]
+
+        if not _range_is_mapped(lp_chartype, len(chars) * 2, mapped_ranges):
+            state["status"] = "GUEST_STOP_MEMORY"
+            state["target"] = lp_chartype
+            state["memory_fault"] = {"access": "write", "address": lp_chartype, "size": len(chars) * 2}
+            return False
+
+        types = [_CT_CTYPE1_CP1252[ch] if ch < 256 else 0x0200 for ch in chars]
+        out_bytes = struct.pack(f"<{len(types)}H", *types)
+        engine.mem_write(lp_chartype, out_bytes)
+        result = 1
+        api["outcome"] = "success"
+
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 20)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
+    api["result"] = result
+    state["api_calls"].append(api)
+    state["resume"] = True
+    return True
+
+
+def _get_string_type_a(engine: Any, registers: Any, unicorn_module: Any,
+                       import_row: dict[str, Any],
+                       mapped_ranges: list[tuple[int, int]],
+                       state: dict[str, Any]) -> bool:
+    """Implement GetStringTypeA for ANSI character classification."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 5,
+    }
+
+    if not _range_is_mapped(esp, 24, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 24}
+        return False
+
+    ret_addr = _read_u32(engine, esp)
+    locale = _read_u32(engine, esp + 4)
+    info_type = _read_u32(engine, esp + 8)
+    lp_src = _read_u32(engine, esp + 12)
+    cch_src = struct.unpack("<i", engine.mem_read(esp + 16, 4))[0]
+    lp_chartype = _read_u32(engine, esp + 20)
+    api.update(return_address=ret_addr, locale=locale, info_type=info_type,
+               lp_src=lp_src, cch_src=cch_src, lp_chartype=lp_chartype)
+
+    if cch_src == 0 or info_type != 1:
+        last_error_addr = TEB_BASE + LAST_ERROR_OFFSET
+        _write_u32(engine, last_error_addr, ERROR_INVALID_PARAMETER)
+        result = 0
+        api["outcome"] = "invalid_parameter"
+    else:
+        if cch_src == -1:
+            raw_bytes = bytearray()
+            cur = lp_src
+            while True:
+                if not _range_is_mapped(cur, 1, mapped_ranges):
+                    state["status"] = "GUEST_STOP_MEMORY"
+                    state["target"] = cur
+                    state["memory_fault"] = {"access": "read", "address": cur, "size": 1}
+                    return False
+                b = engine.mem_read(cur, 1)[0]
+                raw_bytes.append(b)
+                cur += 1
+                if b == 0:
+                    break
+        else:
+            if not _range_is_mapped(lp_src, cch_src, mapped_ranges):
+                state["status"] = "GUEST_STOP_MEMORY"
+                state["target"] = lp_src
+                state["memory_fault"] = {"access": "read", "address": lp_src, "size": cch_src}
+                return False
+            raw_bytes = bytes(engine.mem_read(lp_src, cch_src))
+
+        if not _range_is_mapped(lp_chartype, len(raw_bytes) * 2, mapped_ranges):
+            state["status"] = "GUEST_STOP_MEMORY"
+            state["target"] = lp_chartype
+            state["memory_fault"] = {"access": "write", "address": lp_chartype, "size": len(raw_bytes) * 2}
+            return False
+
+        types = [_CT_CTYPE1_CP1252[b] for b in raw_bytes]
+        out_bytes = struct.pack(f"<{len(types)}H", *types)
+        engine.mem_write(lp_chartype, out_bytes)
+        result = 1
+        api["outcome"] = "success"
+
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 24)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
+    api["result"] = result
+    state["api_calls"].append(api)
+    state["resume"] = True
+    return True
+
+
+def _lc_map_string_w(engine: Any, registers: Any, unicorn_module: Any,
+                     import_row: dict[str, Any],
+                     mapped_ranges: list[tuple[int, int]],
+                     state: dict[str, Any]) -> bool:
+    """Implement LCMapStringW for case conversions and length querying."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 6,
+    }
+
+    if not _range_is_mapped(esp, 28, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 28}
+        return False
+
+    ret_addr = _read_u32(engine, esp)
+    locale = _read_u32(engine, esp + 4)
+    flags = _read_u32(engine, esp + 8)
+    lp_src = _read_u32(engine, esp + 12)
+    cch_src = struct.unpack("<i", engine.mem_read(esp + 16, 4))[0]
+    lp_dest = _read_u32(engine, esp + 20)
+    cch_dest = struct.unpack("<i", engine.mem_read(esp + 24, 4))[0]
+    api.update(return_address=ret_addr, locale=locale, flags=flags,
+               lp_src=lp_src, cch_src=cch_src, lp_dest=lp_dest, cch_dest=cch_dest)
+
+    last_error_addr = TEB_BASE + LAST_ERROR_OFFSET
+    last_error_before = _read_u32(engine, last_error_addr)
+    api["last_error_before"] = last_error_before
+
+    if cch_src == 0:
+        _write_u32(engine, last_error_addr, ERROR_INVALID_PARAMETER)
+        result = 0
+        api["outcome"] = "invalid_parameter"
+    else:
+        if cch_src == -1:
+            chars = []
+            cur = lp_src
+            while True:
+                if not _range_is_mapped(cur, 2, mapped_ranges):
+                    state["status"] = "GUEST_STOP_MEMORY"
+                    state["target"] = cur
+                    state["memory_fault"] = {"access": "read", "address": cur, "size": 2}
+                    return False
+                wc = struct.unpack("<H", engine.mem_read(cur, 2))[0]
+                chars.append(wc)
+                cur += 2
+                if wc == 0:
+                    break
+        else:
+            if not _range_is_mapped(lp_src, cch_src * 2, mapped_ranges):
+                state["status"] = "GUEST_STOP_MEMORY"
+                state["target"] = lp_src
+                state["memory_fault"] = {"access": "read", "address": lp_src, "size": cch_src * 2}
+                return False
+            raw = bytes(engine.mem_read(lp_src, cch_src * 2))
+            chars = [struct.unpack_from("<H", raw, i * 2)[0] for i in range(cch_src)]
+
+        s = "".join(chr(c) for c in chars)
+        if flags & 0x0100:  # LCMAP_LOWERCASE
+            s = s.lower()
+        elif flags & 0x0200:  # LCMAP_UPPERCASE
+            s = s.upper()
+
+        req_len = len(s)
+        if cch_dest == 0:
+            result = req_len
+            api["outcome"] = "query_size"
+        else:
+            if cch_dest < req_len:
+                _write_u32(engine, last_error_addr, ERROR_INSUFFICIENT_BUFFER)
+                result = 0
+                api["outcome"] = "insufficient_buffer"
+            else:
+                if not _range_is_mapped(lp_dest, req_len * 2, mapped_ranges):
+                    state["status"] = "GUEST_STOP_MEMORY"
+                    state["target"] = lp_dest
+                    state["memory_fault"] = {"access": "write", "address": lp_dest, "size": req_len * 2}
+                    return False
+                engine.mem_write(lp_dest, s.encode("utf-16le"))
+                result = req_len
+                api["outcome"] = "mapped"
+
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 28)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
+    api["result"] = result
+    state["api_calls"].append(api)
+    state["resume"] = True
+    return True
+
+
+def _lc_map_string_a(engine: Any, registers: Any, unicorn_module: Any,
+                     import_row: dict[str, Any],
+                     mapped_ranges: list[tuple[int, int]],
+                     state: dict[str, Any]) -> bool:
+    """Implement LCMapStringA for ANSI case conversions and length querying."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 6,
+    }
+
+    if not _range_is_mapped(esp, 28, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 28}
+        return False
+
+    ret_addr = _read_u32(engine, esp)
+    locale = _read_u32(engine, esp + 4)
+    flags = _read_u32(engine, esp + 8)
+    lp_src = _read_u32(engine, esp + 12)
+    cch_src = struct.unpack("<i", engine.mem_read(esp + 16, 4))[0]
+    lp_dest = _read_u32(engine, esp + 20)
+    cch_dest = struct.unpack("<i", engine.mem_read(esp + 24, 4))[0]
+    api.update(return_address=ret_addr, locale=locale, flags=flags,
+               lp_src=lp_src, cch_src=cch_src, lp_dest=lp_dest, cch_dest=cch_dest)
+
+    last_error_addr = TEB_BASE + LAST_ERROR_OFFSET
+    last_error_before = _read_u32(engine, last_error_addr)
+    api["last_error_before"] = last_error_before
+
+    if cch_src == 0:
+        _write_u32(engine, last_error_addr, ERROR_INVALID_PARAMETER)
+        result = 0
+        api["outcome"] = "invalid_parameter"
+    else:
+        if cch_src == -1:
+            raw = bytearray()
+            cur = lp_src
+            while True:
+                if not _range_is_mapped(cur, 1, mapped_ranges):
+                    state["status"] = "GUEST_STOP_MEMORY"
+                    state["target"] = cur
+                    state["memory_fault"] = {"access": "read", "address": cur, "size": 1}
+                    return False
+                b = engine.mem_read(cur, 1)[0]
+                raw.append(b)
+                cur += 1
+                if b == 0:
+                    break
+        else:
+            if not _range_is_mapped(lp_src, cch_src, mapped_ranges):
+                state["status"] = "GUEST_STOP_MEMORY"
+                state["target"] = lp_src
+                state["memory_fault"] = {"access": "read", "address": lp_src, "size": cch_src}
+                return False
+            raw = bytes(engine.mem_read(lp_src, cch_src))
+
+        try:
+            s = raw.decode("cp1252", errors="replace")
+        except Exception:
+            s = raw.decode("latin-1", errors="replace")
+
+        if flags & 0x0100:
+            s = s.lower()
+        elif flags & 0x0200:
+            s = s.upper()
+
+        out_raw = s.encode("cp1252", errors="replace")
+        req_len = len(out_raw)
+        if cch_dest == 0:
+            result = req_len
+            api["outcome"] = "query_size"
+        else:
+            if cch_dest < req_len:
+                _write_u32(engine, last_error_addr, ERROR_INSUFFICIENT_BUFFER)
+                result = 0
+                api["outcome"] = "insufficient_buffer"
+            else:
+                if not _range_is_mapped(lp_dest, req_len, mapped_ranges):
+                    state["status"] = "GUEST_STOP_MEMORY"
+                    state["target"] = lp_dest
+                    state["memory_fault"] = {"access": "write", "address": lp_dest, "size": req_len}
+                    return False
+                engine.mem_write(lp_dest, out_raw)
+                result = req_len
+                api["outcome"] = "mapped"
+
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 28)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
+    api["result"] = result
+    state["api_calls"].append(api)
+    state["resume"] = True
+    return True
+
+
+def _multi_byte_to_wide_char(engine: Any, registers: Any, unicorn_module: Any,
+                             import_row: dict[str, Any],
+                             mapped_ranges: list[tuple[int, int]],
+                             state: dict[str, Any]) -> bool:
+    """Implement MultiByteToWideChar (required companion for GetStringTypeW & LCMapStringW)."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 6,
+    }
+
+    if not _range_is_mapped(esp, 28, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 28}
+        return False
+
+    ret_addr = _read_u32(engine, esp)
+    code_page = _read_u32(engine, esp + 4)
+    flags = _read_u32(engine, esp + 8)
+    lp_mb = _read_u32(engine, esp + 12)
+    cb_mb = struct.unpack("<i", engine.mem_read(esp + 16, 4))[0]
+    lp_wc = _read_u32(engine, esp + 20)
+    cch_wc = struct.unpack("<i", engine.mem_read(esp + 24, 4))[0]
+    api.update(return_address=ret_addr, code_page=code_page, flags=flags,
+               lp_multi_byte_str=lp_mb, cb_multi_byte=cb_mb,
+               lp_wide_char_str=lp_wc, cch_wide_char=cch_wc)
+
+    last_error_addr = TEB_BASE + LAST_ERROR_OFFSET
+    last_error_before = _read_u32(engine, last_error_addr)
+    api["last_error_before"] = last_error_before
+
+    if cb_mb == 0:
+        _write_u32(engine, last_error_addr, ERROR_INVALID_PARAMETER)
+        result = 0
+        api["outcome"] = "invalid_parameter"
+    else:
+        if cb_mb == -1:
+            raw = bytearray()
+            cur = lp_mb
+            while True:
+                if not _range_is_mapped(cur, 1, mapped_ranges):
+                    state["status"] = "GUEST_STOP_MEMORY"
+                    state["target"] = cur
+                    state["memory_fault"] = {"access": "read", "address": cur, "size": 1}
+                    return False
+                b = engine.mem_read(cur, 1)[0]
+                raw.append(b)
+                cur += 1
+                if b == 0:
+                    break
+        else:
+            if not _range_is_mapped(lp_mb, cb_mb, mapped_ranges):
+                state["status"] = "GUEST_STOP_MEMORY"
+                state["target"] = lp_mb
+                state["memory_fault"] = {"access": "read", "address": lp_mb, "size": cb_mb}
+                return False
+            raw = bytes(engine.mem_read(lp_mb, cb_mb))
+
+        enc = "cp1252" if code_page in (0, 1252) else ("cp437" if code_page == 1 else f"cp{code_page}")
+        try:
+            s = raw.decode(enc, errors="replace")
+        except Exception:
+            s = raw.decode("latin-1", errors="replace")
+
+        req_len = len(s)
+        if cch_wc == 0:
+            result = req_len
+            api["outcome"] = "query_size"
+        else:
+            if cch_wc < req_len:
+                _write_u32(engine, last_error_addr, ERROR_INSUFFICIENT_BUFFER)
+                result = 0
+                api["outcome"] = "insufficient_buffer"
+            else:
+                if not _range_is_mapped(lp_wc, req_len * 2, mapped_ranges):
+                    state["status"] = "GUEST_STOP_MEMORY"
+                    state["target"] = lp_wc
+                    state["memory_fault"] = {"access": "write", "address": lp_wc, "size": req_len * 2}
+                    return False
+                engine.mem_write(lp_wc, s.encode("utf-16le"))
+                result = req_len
+                api["outcome"] = "converted"
+
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 28)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
+    api["result"] = result
+    state["api_calls"].append(api)
+    state["resume"] = True
+    return True
+
+
+
 def _critical_section_import(engine: Any, registers: Any, import_row: dict[str, Any],
                              mapped_ranges: list[tuple[int, int]],
                              state: dict[str, Any]) -> bool:
@@ -1979,6 +2765,78 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
                 elif row["name"] == "HeapAlloc":
                     handled = _heap_alloc(engine, xr, uc, row,
                                           mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "HeapFree":
+                    handled = _heap_free(engine, xr, uc, row,
+                                         mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "WideCharToMultiByte":
+                    handled = _wide_char_to_multi_byte(engine, xr, uc, row,
+                                                        mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "GetCPInfo":
+                    handled = _get_cp_info(engine, xr, uc, row,
+                                           mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "GetModuleFileNameA":
+                    handled = _get_module_file_name_a(engine, xr, uc, row,
+                                                      mapped_ranges, image_base, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "GetStringTypeW":
+                    handled = _get_string_type_w(engine, xr, uc, row,
+                                                 mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "GetStringTypeA":
+                    handled = _get_string_type_a(engine, xr, uc, row,
+                                                 mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "LCMapStringW":
+                    handled = _lc_map_string_w(engine, xr, uc, row,
+                                               mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "LCMapStringA":
+                    handled = _lc_map_string_a(engine, xr, uc, row,
+                                               mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "MultiByteToWideChar":
+                    handled = _multi_byte_to_wide_char(engine, xr, uc, row,
+                                                       mapped_ranges, state)
                     if handled or state["status"] is not None:
                         engine.emu_stop()
                         return True
