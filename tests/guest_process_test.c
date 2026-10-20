@@ -165,7 +165,9 @@ static int test_init_contents_and_cleanup(void) {
     CHECK(guest_memory_init() == 0);
     CHECK(guest_process_init(&proc, &img) == 0);
     CHECK(proc.initialized == 1);
-
+    guest_process_cleanup(&proc);
+    guest_memory_shutdown();
+    CHECK(guest_memory_init() == 0);
     return 0;
 }
 
@@ -577,14 +579,20 @@ int main(void) {
     }
 
     if (test_init_validation() != 0) return 1;
+    guest_memory_shutdown(); if (guest_memory_init() != 0) return 1;
     if (test_init_contents_and_cleanup() != 0) return 1;
+    guest_memory_shutdown(); if (guest_memory_init() != 0) return 1;
     if (test_unknown_and_uninit_import() != 0) return 1;
+    guest_memory_shutdown(); if (guest_memory_init() != 0) return 1;
     if (test_stdcall_getcommandline_cp() != 0) return 1;
+    guest_memory_shutdown(); if (guest_memory_init() != 0) return 1;
     if (test_env_lifecycle_and_caps() != 0) return 1;
+    guest_memory_shutdown(); if (guest_memory_init() != 0) return 1;
     if (test_memory_protection_and_faults() != 0) return 1;
+    guest_memory_shutdown(); if (guest_memory_init() != 0) return 1;
     if (test_bad_frames_and_overflow_teb() != 0) return 1;
 
     guest_memory_shutdown();
-    printf("PASS\n");
+    printf("PASS | guest process contracts\n");
     return 0;
 }

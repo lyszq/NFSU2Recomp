@@ -381,6 +381,6 @@ int main(void) {
     CHECK(test_teb_faults_and_atomicity() == 0);
 
     CHECK(guest_memory_shutdown() == 0);
-    printf("PASS\n");
+    printf("PASS | guest stdio contracts\n");
     return 0;
 }
