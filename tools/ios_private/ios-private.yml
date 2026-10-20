@@ -49,7 +49,7 @@ jobs:
           set -euo pipefail
           clang -O2 -std=gnu11 -Wall -Wextra -Werror -Wno-unused-label \
             -fno-strict-aliasing -pthread -DNFS_PRIVATE_PROBE=1 -DNFS_PRIVATE_STARTUP=1 -Iruntime \
-            runtime/guest_memory.c runtime/guest_pe.c runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_bootstrap.c \
+            runtime/guest_memory.c runtime/guest_pe.c runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_bootstrap.c runtime/guest_windows.c runtime/guest_heap.c \
             ios/NFSU2iOS/Native/GuestImageProbe.c tests/guest_image_cli.c \
             gen/ios-private/lifted.c gen/ios-private/private_probe.c gen/ios-private/startup_lifted.c gen/ios-private/startup_probe.c \
             -o "$RUNNER_TEMP/private-lifted-test"
@@ -75,7 +75,7 @@ jobs:
           test "$(lipo -archs "$APP/NFSU2iOS")" = arm64
           MAP="$RUNNER_TEMP/PrivateDerivedData/Build/Intermediates.noindex/NFSU2iOS.build/Release-iphoneos/NFSU2iOS.build/NFSU2iOS-LinkMap-normal-arm64.txt"
           sed '/^# Dead Stripped Symbols/,$d' "$MAP" > "$RUNNER_TEMP/private-live-symbols.txt"
-          for SYMBOL in sub_0048b1e0 sub_0075bcc7 sub_00760da0 sub_0075c4d0 nfs_private_lifted_probe nfs_private_startup_probe guest_pe_load guest_dispatch_lookup guest_execution_run guest_bootstrap_init; do
+          for SYMBOL in sub_0048b1e0 sub_0075bcc7 sub_00760da0 sub_0075c4d0 nfs_private_lifted_probe nfs_private_startup_probe guest_pe_load guest_dispatch_lookup guest_execution_run guest_bootstrap_init guest_windows_import guest_heap_create; do
             grep -E "[[:space:]]_$SYMBOL$" "$RUNNER_TEMP/private-live-symbols.txt" | tee -a "$RUNNER_TEMP/private-evidence.txt"
           done
           mkdir -p "$RUNNER_TEMP/private-ipa/Payload"

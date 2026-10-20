@@ -24,7 +24,7 @@ static int heap_import(CPU *c, const GuestImport *import, GuestWindows *windows,
         ((release || size) && (b & ~1u))) return 0;
     uint64_t error_at=(uint64_t)c->fs_base+0x34u;
     void *error=error_at<=UINT32_MAX ? guest_memory_pointer((uint32_t)error_at,4,1) : NULL;
-    if (!alloc && !error) { *fault=error_at>UINT32_MAX ? UINT32_MAX : (uint32_t)error_at; return -1; }
+    if (!alloc && !size && !error) { *fault=error_at>UINT32_MAX ? UINT32_MAX : (uint32_t)error_at; return -1; }
     int rc;
     if (create) {
         uint64_t maximum=((uint64_t)d+GUEST_MEMORY_GRANULE-1)&~(uint64_t)(GUEST_MEMORY_GRANULE-1);
@@ -38,7 +38,7 @@ static int heap_import(CPU *c, const GuestImport *import, GuestWindows *windows,
         if (rc) write32(error,87);
     } else if (size) {
         rc=guest_heap_size(&windows->heaps,a,d,&result);
-        if (rc) { result=UINT32_MAX; write32(error,87); }
+        if (rc) result=UINT32_MAX; /* HeapSize, like HeapAlloc, preserves LastError. */
     } else {
         rc=guest_heap_destroy(&windows->heaps,a); result=!rc;
         if (rc) write32(error,87);
@@ -54,9 +54,7 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
     int module = !strcmp(import->name, "GetModuleHandleA");
     if (strcasecmp(import->library, "KERNEL32.dll")) return 0;
     if (!version && !module) return heap_import(c,import,context,fault);
-    if (
-        (module && !context))
-        return 0;
+    if (module && !context) return 0;
     /* Validate the return and argument together: wrapped x86 stack ranges are
      * rejected, and a malformed API never partly consumes the guest stack. */
     const uint8_t *stack = guest_memory_pointer(c->esp, 8, 0);

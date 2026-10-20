@@ -3,6 +3,7 @@
 #include "guest_execution.h"
 #include "guest_bootstrap.h"
 #include "guest_memory.h"
+#include "guest_windows.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -29,19 +30,27 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     rc = guest_dispatch_init(&table, 0x00401000u, 0x00381af1u,
                              nfs_startup_addresses, nfs_startup_functions, nfs_startup_count);
     if (rc) goto failed;
-    GuestExecutionConfig config = {&table, nfs_startup_imports, nfs_startup_import_count,
-                                    100000u, 64u, UINT64_C(2000000000)};
+    GuestWindows windows={.image_base=image->image_base};
+    GuestExecutionConfig config = {.dispatch=&table, .imports=nfs_startup_imports,
+        .import_count=nfs_startup_import_count, .instruction_budget=100000u,
+        .depth_limit=64u, .timeout_ns=UINT64_C(2000000000), .import_handler=guest_windows_import,
+        .import_context=&windows};
     PUSH32(0xdeadc0deu);
     rc = guest_execution_run(&config, c, image->entry_point, &result);
     if (rc) goto failed;
     const uint32_t expected_registers[] = {@EXPECTED_GPRS@};
     if (result.stop != GUEST_STOP_IMPORT || result.target != @EXPECTED_TARGET@ ||
         result.ip != @EXPECTED_IP@ || result.instructions != @EXPECTED_STEPS@ ||
+        result.imports_handled != @EXPECTED_APIS@ ||
+        result.calls != @EXPECTED_CALLS@ || result.maximum_depth != @EXPECTED_DEPTH@ ||
+        c->eip != @EXPECTED_IP@ || c->fs_base != GUEST_TEB_BASE || c->gs_base != GUEST_TEB_BASE ||
         result.trace_hash != UINT64_C(@EXPECTED_TRACE@) ||
         memcmp(c->r, expected_registers, sizeof c->r) ||
         (eflags_get(c) & 0xcd5u) != @EXPECTED_FLAGS@ ||
         memory_hash(g_mem + image->image_base, image->image_size) != UINT64_C(@EXPECTED_IMAGE_HASH@) ||
         memory_hash(g_mem + GUEST_TEB_BASE, 0x20000u) != UINT64_C(@EXPECTED_TEB_HASH@) ||
+        !guest_memory_pointer(@HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@, 0) ||
+        memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@) != UINT64_C(@EXPECTED_HEAP_HASH@) ||
         memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) != UINT64_C(@EXPECTED_STACK_HASH@)) {
         rc = EINVAL;
         (void)snprintf(out, capacity,
@@ -55,8 +64,10 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     (void)snprintf(out, capacity,
         "VERIFIED ENTRY STOP | 0075bcc7 -> %08x | %s!%s not implemented | "
         "%" PRIu64 " instructions / %" PRIu64 " dispatch calls / %u registered functions | "
-        "x86 trace + GPR/EFLAGS + image/TEB/stack match | leaf regression PASS | no JIT | no game boot",
-        result.ip, import->library, import->name, result.instructions, result.calls, nfs_startup_count);
+        "%" PRIu64 " implemented API calls | x86 trace + GPR/EFLAGS + image/TEB/stack/heap match | "
+        "leaf regression PASS | no JIT | no game boot",
+        result.ip, import->library, import->name, result.instructions, result.calls, nfs_startup_count,
+        result.imports_handled);
     guest_dispatch_destroy(&table);
     return 0;
 failed:

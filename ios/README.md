@@ -150,3 +150,45 @@ result is **VERIFIED ENTRY STOP**, never a full-boot or gameplay PASS.
 Next: implement the actual `GetVersionExA` compatibility contract, then continue
 through subsequent module/command-line/CRT imports with explicit diagnostics.
 The app still has no game renderer, audio, input or playable scene.
+
+
+## Stage 6: bounded Windows contracts and guest heaps (0.6.1 private)
+
+The shared runner can service implemented imports through an explicit callback.
+Unknown APIs or unsupported flags still stop with the unconsumed call frame.
+`guest_windows.c` implements GetVersionExA, GetModuleHandleA, HeapCreate,
+HeapAlloc, HeapFree, HeapSize and HeapDestroy. These are compatibility contracts,
+not claims about the host iPad OS. The selected guest profile is XP 5.1.2600,
+NT/workstation, Personal suite, no service pack. Main-module queries recognize
+NULL or the case-insensitive exact SPEED2.EXE identity. No other DLL is loaded.
+
+`guest_heap.c` supplies actual checked guest allocations with 8-byte alignment,
+zero-memory support, reuse of freed gaps, size queries and destruction that
+revokes access. Four disjoint 64 MiB arenas with 256 live blocks each are current
+resource limits. Fixed heap limits and the 32-bit large-block cutoff are checked.
+This is a bounded allocator, not the desktop Windows heap implementation.
+The bootstrap TEB must remain valid; one serialized guest thread owns this state.
+Executable or exception-generating heap options stop as unsupported. There is
+no GetProcessHeap, HeapReAlloc, guest thread creation or filesystem bridge yet.
+
+The independent x86 reference now services the declared contracts and reaches
+InitializeCriticalSection at 0x0076c3aa after 154 original instructions, 15 calls,
+maximum depth 5 and four API invocations (version, module, heap, module).
+The native private probe must match those counts, the exact instruction-address
+trace, GPR/EFLAGS, image/TEB/stack hashes and the 32 KiB committed guest heap.
+Static generation prioritizes observed authentic call targets, then expands the
+bounded graph; all executed functions must have real lifted bodies or generation
+fails. Native execution remains ARM64 static code without JIT or an interpreter.
+
+Host tests cover heap exhaustion, failed-allocation atomicity, freed-gap reuse,
+protection, stdcall cleanup, structure layouts, LastError preservation, aliased
+outputs, malformed memory and unsupported imports. Physical iPad validation of
+0.6.1 is pending; the last confirmed device regression is 0.4.1. This probe still
+stops during CRT initialization and has no game boot, renderer, audio or input.
+
+API references:
+- https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-getversionexa
+- https://learn.microsoft.com/en-us/windows/win32/api/libloaderapi/nf-libloaderapi-getmodulehandlea
+- https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapcreate
+- https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapalloc
+- https://learn.microsoft.com/en-us/windows/win32/api/heapapi/nf-heapapi-heapsize

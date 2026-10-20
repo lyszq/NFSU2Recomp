@@ -115,6 +115,20 @@ int main(void) {
     CHECK(failed_address == UINT32_C(0x87654321));
     CHECK(!guest_heap_destroy(&fixed, fixed_heap));
 
+    GuestHeapSet fixed_boundary = {0};
+    uint32_t boundary_heap = 0;
+    CHECK(!guest_heap_create(&fixed_boundary, 0, 0x80000u, &boundary_heap));
+    failed_address = UINT32_C(0x87654321);
+    CHECK(guest_heap_alloc(&fixed_boundary, boundary_heap, 0x7fff8u, 0,
+                           &failed_address) == ENOMEM);
+    CHECK(failed_address == UINT32_C(0x87654321));
+    uint32_t below_cutoff = 0;
+    CHECK(!guest_heap_alloc(&fixed_boundary, boundary_heap, 0x7fff7u, 0,
+                            &below_cutoff));
+    CHECK(!guest_heap_size(&fixed_boundary, boundary_heap, below_cutoff, &size));
+    CHECK(size == 0x7fff7u);
+    CHECK(!guest_heap_destroy(&fixed_boundary, boundary_heap));
+
     /* The fixed host metadata cap is explicit; a freed slot can be reused. */
     GuestHeapSet blocks = {0};
     uint32_t blocks_heap = 0;

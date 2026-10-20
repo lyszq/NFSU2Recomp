@@ -101,7 +101,7 @@ def main():
             "has_projects": False, "has_wiki": False})
         if not created["private"]: raise ValueError("private creation was not confirmed")
         client.private()
-    template = (ROOT / "tools/ios_private/ios-private.yml").read_text()
+    template = (ROOT / "tools/ios_private/ios-private.yml").read_text(encoding="utf-8")
     if template.count("SOURCE_COMMIT_PLACEHOLDER") != 1:
         raise ValueError("invalid workflow template")
     workflow = template.replace("SOURCE_COMMIT_PLACEHOLDER", sha)
@@ -112,7 +112,8 @@ def main():
         "lifted C is generated on the runner and never committed.\n\n"
         f"Pinned public source: `{sha}`. Run the manual Actions workflow to build.\n"
         "Artifacts contain game-derived executable code and must remain private.\n"
-        "Unsigned IPA still requires signing. It tests one actual lifted function, not gameplay.\n")
+        "Unsigned IPA still requires signing. It tests actual lifted functions and a bounded "
+        "entry prefix with implemented guest API contracts; no game boot or gameplay.\n")
     if blob is not None:
         client.private()
         try:

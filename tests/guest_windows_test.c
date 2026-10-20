@@ -68,6 +68,8 @@ int main(void) {
     for (unsigned i=0;i<31;i++) CHECK(!g_mem[allocation+i]);
     heapapi.name="HeapSize"; c=setup(0); put(STACK+4,heap); put(STACK+8,0); put(STACK+12,allocation);
     CHECK(guest_windows_import(&c,&heapapi,&windows,&fault)==1 && c.eax==31);
+    c=setup(0); put(STACK+4,heap); put(STACK+8,0); put(STACK+12,allocation+1);
+    CHECK(guest_windows_import(&c,&heapapi,&windows,&fault)==1 && c.eax==UINT32_MAX && get(TEB+0x34)==999);
     heapapi.name="HeapFree"; c=setup(0); put(STACK+4,heap); put(STACK+8,0); put(STACK+12,allocation);
     CHECK(guest_windows_import(&c,&heapapi,&windows,&fault)==1 && c.eax==1);
     c=setup(0); put(STACK+4,heap); put(STACK+8,0); put(STACK+12,allocation);
@@ -94,6 +96,12 @@ int main(void) {
     c=setup(0); put(STACK+4,0);
     CHECK(guest_windows_import(&c,&module,&windows,&fault)==1 && c.eax==windows.image_base);
     CHECK(c.esp==STACK+8 && get(TEB+0x34)==999);
+    c=setup(0); memcpy(g_mem+BUFFER,"SPEED2",7);
+    CHECK(guest_windows_import(&c,&module,&windows,&fault)==1 && !c.eax && get(TEB+0x34)==126);
+    CHECK(!guest_memory_commit(0xffffc000u,0x4000));
+    c=setup(0); put(STACK+4,0xfffffffeu); g_mem[0xfffffffeu]='a'; g_mem[0xffffffffu]='b'; before=c;
+    CHECK(guest_windows_import(&c,&module,&windows,&fault)==-1 && fault==UINT32_MAX);
+    CHECK(!memcmp(&c,&before,sizeof c));
     c=setup(0); memcpy(g_mem+BUFFER,"sPeEd2.ExE",11);
     CHECK(guest_windows_import(&c,&module,&windows,&fault)==1 && c.eax==windows.image_base);
     c=setup(0); memcpy(g_mem+BUFFER,"missing.dll",12);

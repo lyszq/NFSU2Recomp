@@ -47,7 +47,19 @@ def generate(exe):
                 return [f'guest_execution_unsupported(c,0x{instruction.address:x}u,"unchecked bulk operation");']
             return lines
 
-    queue = collections.deque([ENTRY])
+    pe = pefile.PE(data=blob)
+    imports = [{"iat": entry.address, "library": descriptor.dll.decode("ascii"),
+                "name": entry.name.decode("ascii") if entry.name else f"#{entry.ordinal}"}
+               for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
+    reference = run_startup_reference(exe, imports)
+    if (reference["import_name"] != "InitializeCriticalSection" or reference["instructions"] != 154
+            or reference["api_call_count"] != 4):
+        raise ValueError("unexpected independent x86 entry boundary")
+    # Prioritize the authentic observed startup path within the bounded static
+    # graph. This changes generation order, never the guest instructions or API
+    # outcomes. Missing/unliftable executed functions must fail generation.
+    observed = list(dict.fromkeys(call["target"] for call in reference["direct_calls"]))
+    queue = collections.deque([ENTRY] + observed)
     seen = set()
     bodies, omitted = {}, []
     lifter = StartupLifter(str(exe), comments=False, trap=False)
@@ -76,13 +88,8 @@ def generate(exe):
         queue.extend(t for t in sorted(targets) if lifter.in_text(t) and t not in seen)
     if ENTRY not in bodies or not all(a in bodies for a in [0x00760DA0, 0x0075C4D0]):
         raise ValueError("authentic entry prefix is not completely lifted")
-    pe = pefile.PE(data=blob)
-    imports = [{"iat": entry.address, "library": descriptor.dll.decode("ascii"),
-                "name": entry.name.decode("ascii") if entry.name else f"#{entry.ordinal}"}
-               for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
-    reference = run_startup_reference(exe, imports)
-    if reference["import_name"] != "GetVersionExA" or reference["instructions"] != 40:
-        raise ValueError("unexpected independent x86 entry boundary")
+    if any(address not in bodies and address != LEAF for address in observed):
+        raise ValueError("an executed startup function was not statically lifted")
     output = ROOT / "gen/ios-private"
     if not (output / "manifest.json").is_file():
         raise ValueError("generate the leaf regression first")
@@ -110,10 +117,16 @@ def generate(exe):
                      "EXPECTED_TARGET": f"0x{reference['target']:08x}u",
                      "EXPECTED_IP": f"0x{reference['ip']:08x}u",
                      "EXPECTED_STEPS": str(reference["instructions"]),
+                     "EXPECTED_APIS": str(reference["api_call_count"]),
+                     "EXPECTED_CALLS": str(reference["calls"]),
+                     "EXPECTED_DEPTH": str(reference["maximum_depth"]),
                      "EXPECTED_TRACE": str(reference["trace_hash"]),
                      "EXPECTED_IMAGE_HASH": str(reference["image_hash64"]),
                      "EXPECTED_TEB_HASH": str(reference["teb_hash64"]),
                      "EXPECTED_STACK_HASH": str(reference["stack_hash64"]),
+                     "EXPECTED_HEAP_HASH": str(reference["heap_hash64"]),
+                     "HEAP_WINDOW_ADDRESS": f"0x{reference['heap_hash_start']:08x}u",
+                     "HEAP_WINDOW_SIZE": str(reference["heap_hash_size"]),
                      "STACK_WINDOW_ADDRESS": f"0x{reference['stack_hash_start']:08x}u",
                      "STACK_WINDOW_SIZE": str(reference["stack_hash_size"])}
     for key, value in substitutions.items():
@@ -126,11 +139,13 @@ def generate(exe):
     manifest["startup"] = {"entry": f"{ENTRY:08x}", "generated_functions": len(addresses),
                             "unliftable_omitted": omitted, "frontier_remaining": len(queue),
                             "import_count": len(imports), "reference": reference,
-                            "semantics": "strict stop before first unimplemented import; no fabricated API result"}
+                            "semantics": "original x86 instructions with explicit XP/module/heap contracts; strict stop at unimplemented APIs"}
     for name in ["startup_lifted.c", "startup_probe.c"]:
         manifest[name + "_sha256"] = hashlib.sha256((output / name).read_bytes()).hexdigest()
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    print(f"PASS | private static entry generation | {len(addresses)} functions | {len(imports)} imports | x86 reference stops before GetVersionExA after 40 instructions")
+    print(f"PASS | private static entry generation | {len(addresses)} functions | {len(imports)} imports | "
+          f"x86 reference stops before {reference['import_name']} after {reference['instructions']} instructions | "
+          f"{reference['api_call_count']} implemented API calls")
 
 
 if __name__ == "__main__":

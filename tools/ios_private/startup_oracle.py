@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Build-host x86 reference for the authenticated, bounded startup prefix.
 
-This module executes the original PE instructions in Unicorn only up to the
-first tagged import.  It never supplies an API result and never writes game
-bytes or generated C.  Its result is intended to be compared with the native
-statically lifted startup probe.
+This module executes original PE instructions in Unicorn and services only the
+explicitly declared guest Windows compatibility contracts. It stops before the
+first unimplemented import. Its state is compared with statically lifted native
+execution; the host-only reference engine is never bundled into iOS.
 """
 from __future__ import annotations
 
@@ -41,6 +41,30 @@ FNV64_MASK = 0xFFFFFFFFFFFFFFFF
 INSTRUCTION_BUDGET = 100_000
 STACK_WINDOW_BELOW = 0x1000
 STACK_WINDOW_SIZE = 0x2000
+LAST_ERROR_OFFSET = 0x34
+ERROR_INSUFFICIENT_BUFFER = 122
+ERROR_INVALID_PARAMETER = 87
+ERROR_NOT_ENOUGH_MEMORY = 8
+HEAP_BASE = 0x20000000
+HEAP_ARENA_SIZE = 0x04000000
+HEAP_HEADER_SIZE = 0x4000
+HEAP_GRANULE = 0x4000
+HEAP_MAX_COUNT = 4
+HEAP_SUPPORTED_FLAGS = 0x01
+BOUNDARY_ARGUMENT_COUNTS = {
+    "HeapCreate": 3,
+    "HeapAlloc": 3,
+    "HeapFree": 3,
+    "HeapSize": 3,
+    "HeapDestroy": 1,
+    "InitializeCriticalSection": 1,
+}
+SUPPORTED_IMPORTS = {
+    ("kernel32.dll", "GetVersionExA"),
+    ("kernel32.dll", "GetModuleHandleA"),
+    ("kernel32.dll", "HeapCreate"),
+}
+ERROR_MOD_NOT_FOUND = 126
 
 
 def _fnv1a64(data: bytes | bytearray | memoryview) -> int:
@@ -52,6 +76,312 @@ def _fnv1a64(data: bytes | bytearray | memoryview) -> int:
 
 def _read_u32(engine: Any, address: int) -> int:
     return struct.unpack("<I", engine.mem_read(address, 4))[0]
+
+
+def _range_is_mapped(address: int, size: int, ranges: list[tuple[int, int]]) -> bool:
+    if address < 0 or size <= 0 or address > 0xFFFFFFFF or size > 0x100000000 - address:
+        return False
+    end = address + size
+    return any(start <= address and end <= stop for start, stop in ranges)
+
+
+class _GuestPointerFault(Exception):
+    def __init__(self, access: str, address: int, size: int):
+        super().__init__(access, address, size)
+
+
+def _get_version_ex_a(engine: Any, registers: Any, import_row: dict[str, Any],
+                      mapped_ranges: list[tuple[int, int]], state: dict[str, Any]) -> bool:
+    """Implement only the known XP GetVersionExA contract at its import tag.
+
+    The bool result reports whether the API returned to guest code. Bad guest
+    pointers stop strictly as a memory fault; no API return is fabricated.
+    """
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+    }
+    state["api_calls"].append(api)
+    try:
+        if not _range_is_mapped(esp, 8, mapped_ranges):
+            raise _GuestPointerFault("read", esp, 8)
+        return_address = _read_u32(engine, esp)
+        argument = _read_u32(engine, esp + 4)
+        api["return_address"] = return_address
+        api["argument"] = argument
+        if not _range_is_mapped(argument, 4, mapped_ranges):
+            raise _GuestPointerFault("read", argument, 4)
+        cb = _read_u32(engine, argument)
+        api["structure_size"] = cb
+        last_error_address = TEB_BASE + LAST_ERROR_OFFSET
+        last_error_before = _read_u32(engine, last_error_address)
+        api["last_error_before"] = last_error_before
+
+        if cb not in (148, 156):
+            result = 0
+            _write_u32(engine, last_error_address, ERROR_INSUFFICIENT_BUFFER)
+            api["outcome"] = "insufficient_buffer"
+            api["last_error_after"] = ERROR_INSUFFICIENT_BUFFER
+            api["error"] = ERROR_INSUFFICIENT_BUFFER
+            api["output_size"] = 0
+        else:
+            if not _range_is_mapped(argument, cb, mapped_ranges):
+                raise _GuestPointerFault("write", argument, cb)
+            output = bytearray(cb)
+            struct.pack_into("<IIII", output, 0, cb, 5, 1, 2600)
+            struct.pack_into("<I", output, 16, 2)  # VER_PLATFORM_WIN32_NT
+            if cb == 156:
+                struct.pack_into("<HHHBB", output, 148, 0, 0, 0x0100, 1, 0)
+            engine.mem_write(argument, bytes(output))
+            result = 1
+            api["outcome"] = "success"
+            api["last_error_after"] = last_error_before
+            api["output_size"] = cb
+            api["version"] = {
+                "major": 5,
+                "minor": 1,
+                "build": 2600,
+                "platform": 2,
+                "service_pack": "",
+                "suite_mask": 0x0100 if cb == 156 else None,
+                "product_type": 1 if cb == 156 else None,
+            }
+
+        # GetVersionExA is stdcall: BOOL return, then callee pops its one DWORD.
+        engine.reg_write(registers.UC_X86_REG_EAX, result)
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        api["result"] = result
+        api["esp_after"] = (esp + 8) & 0xFFFFFFFF
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
+def _get_module_handle_a(engine: Any, registers: Any, import_row: dict[str, Any],
+                         mapped_ranges: list[tuple[int, int]], image_base: int,
+                         state: dict[str, Any]) -> bool:
+    """Return only the actual main-module handle; no other modules are loaded."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+    }
+    state["api_calls"].append(api)
+    try:
+        if not _range_is_mapped(esp, 8, mapped_ranges):
+            raise _GuestPointerFault("read", esp, 8)
+        return_address = _read_u32(engine, esp)
+        argument = _read_u32(engine, esp + 4)
+        api["return_address"] = return_address
+        api["argument"] = argument
+        last_error_address = TEB_BASE + LAST_ERROR_OFFSET
+        last_error_before = _read_u32(engine, last_error_address)
+        api["last_error_before"] = last_error_before
+
+        if argument == 0:
+            match = "main_module_null_name"
+            result = image_base
+        else:
+            module = bytearray()
+            terminated = False
+            for offset in range(260):
+                address = argument + offset
+                if not _range_is_mapped(address, 1, mapped_ranges):
+                    raise _GuestPointerFault("read", address, 1)
+                value = engine.mem_read(address, 1)[0]
+                if value == 0:
+                    terminated = True
+                    break
+                module.append(value)
+            if not terminated:
+                match = "unterminated_name_over_260"
+                result = 0
+            else:
+                decoded = module.decode("latin-1")
+                if decoded.casefold() == "speed2.exe":
+                    match = "main_module_name"
+                    result = image_base
+                else:
+                    match = "no_loaded_module_match"
+                    result = 0
+
+        if result == 0:
+            _write_u32(engine, last_error_address, ERROR_MOD_NOT_FOUND)
+            api["last_error_after"] = ERROR_MOD_NOT_FOUND
+            api["error"] = ERROR_MOD_NOT_FOUND
+        else:
+            api["last_error_after"] = last_error_before
+        api["outcome"] = "success" if result else "module_not_found"
+        api["module_match"] = match
+        api["result"] = result
+
+        # GetModuleHandleA is stdcall with one pointer argument.
+        engine.reg_write(registers.UC_X86_REG_EAX, result)
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        api["esp_after"] = (esp + 8) & 0xFFFFFFFF
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
+def _round_up(value: int, granule: int) -> int:
+    return (value + granule - 1) & ~(granule - 1)
+
+
+def _heap_create(engine: Any, registers: Any, unicorn_module: Any,
+                 import_row: dict[str, Any],
+                 mapped_ranges: list[tuple[int, int]], state: dict[str, Any]) -> bool:
+    """Mirror the native bounded HeapCreate bridge and committed heap pages."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    if not _range_is_mapped(esp, 16, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 16}
+        return False
+
+    return_address = _read_u32(engine, esp)
+    flags = _read_u32(engine, esp + 4)
+    initial_size = _read_u32(engine, esp + 8)
+    maximum_size = _read_u32(engine, esp + 12)
+    if flags & ~HEAP_SUPPORTED_FLAGS:
+        # The native import bridge leaves unsupported flags at the import stop.
+        return False
+
+    last_error_address = TEB_BASE + LAST_ERROR_OFFSET
+    if not _range_is_mapped(last_error_address, 4, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = last_error_address
+        state["memory_fault"] = {
+            "access": "write", "address": last_error_address, "size": 4,
+        }
+        return False
+    last_error_before = _read_u32(engine, last_error_address)
+    rounded_maximum = _round_up(maximum_size, HEAP_GRANULE) if maximum_size else 0
+    arena_capacity = HEAP_ARENA_SIZE - HEAP_HEADER_SIZE
+    rc: str | None = None
+    capacity = arena_capacity
+
+    # guest_windows_import rounds HeapCreate's nonzero maximum before calling
+    # guest_heap_create; keep its EINVAL/ENOMEM mapping and ordering exact.
+    if rounded_maximum > 0xFFFFFFFF:
+        rc = "ENOMEM"
+    elif rounded_maximum and initial_size > rounded_maximum:
+        rc = "EINVAL"
+    elif rounded_maximum > arena_capacity:
+        rc = "ENOMEM"
+    else:
+        if rounded_maximum:
+            capacity = rounded_maximum
+        if initial_size > capacity:
+            rc = "ENOMEM"
+
+    slot = next((index for index in range(HEAP_MAX_COUNT)
+                 if index not in state["heaps"]), None)
+    if rc is None and slot is None:
+        rc = "ENOMEM"
+
+    handle = 0
+    committed_size = 0
+    if rc is None:
+        assert slot is not None
+        handle = HEAP_BASE + slot * HEAP_ARENA_SIZE
+        committed_size = _round_up(HEAP_HEADER_SIZE + initial_size, HEAP_GRANULE)
+        try:
+            engine.mem_map(handle, committed_size,
+                           unicorn_module.UC_PROT_READ | unicorn_module.UC_PROT_WRITE)
+            # Fresh native guest pages are zero-filled; model the committed
+            # granule, including the tail beyond HEADER + initial_size.
+            engine.mem_write(handle, bytes(committed_size))
+        except Exception:
+            state["status"] = "GUEST_STOP_MEMORY"
+            state["target"] = handle
+            state["memory_fault"] = {"access": "write", "address": handle,
+                                      "size": committed_size}
+            return False
+        mapped_ranges.append((handle, handle + committed_size))
+        heap = {
+            "slot": slot,
+            "handle": handle,
+            "capacity": capacity,
+            "initial_size": initial_size,
+            "maximum_size": maximum_size,
+            "rounded_maximum": rounded_maximum,
+            "flags": flags,
+            "committed_size": committed_size,
+            "live_blocks": 0,
+        }
+        state["heaps"][slot] = heap
+
+    if rc is not None:
+        error = ERROR_INVALID_PARAMETER if rc == "EINVAL" else ERROR_NOT_ENOUGH_MEMORY
+        _write_u32(engine, last_error_address, error)
+    else:
+        error = last_error_before
+
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "return_address": return_address,
+        "flags": flags,
+        "initial_size": initial_size,
+        "maximum_size": maximum_size,
+        "rounded_maximum": rounded_maximum,
+        "result": handle,
+        "last_error_before": last_error_before,
+        "last_error_after": error,
+        "outcome": "success" if rc is None else rc.lower(),
+        "esp_after": (esp + 16) & 0xFFFFFFFF,
+    }
+    if rc is None:
+        api["heap"] = {
+            "slot": slot,
+            "handle": handle,
+            "capacity": capacity,
+            "committed_size": committed_size,
+            "live_blocks": 0,
+        }
+    else:
+        api["error"] = error
+    state["api_calls"].append(api)
+
+    engine.reg_write(registers.UC_X86_REG_EAX, handle)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 16)
+    engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+    state["resume"] = True
+    return True
+
+
+def _write_u32(engine: Any, address: int, value: int) -> None:
+    engine.mem_write(address, struct.pack("<I", value & 0xFFFFFFFF))
 
 
 def _as_text(value: Any) -> str:
@@ -164,7 +494,7 @@ def _register_id(registers: Any, name: str) -> int:
 
 
 def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
-    """Run the exact PE entry only until its first bound import thunk.
+    """Run the exact PE entry until its first unimplemented import thunk.
 
     `imports` is the same ordered list passed to the native IAT binder.  Each
     row can be a mapping with `iat`/`library`/`name`, an object with those
@@ -273,6 +603,12 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         struct.pack_into("<I", image, image_offset, sentinel)
         engine.mem_write(row["iat"], struct.pack("<I", sentinel))
 
+    mapped_ranges = [
+        (image_base, image_base + image_size),
+        (TEB_BASE, TEB_BASE + TEB_SIZE),
+        (STACK_LO, STACK_HI),
+    ]
+
     md = Cs(CS_ARCH_X86, CS_MODE_32)
     md.detail = True
     state: dict[str, Any] = {
@@ -285,6 +621,10 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "trace_hash": FNV64_OFFSET,
         "direct_calls": [],
         "import": None,
+        "api_calls": [],
+        "boundary_call": None,
+        "heaps": {},
+        "resume": False,
         "memory_fault": None,
     }
 
@@ -297,12 +637,55 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
             state["target"] = address
         else:
             row = import_rows[index]
-            state["status"] = "GUEST_STOP_IMPORT"
-            state["target"] = address
-            state["import_index"] = index
-            state["import"] = dict(row)
+            api_key = (row["library"].casefold(), row["name"])
+            if api_key in SUPPORTED_IMPORTS:
+                if row["name"] == "GetVersionExA":
+                    _get_version_ex_a(engine, xr, row, mapped_ranges, state)
+                elif row["name"] == "GetModuleHandleA":
+                    _get_module_handle_a(engine, xr, row, mapped_ranges, image_base, state)
+                else:
+                    handled = _heap_create(engine, xr, uc, row, mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    # Unsupported HeapCreate flags are a deliberate import stop.
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+            else:
+                _record_unsupported_import(address, index, row, engine, xr,
+                                           mapped_ranges, state)
         engine.emu_stop()
         return True
+
+    def _record_unsupported_import(address: int, index: int, row: dict[str, Any],
+                                   uc_engine: Any, registers: Any,
+                                   ranges: list[tuple[int, int]],
+                                   current: dict[str, Any]) -> None:
+        current["status"] = "GUEST_STOP_IMPORT"
+        current["target"] = address
+        current["import_index"] = index
+        current["import"] = dict(row)
+        argument_count = BOUNDARY_ARGUMENT_COUNTS.get(row["name"])
+        if argument_count is None:
+            return
+        esp = int(uc_engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+        span = 4 * (argument_count + 1)
+        if not _range_is_mapped(esp, span, ranges):
+            current["status"] = "GUEST_STOP_MEMORY"
+            current["target"] = esp
+            current["memory_fault"] = {"access": "read", "address": esp, "size": span}
+            return
+        current["boundary_call"] = {
+            "call_ip": current["last_ip"],
+            "target": address,
+            "import_index": index,
+            "library": row["library"],
+            "name": row["name"],
+            "esp": esp,
+            "return_address": _read_u32(uc_engine, esp),
+            "arguments": [_read_u32(uc_engine, esp + 4 * i)
+                          for i in range(1, argument_count + 1)],
+        }
 
     regids = {name: _register_id(xr, name) for name in
               ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi")}
@@ -379,19 +762,38 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
 
     engine.hook_add(uc.UC_HOOK_CODE, on_code)
     engine.hook_add(uc.UC_HOOK_MEM_UNMAPPED, on_unmapped)
-    try:
-        engine.emu_start(entry, 0, count=INSTRUCTION_BUDGET + 1)
-    except Exception as exc:
-        if state["status"] is None:
-            state["status"] = "GUEST_STOP_MEMORY"
+    begin = entry
+    while state["status"] is None:
+        remaining = INSTRUCTION_BUDGET - state["instructions"] + 1
+        state["resume"] = False
+        try:
+            engine.emu_start(begin, 0, count=remaining)
+        except Exception as exc:
+            if state["status"] is None:
+                state["status"] = "GUEST_STOP_MEMORY"
+                state["target"] = int(engine.reg_read(xr.UC_X86_REG_EIP)) & 0xFFFFFFFF
+                state["emulator_error"] = f"{type(exc).__name__}: {exc}"
+            break
+        if state["status"] is not None:
+            break
+        if not state["resume"]:
+            state["status"] = "GUEST_STOP_BUDGET"
             state["target"] = int(engine.reg_read(xr.UC_X86_REG_EIP)) & 0xFFFFFFFF
-            state["emulator_error"] = f"{type(exc).__name__}: {exc}"
+            break
+        begin = int(engine.reg_read(xr.UC_X86_REG_EIP)) & 0xFFFFFFFF
 
     if state["status"] != "GUEST_STOP_IMPORT":
         raise RuntimeError(f"startup oracle stopped at {state.get('status')} target=0x{state.get('target', 0):08x}")
-    first = state["import"]
-    if first["iat"] != 0x00783168 or first["name"] != "GetVersionExA":
-        raise RuntimeError("startup oracle reached an unexpected first import")
+    boundary_import = state["import"]
+    if (not state["api_calls"] or state["api_calls"][0]["name"] != "GetVersionExA" or
+            state["api_calls"][0]["import_index"] != first_expected["index"]):
+        raise RuntimeError("startup oracle did not execute the expected GetVersionExA boundary")
+    boundary_key = (boundary_import["library"].casefold(), boundary_import["name"])
+    if boundary_key in {
+        ("kernel32.dll", "GetVersionExA"),
+        ("kernel32.dll", "GetModuleHandleA"),
+    } or (boundary_key == ("kernel32.dll", "HeapCreate") and not state["boundary_call"]):
+        raise RuntimeError("startup oracle stopped at a supported import instead of applying its contract")
 
     # The guest runner's EIP is the last instruction reported by its step hook;
     # Unicorn's architectural EIP is the tagged import target after CALL.
@@ -406,6 +808,25 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
     stack_window = bytes(engine.mem_read(stack_hash_start, stack_hash_end - stack_hash_start))
     image_state = bytes(engine.mem_read(image_base, image_size))
     teb_state = bytes(engine.mem_read(TEB_BASE, TEB_SIZE))
+    active_heaps = sorted(state["heaps"].values(), key=lambda heap: heap["slot"])
+    heap_slots = []
+    for slot in range(HEAP_MAX_COUNT):
+        heap = state["heaps"].get(slot)
+        if heap is None:
+            heap_slots.append({"slot": slot, "handle": 0, "capacity": 0,
+                               "live_blocks": 0})
+        else:
+            heap_slots.append({"slot": slot, "handle": heap["handle"],
+                               "capacity": heap["capacity"],
+                               "live_blocks": heap["live_blocks"]})
+    if active_heaps:
+        heap_hash_start = active_heaps[0]["handle"]
+        heap_hash_size = active_heaps[0]["committed_size"]
+        heap_state = bytes(engine.mem_read(heap_hash_start, heap_hash_size))
+    else:
+        heap_hash_start = 0
+        heap_hash_size = 0
+        heap_state = b""
 
     flags = {
         "cf": eflags & 0x001,
@@ -433,7 +854,7 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
     }
     result = {
         "schema_version": 1,
-        "reference": "Unicorn x86-32; authentic PE instructions through first import; no API body executed",
+        "reference": "Unicorn x86-32; authentic PE instructions with declared bounded KERNEL32 contracts",
         "executable_size": len(blob),
         "executable_sha256": digest,
         "image_base": image_base,
@@ -443,9 +864,13 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "ip": last_ip,
         "target": int(state["target"]),
         "import_index": int(state["import_index"]),
-        "import_iat": int(first["iat"]),
-        "import_library": first["library"],
-        "import_name": first["name"],
+        "import_iat": int(boundary_import["iat"]),
+        "import_library": boundary_import["library"],
+        "import_name": boundary_import["name"],
+        "api_call_count": len(state["api_calls"]),
+        "api_calls": state["api_calls"],
+        "boundary_call": state["boundary_call"],
+        "state_heaps": heap_slots,
         "instructions": int(state["instructions"]),
         "calls": int(state["calls"]),
         "maximum_depth": int(state["maximum_depth"]),
@@ -462,6 +887,9 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "stack_hash_start": stack_hash_start,
         "stack_hash_size": len(stack_window),
         "stack_hash64": _fnv1a64(stack_window),
+        "heap_hash_start": heap_hash_start,
+        "heap_hash_size": heap_hash_size,
+        "heap_hash64": _fnv1a64(heap_state),
         "stack_base": STACK_LO,
         "stack_size": STACK_SIZE,
         "stack_initial_esp": start_esp,

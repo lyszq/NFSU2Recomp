@@ -78,3 +78,24 @@ The private artifact name stays stable for repeat builds. Only IPA, provenance
 and diagnostics are retained there; entry-generated C and the EXE stay out of Git
 and public artifacts. The native runner is bounded and uses no JIT or x86
 interpreter on iOS. Unicorn remains a build-host-only reference engine.
+
+
+## Windows contract / heap probe (0.6.1)
+
+The latest private build retains all 48 real-leaf reference cases, then runs
+actual lifted entry functions with the shared Windows compatibility bridge.
+It passes version and module queries and creates a real guest heap; four API
+invocations complete before the explicit InitializeCriticalSection boundary.
+The original-x86 reference uses the same documented guest compatibility policy,
+implemented independently in Python. The expected native stop is 154 instructions,
+15 calls and depth 5, with exact trace/register/image/TEB/stack/heap comparisons.
+This validates translation under the declared guest contracts; it is not a
+comparison against a complete Windows installation or a successful game boot.
+
+Use the latest private IPA, version 0.6.1/build 9, with the same signing identity
+and bundle ID. Upgrade without deleting the existing app. One run of LOAD
+VERIFIED GAME IMAGE runs the retained real-leaf regression and new startup probe
+together. CPU/memory tests remain separately available. Earlier 0.5.1 build
+instructions above describe that historical boundary, not the latest probe.
+The current missing API is InitializeCriticalSection. Gameplay, renderer,
+audio and input remain unimplemented. Device confirmation is still pending.
