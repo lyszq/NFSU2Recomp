@@ -25,6 +25,7 @@ static int identity_import(CPU *c,const GuestImport *import,uint32_t *fault) {
     const void *stack=guest_memory_pointer(c->esp,4,0);
     if (!stack) { *fault=c->esp; return -1; }
     uint32_t ret=read32(stack);
+    if (!c->fs_base) { *fault=0; return -2; }
     uint64_t at=(uint64_t)c->fs_base+0x24u;
     const void *identity=at<=UINT32_MAX ? guest_memory_pointer((uint32_t)at,4,0) : NULL;
     if (!identity) { *fault=at>UINT32_MAX ? UINT32_MAX : (uint32_t)at; return -1; }
@@ -47,6 +48,7 @@ static int tls_import(CPU *c,const GuestImport *import,GuestWindows *windows,uin
     uint32_t value=nargs==2 ? read32(stack+8) : 0, result=0;
     /* GET clears LastError; preflight potential exhaustion reporting for all
      * calls before touching the TLS model. Success otherwise preserves it. */
+    if (!c->fs_base) { *fault=0; return -2; }
     uint64_t error_at=(uint64_t)c->fs_base+0x34u;
     void *error=error_at<=UINT32_MAX ? guest_memory_pointer((uint32_t)error_at,4,1) : NULL;
     if (!error) { *fault=error_at>UINT32_MAX ? UINT32_MAX : (uint32_t)error_at; return -1; }
@@ -69,6 +71,7 @@ static int critical_import(CPU *c, const GuestImport *import, GuestWindows *wind
     if (!stack) { *fault=c->esp; return -1; }
     uint32_t ret=read32(stack), address=read32(stack+4), thread_id=0;
     if (enter || attempt || leave) {
+        if (!c->fs_base) { *fault=0; return -2; }
         uint64_t at=(uint64_t)c->fs_base+0x24u;
         const void *tid=at<=UINT32_MAX ? guest_memory_pointer((uint32_t)at,4,0) : NULL;
         if (!tid) { *fault=at>UINT32_MAX ? UINT32_MAX : (uint32_t)at; return -1; }
@@ -105,9 +108,12 @@ static int heap_import(CPU *c, const GuestImport *import, GuestWindows *windows,
      * provide. Stop before altering state rather than silently drop flags. */
     if ((create && (a & ~1u)) || (alloc && (b & ~9u)) ||
         ((release || size) && (b & ~1u))) return 0;
-    uint64_t error_at=(uint64_t)c->fs_base+0x34u;
-    void *error=error_at<=UINT32_MAX ? guest_memory_pointer((uint32_t)error_at,4,1) : NULL;
-    if (!alloc && !size && !error) { *fault=error_at>UINT32_MAX ? UINT32_MAX : (uint32_t)error_at; return -1; }
+    if (!alloc && !size) {
+        if (!c->fs_base) { *fault=0; return -2; }
+        uint64_t error_at=(uint64_t)c->fs_base+0x34u;
+        void *error=error_at<=UINT32_MAX ? guest_memory_pointer((uint32_t)error_at,4,1) : NULL;
+        if (!error) { *fault=error_at>UINT32_MAX ? UINT32_MAX : (uint32_t)error_at; return -1; }
+    }
     int rc;
     if (create) {
         uint64_t maximum=((uint64_t)d+GUEST_MEMORY_GRANULE-1)&~(uint64_t)(GUEST_MEMORY_GRANULE-1);
@@ -177,6 +183,7 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
         if (terminated && (!address || !strcasecmp(name,"SPEED2.EXE")))
             value=((GuestWindows *)context)->image_base;
         if (!value) {
+            if (!c->fs_base) { *fault=0; return -2; }
             uint64_t at=(uint64_t)c->fs_base+0x34u;
             void *error=at<=UINT32_MAX ? guest_memory_pointer((uint32_t)at,4,1) : NULL;
             if (!error) { *fault=at>UINT32_MAX ? UINT32_MAX : (uint32_t)at; return -1; }
@@ -185,10 +192,12 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
         c->eax=value; c->eip=return_ip; c->esp+=8u;
         return 1;
     }
+    if (!address) { *fault=0; return -1; }
     const void *size_pointer = guest_memory_pointer(address, 4, 0);
     if (!size_pointer) { *fault = address; return -1; }
     uint32_t size = read32(size_pointer), value;
     if (size != 148 && size != 156) {
+        if (!c->fs_base) { *fault=0; return -2; }
         uint64_t error_address = (uint64_t)c->fs_base + 0x34u;
         void *error = error_address <= UINT32_MAX ?
             guest_memory_pointer((uint32_t)error_address, 4, 1) : NULL;

@@ -38,7 +38,7 @@ void guest_process_cleanup(GuestProcess *);
  * on uninitialized state =>-2 fault PROCESS_BASE. Snapshot readable whole frame
  * before all writes; validate returned strings remain readable (full command
  * incl NUL; A2/W4 bytes); bad memory/overflow =>-1, no CPU/count/output changes.
- * Cap error needs nonzero fs_base (-2 if0), uint64(fs)+34 writable, fault max if
+ * Cap error needs nonzero fs_base (-2 if0), uint64(fs)+0x34 writable, fault max if
  * sum overflows. Success EAXresult/EIPret/ESP+4*(argc+1), preserve all else.
  * Caller serializes calls, process leases and all VM lifecycle operations. */
 int guest_process_import(CPU *, const GuestImport *, GuestProcess *, uint32_t *fault);

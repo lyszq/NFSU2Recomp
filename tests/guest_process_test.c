@@ -377,7 +377,6 @@ static int test_env_lifecycle_and_caps(void) {
     /* 33rd get with valid TEB preflight => NULL result, LastError=8 */
     cpu.fs_base = 0x00200000u;
     write_u32(0x00200034u, 0x11223344u);
-    write_u32(0x00200000u + 34u, 0x11223344u);
     write_u32(0x00108000u, 0x00407100u);
     cpu.esp = 0x00108000u;
     before = cpu;
@@ -387,7 +386,7 @@ static int test_env_lifecycle_and_caps(void) {
     CHECK(cpu.eip == 0x00407100u);
     CHECK(cpu.esp == 0x00108004u);
     CHECK(check_preserved_regs(&before, &cpu));
-    CHECK(read_u32(0x00200034u) == 8 || read_u32(0x00200000u + 34u) == 8);
+    CHECK(read_u32(0x00200034u) == 8);
     CHECK(proc.environment_a_refs == 32);
 
     /* Normal success preserves LastError */
@@ -399,14 +398,13 @@ static int test_env_lifecycle_and_caps(void) {
     CHECK(proc.environment_a_refs == 31);
 
     write_u32(0x00200034u, 0x55667788u);
-    write_u32(0x00200000u + 34u, 0x55667788u);
     write_u32(0x00108000u, 0x00407300u);
     cpu.esp = 0x00108000u;
     rc = guest_process_import(&cpu, &imp_get_a, &proc, &fault);
     CHECK(rc == 1);
     CHECK(cpu.eax == GUEST_PROCESS_ENV_A);
     CHECK(proc.environment_a_refs == 32);
-    CHECK(read_u32(0x00200034u) == 0x55667788u || read_u32(0x00200000u + 34u) == 0x55667788u);
+    CHECK(read_u32(0x00200034u) == 0x55667788u);
 
     /* Independent 32 lease cap on W */
     for (uint32_t i = 0; i < GUEST_PROCESS_ENV_LEASES; i++) {
@@ -421,13 +419,12 @@ static int test_env_lifecycle_and_caps(void) {
 
     /* Cap error on W with valid TEB */
     write_u32(0x00200034u, 0);
-    write_u32(0x00200000u + 34u, 0);
     write_u32(0x00108000u, 0x00408100u);
     cpu.esp = 0x00108000u;
     rc = guest_process_import(&cpu, &imp_get_w, &proc, &fault);
     CHECK(rc == 1);
     CHECK(cpu.eax == 0);
-    CHECK(read_u32(0x00200034u) == 8 || read_u32(0x00200000u + 34u) == 8);
+    CHECK(read_u32(0x00200034u) == 8);
     CHECK(proc.environment_w_refs == 32);
 
     /* Free all 32 leases on both */
@@ -565,7 +562,7 @@ static int test_bad_frames_and_overflow_teb(void) {
     fault = 0;
     rc = guest_process_import(&cpu, &imp_get_a, &proc, &fault);
     CHECK(rc == -1);
-    CHECK(fault == 0x30000034u || fault == (0x30000000u + 34u));
+    CHECK(fault == 0x30000034u);
     CHECK(memcmp(&cpu, &before, sizeof(CPU)) == 0);
     CHECK(proc.environment_a_refs == 32);
 
