@@ -87,20 +87,16 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         memory_hash(g_mem + @PROCESS_WINDOW_ADDRESS@, @PROCESS_WINDOW_SIZE@) != UINT64_C(@EXPECTED_PROCESS_HASH@)) {
         rc = EINVAL;
         (void)snprintf(out, capacity,
-            "FAIL | entry mismatch | stop=%d(exp %d) ip=%08x(exp %08x) target=%08x(exp %08x) "
-            "steps=%" PRIu64 "(exp %" PRIu64 ") calls=%" PRIu64 "(exp %" PRIu64 ") apis=%" PRIu64 "(exp %" PRIu64 ") "
-            "gpr=%d flags=%d img=%d teb=%d stak=%d heap=%d proc=%d trace=%016" PRIx64 "(exp %016" PRIx64 ")",
-            result.stop, GUEST_STOP_IMPORT, result.ip, @EXPECTED_IP@, result.target, @EXPECTED_TARGET@,
+            "FAIL | entry mismatch | steps=%" PRIu64 "(exp %" PRIu64 ") calls=%" PRIu64 "(exp %" PRIu64 ") "
+            "trace=%016" PRIx64 "(exp %016" PRIx64 ") "
+            "r=[%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x] "
+            "img=%016" PRIx64 " stak=%016" PRIx64 " heap=%016" PRIx64,
             result.instructions, (uint64_t)@EXPECTED_STEPS@, result.calls, (uint64_t)@EXPECTED_CALLS@,
-            result.imports_handled, (uint64_t)@EXPECTED_APIS@,
-            !memcmp(c->r, expected_registers, sizeof c->r),
-            (eflags_get(c) & 0xcd5u) == @EXPECTED_FLAGS@,
-            memory_hash(g_mem + image->image_base, image->image_size) == UINT64_C(@EXPECTED_IMAGE_HASH@),
-            memory_hash(g_mem + GUEST_TEB_BASE, 0x20000u) == UINT64_C(@EXPECTED_TEB_HASH@),
-            memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) == UINT64_C(@EXPECTED_STACK_HASH@),
-            memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@) == UINT64_C(@EXPECTED_HEAP_HASH@),
-            memory_hash(g_mem + @PROCESS_WINDOW_ADDRESS@, @PROCESS_WINDOW_SIZE@) == UINT64_C(@EXPECTED_PROCESS_HASH@),
-            result.trace_hash, UINT64_C(@EXPECTED_TRACE@));
+            result.trace_hash, UINT64_C(@EXPECTED_TRACE@),
+            c->r[0], c->r[1], c->r[2], c->r[3], c->r[4], c->r[5], c->r[6], c->r[7],
+            memory_hash(g_mem + image->image_base, image->image_size),
+            memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@),
+            memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@));
         goto cleanup;
     }
     const GuestImport *import = &nfs_startup_imports[result.import_index];

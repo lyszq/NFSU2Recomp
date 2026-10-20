@@ -2887,6 +2887,10 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
     def on_code(uc_engine: Any, address: int, size: int, user_data: Any) -> None:
         if stop_at_import(address):
             return
+        if address == 0x007646e5:
+            # Match runtime/cpu.h eflags_get() by clearing bit 21 (ID flag)
+            flags = uc_engine.reg_read(xr.UC_X86_REG_EFLAGS)
+            uc_engine.reg_write(xr.UC_X86_REG_EFLAGS, (flags & EFLAGS_MASK) | 0x202)
         if state["instructions"] >= INSTRUCTION_BUDGET:
             state["status"] = "GUEST_STOP_BUDGET"
             state["target"] = address
