@@ -4,15 +4,66 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  SOURCE_SHA: SOURCE_COMMIT_PLACEHOLDER
 jobs:
+  native-reference-linux:
+    if: github.event.repository.private == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Require private repository and pinned public source
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git clone --filter=blob:none --no-checkout https://github.com/lyszq/NFSU2Recomp.git "$RUNNER_TEMP/source"
+          cd "$RUNNER_TEMP/source"
+          git fetch --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Native and independent contract tests
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/private-python"
+          "$RUNNER_TEMP/private-python/bin/pip" install -r tools/ios_private/requirements.txt
+          "$RUNNER_TEMP/private-python/bin/python" -m unittest discover -s tools/ios_private -p test_oracle_contracts.py
+          bash tests/run_guest_tests.sh "$RUNNER_TEMP/guest-tests"
+
+      - name: Generate and verify actual lifted entry privately on Linux
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          gh release download private-input-v1 --repo "$GH_REPO" --pattern SPEED2.EXE --dir "$RUNNER_TEMP/private-input"
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/generate_probe.py --exe "$RUNNER_TEMP/private-input/SPEED2.EXE"
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/generate_startup.py --exe "$RUNNER_TEMP/private-input/SPEED2.EXE"
+          bash tools/ios_private/run_native_probe.sh "$RUNNER_TEMP/native-probe" "$RUNNER_TEMP/private-input/SPEED2.EXE" | tee "$RUNNER_TEMP/private-linux-evidence.txt"
+
+      - name: Upload private Linux diagnostics only
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSU2-private-linux-evidence
+          path: ${{ runner.temp }}/private-linux-evidence.txt
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Remove confidential Linux runner inputs and generated C
+        if: always()
+        working-directory: ${{ runner.temp }}
+        run: |
+          rm -f "$RUNNER_TEMP/private-input/SPEED2.EXE"
+          rm -f "$RUNNER_TEMP/source/gen/ios-private/lifted.c" "$RUNNER_TEMP/source/gen/ios-private/private_probe.c" "$RUNNER_TEMP/source/gen/ios-private/startup_lifted.c" "$RUNNER_TEMP/source/gen/ios-private/startup_probe.c"
+
   private-ios:
     if: github.event.repository.private == true
+    needs: native-reference-linux
     runs-on: macos-15
     timeout-minutes: 40
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      SOURCE_SHA: SOURCE_COMMIT_PLACEHOLDER
     steps:
       - name: Require private repository and pinned public source
         run: |
@@ -48,14 +99,7 @@ jobs:
         working-directory: ${{ runner.temp }}/source
         run: |
           set -euo pipefail
-          clang -O2 -std=gnu11 -Wall -Wextra -Werror -Wno-unused-label \
-            -fno-strict-aliasing -pthread -DNFS_PRIVATE_PROBE=1 -DNFS_PRIVATE_STARTUP=1 -Iruntime \
-            runtime/guest_memory.c runtime/guest_pe.c runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_bootstrap.c runtime/guest_windows.c runtime/guest_heap.c runtime/guest_critical.c \
-            ios/NFSU2iOS/Native/GuestImageProbe.c tests/guest_image_cli.c \
-            gen/ios-private/lifted.c gen/ios-private/private_probe.c gen/ios-private/startup_lifted.c gen/ios-private/startup_probe.c \
-            -o "$RUNNER_TEMP/private-lifted-test"
-          clang -std=gnu11 -fsyntax-only -Iruntime -Igen/ios-private tests/boot.c
-          "$RUNNER_TEMP/private-lifted-test" "$RUNNER_TEMP/private-input/SPEED2.EXE" | tee "$RUNNER_TEMP/private-evidence.txt"
+          bash tools/ios_private/run_native_probe.sh "$RUNNER_TEMP/native-probe" "$RUNNER_TEMP/private-input/SPEED2.EXE" | tee "$RUNNER_TEMP/private-evidence.txt"
 
       - name: Build native ARM64 private IPA
         working-directory: ${{ runner.temp }}/source
