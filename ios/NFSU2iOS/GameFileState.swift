@@ -79,7 +79,7 @@ final class GameFileState: ObservableObject {
             .joined()
         if digest == Self.expectedSHA256 {
             isVerified = true
-            message = "Previously verified SPEED2.EXE is still saved locally. Runtime integration is pending."
+            message = "Previously verified SPEED2.EXE is still saved locally. Ready for native image diagnostics; full game boot is pending."
         }
     }
 
@@ -113,7 +113,7 @@ final class GameFileState: ObservableObject {
             // Save an app-local copy for future game-runtime integration.
             try data.write(to: destination, options: .atomic)
             isVerified = true
-            message = "Supported executable verified and saved locally. Runtime integration is still pending."
+            message = "Supported executable verified and saved locally. Ready for native image diagnostics; full game boot is pending."
         } catch {
             message = "Could not read or save executable: \(error.localizedDescription)"
         }

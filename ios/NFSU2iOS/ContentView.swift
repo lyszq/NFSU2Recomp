@@ -137,7 +137,7 @@ struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
 
-                    Text("Select your locally owned SPEED2.EXE. The file is verified and saved for a later stage; it is not executed.")
+                    Text("Select your locally owned SPEED2.EXE. Its saved copy is authenticated before every native image probe.")
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(0.7))
 
@@ -168,7 +168,7 @@ struct ContentView: View {
 
                     imageProbePanel
 
-                    Text("NEXT: Generate lifted C from your own EXE privately, port the guest boot process, then connect the macOS D3D9-to-Metal implementation to iOS. This IPA includes the shared memory core, but no lifted game code or game assets.")
+                    Text("This app provides native runtime diagnostics. Full game boot, game rendering, audio and input integration are still pending.")
                         .font(.footnote)
                         .foregroundStyle(.white.opacity(0.6))
                 }
