@@ -96,7 +96,7 @@ static int startup_and_stdio_contract(void) {
     CHECK(guest_windows_import(&c,&api,&windows,&fault)==1);
     expected.eax=0; expected.eip=0x401005; expected.esp+=8;
     CHECK(!memcmp(&c,&expected,sizeof c) && get(TEB+0x34)==6);
-    api.name="GetLastError"; c=setup(0); eflags_set(&c,0xcd5u); expected=c;
+    api.name="GetLastError"; c=setup(0); put(TEB+0x34,6); eflags_set(&c,0xcd5u); expected=c;
     CHECK(guest_windows_import(&c,&api,&windows,&fault)==1);
     expected.eax=6; expected.eip=0x401005; expected.esp+=4;
     CHECK(!memcmp(&c,&expected,sizeof c));
