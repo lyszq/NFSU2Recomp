@@ -40,7 +40,8 @@ enum TestMode {
     MODE_API_COUNT,
     MODE_BLOCK_COUNT,
     MODE_DEPTH,
-    MODE_TARGET
+    MODE_TARGET,
+    MODE_USER_OBJECTS
 };
 
 static enum TestMode mode;
@@ -52,7 +53,7 @@ static int mode_from_arg(const char *name, enum TestMode *out) {
         {"process", MODE_PROCESS}, {"step_count", MODE_STEP_COUNT},
         {"call_count", MODE_CALL_COUNT}, {"api_count", MODE_API_COUNT},
         {"block_count", MODE_BLOCK_COUNT}, {"depth", MODE_DEPTH},
-        {"target", MODE_TARGET}
+        {"target", MODE_TARGET}, {"user_objects", MODE_USER_OBJECTS}
     };
     for (size_t i = 0; i < sizeof modes / sizeof modes[0]; ++i) {
         if (strcmp(name, modes[i].name) == 0) {
@@ -144,6 +145,15 @@ int guest_windows_import(CPU *cpu, const GuestImport *import, void *context,
     if (!cpu || !import || !import->name || !context || !fault) return 0;
     GuestWindows *windows = context;
     if (strcmp(import->name, "HeapCreate") == 0) {
+        /* A typed virtual descriptor fixture; corruption changes no guest bytes,
+         * counts or registers, so only the exact object-metadata check catches it. */
+        windows->user_objects.count = 1;
+        windows->user_objects.entries[0] = (GuestUserObject){
+            .handle=0x00b10001u,
+            .type=mode == MODE_USER_OBJECTS ? GUEST_USER_OBJECT_ICON : GUEST_USER_OBJECT_CURSOR,
+            .source=GUEST_USER_OBJECT_SOURCE_SYSTEM_SHARED,
+            .module=0, .resource_id=32512u, .shared=1u
+        };
         const uint8_t *frame = guest_memory_pointer(cpu->esp, 16u, 0);
         if (!frame) { *fault = cpu->esp; return -1; }
         uint32_t result = 0;

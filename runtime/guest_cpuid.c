@@ -20,7 +20,9 @@ int guest_cpuid(CPU *cpu) {
         return 1;
 
     case 0x80000000u:
-        /* Match the legacy guest profile's all-zero extended-leaf response. */
+    case 0x80000001u:
+        /* Match the legacy guest profile's all-zero extended-leaf responses;
+         * leaf 0x80000001 advertises no AMD extended features. */
         cpu->eax = 0u;
         cpu->ebx = 0u;
         cpu->ecx = 0u;

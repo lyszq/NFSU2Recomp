@@ -28,7 +28,7 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     CPU context;
     CPU *c = &context;
     GuestExecutionResult result = {0};
-    GuestWindows windows={.image_base=image->image_base};
+    GuestWindows windows={.image_base=image->image_base, .resource_image=*image};
     int cursor_fixture_started = 0;
     int rc = guest_execution_bind_imports(image, nfs_startup_imports, nfs_startup_import_count);
     if (rc) goto failed;
@@ -63,6 +63,16 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     const uint32_t expected_blocks[][5]={@EXPECTED_BLOCKS@};
     unsigned heap_count=0, block_count=0;
     int metadata_match=1;
+    const uint32_t expected_user_objects[GUEST_USER_OBJECT_LIMIT][6] = {@EXPECTED_USER_OBJECTS@};
+    if (windows.user_objects.count != @EXPECTED_USER_OBJECT_COUNT@) metadata_match=0;
+    for (unsigned i=0; i<GUEST_USER_OBJECT_LIMIT; ++i) {
+        const GuestUserObject *obj=&windows.user_objects.entries[i];
+        const uint32_t actual[]={obj->handle,(uint32_t)obj->type,(uint32_t)obj->source,
+                                 obj->module,obj->resource_id,obj->shared};
+        if (memcmp(actual,expected_user_objects[i],sizeof actual)) metadata_match=0;
+        if (obj->handle && guest_user_objects_lookup(&windows.user_objects, obj->handle,
+                (GuestUserObjectType)expected_user_objects[i][1]) != obj) metadata_match=0;
+    }
     for (unsigned h=0;h<GUEST_HEAP_MAX_HEAPS;h++) {
         const GuestHeap *heap=&windows.heaps.heaps[h];
         heap_count+=heap->handle!=0;

@@ -63,12 +63,13 @@ static int test_known_leaves(void) {
     CHECK(check_leaf(0u, 1u, 0x756e6547u, 0x6c65746eu, 0x49656e69u) == 0);
     CHECK(check_leaf(1u, 0x000006d8u, 0u, 0u, 0x0383fbffu) == 0);
     CHECK(check_leaf(0x80000000u, 0u, 0u, 0u, 0u) == 0);
+    CHECK(check_leaf(0x80000001u, 0u, 0u, 0u, 0u) == 0);
     return 0;
 }
 
 static int test_unknown_leaves_and_null(void) {
     static const uint32_t unknown[] = {
-        2u, 0x80000001u, 0xffffffffu
+        2u, 0x80000002u, 0xffffffffu
     };
     CPU cpu, before;
 

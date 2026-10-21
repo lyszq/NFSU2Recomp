@@ -25,6 +25,8 @@ targets:
       - path: ../runtime/guest_execution.c
       - path: ../runtime/guest_bootstrap.c
       - path: ../runtime/guest_windows.c
+      - path: ../runtime/guest_resources.c
+      - path: ../runtime/guest_user_objects.c
       - path: ../runtime/guest_registry.c
       - path: ../runtime/guest_cursor.c
       - path: ../runtime/guest_cpuid.c
@@ -67,8 +69,8 @@ targets:
       path: NFSU2iOS/Info.plist
       properties:
         CFBundleDisplayName: NFSU2 iOS
-        CFBundleShortVersionString: '0.16.0'
-        CFBundleVersion: '23'
+        CFBundleShortVersionString: '0.17.0'
+        CFBundleVersion: '24'
         LSRequiresIPhoneOS: true
         UIRequiresFullScreen: true
         UIFileSharingEnabled: true

@@ -48,14 +48,28 @@ RETURN_REGISTERS = (
 LEAF_ZERO = (0x00000001, 0x756E6547, 0x6C65746E, 0x49656E69)
 LEAF_ONE = (0x000006D8, 0x00000000, 0x00000000, 0x0383FBFF)
 LEAF_EXTENDED_MAX = (0, 0, 0, 0)
+LEAF_EXTENDED_FEATURES = (0, 0, 0, 0)
+NONRESULT_FP_REGISTERS = (
+    x86_const.UC_X86_REG_XMM0,
+    x86_const.UC_X86_REG_XMM3,
+    x86_const.UC_X86_REG_FPCW,
+    x86_const.UC_X86_REG_FPSW,
+)
+FP_SENTINELS = {
+    x86_const.UC_X86_REG_XMM0: 0x112233445566778899AABBCCDDEEFF00,
+    x86_const.UC_X86_REG_XMM3: 0xAABBCCDDEEFF00112233445566778899,
+    x86_const.UC_X86_REG_FPCW: 0x027F,
+    x86_const.UC_X86_REG_FPSW: 0x1200,
+}
 
 
 class CpuidOracleTests(unittest.TestCase):
-    def test_only_three_declared_leaves_have_values(self) -> None:
+    def test_only_four_declared_leaves_have_values(self) -> None:
         self.assertEqual(cpuid_values(0), LEAF_ZERO)
         self.assertEqual(cpuid_values(1), LEAF_ONE)
         self.assertEqual(cpuid_values(0x80000000), LEAF_EXTENDED_MAX)
-        for unsupported in (2, 0x80000001, 0xFFFFFFFF):
+        self.assertEqual(cpuid_values(0x80000001), LEAF_EXTENDED_FEATURES)
+        for unsupported in (2, 0x80000002, 0xFFFFFFFF):
             with self.subTest(leaf=unsupported):
                 self.assertIsNone(cpuid_values(unsupported))
 
@@ -67,6 +81,21 @@ class CpuidOracleTests(unittest.TestCase):
         self.assertEqual(edx & (1 << 25), 1 << 25)  # SSE / feature 6.
         self.assertEqual(edx & (1 << 26), 0)  # SSE2 / feature 10.
 
+    def test_extended_feature_leaf_advertises_no_amd_extensions(self) -> None:
+        values = cpuid_values(0x80000001)
+        self.assertEqual(values, (0, 0, 0, 0))
+        assert values is not None
+        eax, ebx, ecx, edx = values
+        self.assertEqual((eax, ebx), (0, 0))
+        self.assertEqual(ecx, 0)
+        self.assertEqual(edx, 0)
+        # In particular, do not advertise SVM/ABM/SSE4a, NX, long mode,
+        # RDTSCP, or either of the two AMD 3DNow feature bits.
+        for bit in (0, 2, 5, 6, 8, 11, 16, 21):
+            self.assertEqual(ecx & (1 << bit), 0)
+        for bit in (11, 20, 27, 29, 30, 31):
+            self.assertEqual(edx & (1 << bit), 0)
+
     def make_engine(self, code: bytes, leaf: int) -> tuple[unicorn.Uc,
                                                             dict[str, object]]:
         engine = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
@@ -77,6 +106,8 @@ class CpuidOracleTests(unittest.TestCase):
         engine.reg_write(x86_const.UC_X86_REG_EFLAGS, FLAGS_SENTINEL)
         for register, value in OTHER_SENTINELS.items():
             engine.reg_write(register, value)
+        for register, value in FP_SENTINELS.items():
+            engine.reg_write(register, value)
         state: dict[str, object] = {
             "status": None,
             "target": None,
@@ -85,7 +116,7 @@ class CpuidOracleTests(unittest.TestCase):
 
     def snapshot(self, engine: unicorn.Uc) -> dict[int, int]:
         return {register: engine.reg_read(register)
-                for register in RETURN_REGISTERS}
+                for register in RETURN_REGISTERS + NONRESULT_FP_REGISTERS}
 
     def test_code_hook_emulates_cpuid_and_executes_following_instructions(self) -> None:
         # CPUID; mov esi, 0xDEADBEEF; mov edi, 0x12345678.
@@ -114,6 +145,8 @@ class CpuidOracleTests(unittest.TestCase):
                          OTHER_SENTINELS[x86_const.UC_X86_REG_EBP])
         self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_EFLAGS),
                          FLAGS_SENTINEL)
+        for register, value in FP_SENTINELS.items():
+            self.assertEqual(engine.reg_read(register), value)
         self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_EIP),
                          CODE_BASE + len(code))
         self.assertIsNone(state["status"])
@@ -121,7 +154,8 @@ class CpuidOracleTests(unittest.TestCase):
     def test_each_supported_leaf_is_emulated_by_code_hook(self) -> None:
         for leaf, expected in (
                 (0, LEAF_ZERO), (1, LEAF_ONE),
-                (0x80000000, LEAF_EXTENDED_MAX)):
+                (0x80000000, LEAF_EXTENDED_MAX),
+                (0x80000001, LEAF_EXTENDED_FEATURES)):
             with self.subTest(leaf=leaf):
                 code = b"\x0f\xa2\x90"
                 engine, state = self.make_engine(code, leaf=leaf)
@@ -148,31 +182,76 @@ class CpuidOracleTests(unittest.TestCase):
                                  CODE_BASE + len(code))
                 self.assertIsNone(state["status"])
 
-    def test_unknown_leaf_stops_in_hook_without_changing_registers(self) -> None:
-        code = b"\x0f\xa2\xbf\x78\x56\x34\x12"
-        unknown_leaf = 0x80000001
-        engine, state = self.make_engine(code, leaf=unknown_leaf)
-        state["status"] = None
-        registers_before = self.snapshot(engine)
-        results: list[bool] = []
+    def test_extended_leaf_hook_skips_cpuid_and_preserves_nonresult_state(self) -> None:
+        # CPUID; mov esi, 0xDEADBEEF. The instruction after CPUID must run.
+        code = b"\x0f\xa2\xbe\xef\xbe\xad\xde"
+        engine, state = self.make_engine(code, leaf=0x80000001)
+        handled: list[bool] = []
 
-        def on_code(uc: unicorn.Uc, address: int, size: int, _user_data: object) -> None:
+        def on_code(uc: unicorn.Uc, address: int, size: int,
+                    _user_data: object) -> None:
             if bytes(uc.mem_read(address, 2)) == b"\x0f\xa2":
-                results.append(apply_cpuid(uc, x86_const, address, size, state))
+                handled.append(apply_cpuid(uc, x86_const, address, size, state))
 
         engine.hook_add(unicorn.UC_HOOK_CODE, on_code)
         engine.emu_start(CODE_BASE, CODE_BASE + len(code))
 
-        self.assertEqual(results, [False])
-        self.assertEqual(self.snapshot(engine), registers_before)
-        self.assertEqual(state["status"], "GUEST_STOP_INSTRUCTION")
-        self.assertEqual(state["target"], CODE_BASE)
-        self.assertEqual(state["instruction_fault"], {
+        self.assertEqual(handled, [True])
+        self.assertEqual(tuple(engine.reg_read(register) for register in (
+            x86_const.UC_X86_REG_EAX,
+            x86_const.UC_X86_REG_EBX,
+            x86_const.UC_X86_REG_ECX,
+            x86_const.UC_X86_REG_EDX,
+        )), LEAF_EXTENDED_FEATURES)
+        self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_ESI), 0xDEADBEEF)
+        self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_EDI),
+                         OTHER_SENTINELS[x86_const.UC_X86_REG_EDI])
+        self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_ESP),
+                         OTHER_SENTINELS[x86_const.UC_X86_REG_ESP])
+        self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_EBP),
+                         OTHER_SENTINELS[x86_const.UC_X86_REG_EBP])
+        self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_EFLAGS),
+                         FLAGS_SENTINEL)
+        for register, value in FP_SENTINELS.items():
+            self.assertEqual(engine.reg_read(register), value)
+        self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         CODE_BASE + len(code))
+        self.assertEqual(state["cpuid_calls"], [{
             "address": CODE_BASE,
-            "instruction": "CPUID",
-            "leaf": unknown_leaf,
-            "reason": "unsupported_cpuid_leaf",
-        })
+            "leaf": 0x80000001,
+            "eax": 0,
+            "ebx": 0,
+            "ecx": 0,
+            "edx": 0,
+        }])
+
+    def test_unknown_leaf_stops_in_hook_without_changing_registers(self) -> None:
+        code = b"\x0f\xa2\xbf\x78\x56\x34\x12"
+        for unknown_leaf in (0x80000002, 0xFFFFFFFF):
+            with self.subTest(leaf=unknown_leaf):
+                engine, state = self.make_engine(code, leaf=unknown_leaf)
+                registers_before = self.snapshot(engine)
+                results: list[bool] = []
+
+                def on_code(uc: unicorn.Uc, address: int, size: int,
+                            _user_data: object) -> None:
+                    if bytes(uc.mem_read(address, 2)) == b"\x0f\xa2":
+                        results.append(apply_cpuid(
+                            uc, x86_const, address, size, state))
+
+                engine.hook_add(unicorn.UC_HOOK_CODE, on_code)
+                engine.emu_start(CODE_BASE, CODE_BASE + len(code))
+
+                self.assertEqual(results, [False])
+                self.assertEqual(self.snapshot(engine), registers_before)
+                self.assertEqual(state["status"], "GUEST_STOP_INSTRUCTION")
+                self.assertEqual(state["target"], CODE_BASE)
+                self.assertEqual(state["instruction_fault"], {
+                    "address": CODE_BASE,
+                    "instruction": "CPUID",
+                    "leaf": unknown_leaf,
+                    "reason": "unsupported_cpuid_leaf",
+                })
 
     def test_unknown_basic_leaf_also_stops_without_generic_zero_results(self) -> None:
         code = b"\x0f\xa2\x90"

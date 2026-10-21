@@ -6,6 +6,7 @@
 #include "guest_tls.h"
 #include "guest_process.h"
 #include "guest_locale.h"
+#include "guest_user_objects.h"
 /* Explicit guest Windows XP compatibility policy, independent of the host OS.
  * Only implemented contracts are serviced. No unknown API success fallback.
  * Caller supplies the bootstrap TEB and serializes the guest thread/heap state.
@@ -14,6 +15,8 @@
  * paths are not resolved without a guest filesystem/module loader. */
 typedef struct GuestWindows {
     uint32_t image_base;
+    GuestPEImage resource_image;
+    GuestUserObjects user_objects;
     GuestHeapSet heaps;
     GuestCriticalSet critical;
     GuestTLSSet tls;

@@ -10,8 +10,11 @@ _CPUID_VALUES: dict[int, tuple[int, int, int, int]] = {
     # leaf and the advertised maximum basic leaf.
     0x00000000: (0x00000001, 0x756E6547, 0x6C65746E, 0x49656E69),
     0x00000001: (0x000006D8, 0x00000000, 0x00000000, 0x0383FBFF),
-    # No AMD extended feature leaves are claimed by this profile.
+    # The static upstream profile advertises no extended feature bits. The
+    # observed query is modeled explicitly as zero rather than delegated to
+    # Unicorn's host-dependent CPUID implementation.
     0x80000000: (0, 0, 0, 0),
+    0x80000001: (0, 0, 0, 0),
 }
 
 

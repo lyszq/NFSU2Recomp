@@ -7,6 +7,7 @@
 #include "guest_locale.h"
 #include "guest_registry.h"
 #include "guest_cursor.h"
+#include "guest_resources.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -796,7 +797,12 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
     if (!strcasecmp(import->library, "ADVAPI32.dll"))
         return guest_registry_import(c, import, fault);
     if (!strcasecmp(import->library, "USER32.dll")) {
-        int handled = window_query_import(c, import, fault);
+        GuestWindows *windows = context;
+        int handled = windows ? guest_resources_import(c, import, &windows->resource_image, fault) : 0;
+        if (handled) return handled;
+        handled = windows ? guest_user_objects_import(c, import, &windows->user_objects, fault) : 0;
+        if (handled) return handled;
+        handled = window_query_import(c, import, fault);
         if (handled) return handled;
         handled = guest_user32_get_system_metrics(c, import, fault);
         if (handled) return handled;
@@ -910,6 +916,7 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
 int guest_windows_cleanup(GuestWindows *windows) {
     if (!windows) return EINVAL;
     windows->unhandled_exception_filter = 0;
+    guest_user_objects_cleanup(&windows->user_objects);
     guest_process_cleanup(&windows->process);
     int rc=guest_critical_cleanup(&windows->critical);
     if (!rc) guest_tls_cleanup(&windows->tls);

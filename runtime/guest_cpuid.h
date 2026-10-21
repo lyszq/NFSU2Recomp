@@ -15,8 +15,9 @@ extern "C" {
 
 /*
  * Profile: upstream_static_x86_006d8.
- * Handles basic leaves 0 and 1, plus the extended-leaf maximum query
- * 0x80000000 (which returns four zero registers, matching the legacy profile).
+ * Handles basic leaves 0 and 1, plus extended leaves 0x80000000 and
+ * 0x80000001. Both extended leaves return four zero registers, matching the
+ * legacy profile; no extended features are advertised.
  * Returns 1 when handled,
  * 0 when the CPU pointer or requested leaf is unsupported. Unsupported
  * leaves leave the entire CPU state unchanged.

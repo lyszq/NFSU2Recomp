@@ -108,6 +108,8 @@ def substitutions() -> dict[str, str]:
         "EXPECTED_BLOCKS": f"{{0u,0u,{HEAP_BLOCK}u,16u,16u}}",
         "EXPECTED_CALLS": "4u",
         "EXPECTED_DEPTH": "1u",
+        "EXPECTED_USER_OBJECT_COUNT": "1u",
+        "EXPECTED_USER_OBJECTS": "{0x00b10001u,2u,2u,0u,32512u,1u}," + ",".join("{0u,0u,0u,0u,0u,0u}" for _ in range(7)),
         "EXPECTED_TRACE": str(trace_hash([STEP_A, STEP_B, STEP_C])),
         "HEAP_WINDOW_ADDRESS": f"0x{HEAP_BLOCK:08x}u",
         "HEAP_WINDOW_SIZE": "16u",
@@ -149,6 +151,7 @@ def compile_case(directory: Path, name: str, base: dict[str, str],
         str(ROOT / "runtime/guest_process.c"),
         str(ROOT / "runtime/guest_heap.c"),
         str(ROOT / "runtime/guest_cursor.c"),
+        str(ROOT / "runtime/guest_user_objects.c"),
         "-lm",
         "-o", str(executable),
     ]
@@ -202,7 +205,7 @@ def main() -> int:
         rejected = [
             ("trace", "baseline"), ("image", "baseline"), ("teb", "baseline"),
             ("stack", "baseline"), ("heap", "baseline"), ("process", "baseline"),
-            ("target", "baseline"), ("step_count", "steps_only"),
+            ("target", "baseline"), ("user_objects", "baseline"), ("step_count", "steps_only"),
             ("call_count", "calls_only"), ("api_count", "apis_only"),
             ("block_count", "heap_blocks_only"), ("depth", "depth_only"),
         ]

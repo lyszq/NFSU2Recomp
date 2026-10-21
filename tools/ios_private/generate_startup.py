@@ -71,9 +71,9 @@ def generate(exe):
                for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
     reference = run_startup_reference(exe, imports, diagnostic_directory=ROOT / "gen/ios-private")
     # Registry, CPU capability, cursor and window contracts advance
-    # the explicit fixture prefix to its LoadIconA resource query. Native comparisons stay exact.
-    if (reference["import_name"] != "LoadIconA" or reference["raw_instructions"] != 206298
-            or reference["calls"] != 9511 or reference["api_call_count"] != 745
+    # the explicit fixture prefix to its CreateToolhelp32Snapshot query. Native comparisons stay exact.
+    if (reference["import_name"] != "CreateToolhelp32Snapshot" or reference["raw_instructions"] != 217254
+            or reference["calls"] != 10482 or reference["api_call_count"] != 865
             or reference["critical_section_count"] != 14
             or reference["tls_slot_count"] != 1 or reference["tls_thread_count"] != 1):
         raise ValueError(f"unexpected independent x86 entry boundary: {reference['import_name']} {reference['instructions']}")
@@ -85,7 +85,7 @@ def generate(exe):
     seen = set()
     bodies, omitted = {}, []
     lifter = StartupLifter(str(exe), comments=False, trap=False)
-    while queue and len(bodies) < 800:
+    while queue and len(bodies) < 1200:
         address = queue.popleft()
         if address in seen or address == LEAF:
             continue
@@ -134,7 +134,16 @@ def generate(exe):
     content += f"const uint32_t nfs_startup_import_count = {len(imports)}u;\n"
     (output / "startup_lifted.c").write_text(content, encoding="utf-8", newline="\n")
     harness = (ROOT / "tools/ios_private/startup_probe.c.in").read_text(encoding="utf-8")
-    substitutions = {"EXPECTED_GPRS": ",".join(f"0x{x:08x}u" for x in reference["cpu"]["r"]),
+    user_objects = [[0] * 6 for _ in range(8)]
+    for handle, obj in reference["user_objects"].items():
+        slot = int(handle) - 0x00b10001
+        if not 0 <= slot < 8 or obj != {"handle": int(handle), "kind": "CURSOR", "origin": "SYSTEM_SHARED",
+                "system_id": 32512, "module": 0, "shared": True}:
+            raise ValueError("unexpected USER32 object profile")
+        user_objects[slot] = [int(handle), 2, 2, 0, 32512, 1]
+    substitutions = {"EXPECTED_USER_OBJECT_COUNT": str(len(reference["user_objects"])),
+                     "EXPECTED_USER_OBJECTS": ",".join("{"+",".join(str(x)+"u" for x in row)+"}" for row in user_objects),
+                     "EXPECTED_GPRS": ",".join(f"0x{x:08x}u" for x in reference["cpu"]["r"]),
                      "EXPECTED_FLAGS": f"0x{reference['cpu']['eflags_masked']:x}u",
                      "EXPECTED_TARGET": f"0x{reference['target']:08x}u",
                      "EXPECTED_IP": f"0x{reference['ip']:08x}u",

@@ -97,6 +97,9 @@ BOUNDARY_ARGUMENT_COUNTS = {
     "GetSystemMetrics": 1,
     "LoadIconA": 2,
     "LoadCursorA": 2,
+    "RegisterClassA": 1,
+    "CreateWindowExA": 12,
+    "CreateToolhelp32Snapshot": 2,
     "GetStartupInfoA": 1,
     "GetStdHandle": 1,
     "GetFileType": 1,
@@ -152,6 +155,8 @@ SUPPORTED_IMPORTS = {
     ("user32.dll", "GetClientRect"),
     ("user32.dll", "GetCursorPos"),
     ("user32.dll", "GetSystemMetrics"),
+    ("user32.dll", "LoadIconA"),
+    ("user32.dll", "LoadCursorA"),
     ("kernel32.dll", "GetVersionExA"),
     ("kernel32.dll", "GetModuleHandleA"),
     ("kernel32.dll", "GetStartupInfoA"),
@@ -3148,6 +3153,10 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
 
     image = _loader_image(pe, blob)
     image_size = len(image)
+    # Independent original-file resource inventory, not a presumed missing ID.
+    group_icon_types = [t for t in pe.DIRECTORY_ENTRY_RESOURCE.entries if t.id == 14]
+    missing_application_icon = (len(group_icon_types) == 1 and
+        all(n.id != 32512 for n in group_icon_types[0].directory.entries))
     page_size = 0x1000
     map_size = (image_size + page_size - 1) & ~(page_size - 1)
     engine = uc.Uc(uc.UC_ARCH_X86, uc.UC_MODE_32)
@@ -3242,6 +3251,9 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         "direct_calls": [],
         "indirect_jumps": [],
         "cpuid_calls": [],
+        "user_objects": {},
+        "resource_image_base": image_base,
+        "resource_missing_application_icon": missing_application_icon,
         "cursor_coords": (320, 180),
         "cursor_available": True,
         "cursor_profile": "deterministic_cursor_fixture_v1",
@@ -3281,6 +3293,13 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
                 elif row["name"] in ("GetWindowRect", "GetClientRect"):
                     from window_oracle import _window_query_import
                     handled = _window_query_import(engine, xr, uc, row, mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
+                elif row["name"] in ("LoadIconA", "LoadCursorA"):
+                    from resource_oracle import _resource_import
+                    handled = _resource_import(engine, xr, uc, row, mapped_ranges, state)
                     if handled or state["status"] is not None:
                         engine.emu_stop()
                         return True
@@ -3676,7 +3695,7 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         begin = int(engine.reg_read(xr.UC_X86_REG_EIP)) & 0xFFFFFFFF
 
     if state["status"] != "GUEST_STOP_IMPORT":
-        detail = state.get("api_state_fault", state.get("memory_fault"))
+        detail = state.get("api_state_fault") or state.get("memory_fault") or state.get("instruction_fault")
         raise RuntimeError(
             f"startup oracle stopped at {state.get('status')} "
             f"target=0x{state.get('target', 0):08x} detail={detail!r}"
@@ -3826,6 +3845,8 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         "unicorn_eip_at_stop": architectural_eip,
         "direct_calls": state["direct_calls"],
         "indirect_jumps": state["indirect_jumps"],
+        "user_objects": state["user_objects"],
+        "resource_missing_application_icon": state["resource_missing_application_icon"],
         "cursor_profile": state["cursor_profile"],
         "cursor_fixture": list(state["cursor_coords"]),
         "cpuid_profile": "upstream_static_x86_006d8",
