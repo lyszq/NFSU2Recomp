@@ -20,7 +20,7 @@ LIBS=(-lm)
 "$DEST/guest-resources-test"
 "$CC" "${FLAGS[@]}" runtime/guest_memory.c runtime/guest_user_objects.c tests/guest_user_objects_test.c -o "$DEST/guest-user-objects-test"
 "$DEST/guest-user-objects-test"
-"$CC" "${FLAGS[@]}" runtime/guest_memory.c runtime/guest_toolhelp.c tests/test_guest_toolhelp.c -o "$DEST/guest-toolhelp-test"
+"$CC" "${FLAGS[@]}" runtime/guest_toolhelp.c tests/test_guest_toolhelp.c -o "$DEST/guest-toolhelp-test"
 "$DEST/guest-toolhelp-test"
 "$CC" "${FLAGS[@]}" runtime/guest_memory.c runtime/guest_heap.c tests/guest_heap_test.c -o "$DEST/guest-heap-test"
 "$DEST/guest-heap-test"
