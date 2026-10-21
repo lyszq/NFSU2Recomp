@@ -58,9 +58,9 @@ int main(void) {
     GuestWindows windows = {.image_base = 0x00400000u};
     uint32_t fault = 0;
 
-    const GuestImport api_heap_create = {"KERNEL32.dll", "HeapCreate", 0x101};
-    const GuestImport api_heap_alloc = {"KERNEL32.dll", "HeapAlloc", 0x102};
-    const GuestImport api_heap_realloc = {"KERNEL32.dll", "HeapReAlloc", 0x103};
+    const GuestImport api_heap_create = {.iat = 0x101, .library = "KERNEL32.dll", .name = "HeapCreate"};
+    const GuestImport api_heap_alloc = {.iat = 0x102, .library = "KERNEL32.dll", .name = "HeapAlloc"};
+    const GuestImport api_heap_realloc = {.iat = 0x103, .library = "KERNEL32.dll", .name = "HeapReAlloc"};
 
     /* 1. Create a heap: HeapCreate(0, 4096, 65536) */
     uint32_t cur_esp = STACK_ADDR + 0x1000u;
