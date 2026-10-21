@@ -34,6 +34,9 @@ HEAP_BLOCK = HEAP_BASE + 0x4000
 STACK_START = STACK_HI - 0x1004
 FNV_OFFSET = 14695981039346656037
 FNV_PRIME = 1099511628211
+# FNV fold of (STEP_B, 1000000) then (STEP_C, 1001000), matching the
+# deterministic virtual counter configured in the rendered probe.
+EXPECTED_TSC_HASH = 0xCD3BFA12B129556E
 
 
 def fnv64(data: bytes) -> int:
@@ -110,6 +113,9 @@ def substitutions() -> dict[str, str]:
         "EXPECTED_DEPTH": "1u",
         "EXPECTED_USER_OBJECT_COUNT": "1u",
         "EXPECTED_USER_OBJECTS": "{0x00b10001u,2u,2u,0u,32512u,1u}," + ",".join("{0u,0u,0u,0u,0u,0u}" for _ in range(7)),
+        "EXPECTED_TSC_NEXT": "1002000",
+        "EXPECTED_TSC_READS": "2",
+        "EXPECTED_TSC_HASH": f"0x{EXPECTED_TSC_HASH:016x}",
         "EXPECTED_TRACE": str(trace_hash([STEP_A, STEP_B, STEP_C])),
         "HEAP_WINDOW_ADDRESS": f"0x{HEAP_BLOCK:08x}u",
         "HEAP_WINDOW_SIZE": "16u",
@@ -193,6 +199,7 @@ def main() -> int:
         "apis_only": {"EXPECTED_CALLS": "5u", "EXPECTED_GPRS": gpr_after_extra_api},
         "heap_blocks_only": {"EXPECTED_GPRS": registers(0, BASE_STACK_ESP)},
         "depth_only": {"EXPECTED_CALLS": "5u"},
+        "tsc_hash": {"EXPECTED_TSC_HASH": f"0x{EXPECTED_TSC_HASH ^ 1:016x}"},
     }
     with tempfile.TemporaryDirectory(prefix="ios-startup-probe-", dir=build_root) as tmp:
         directory = Path(tmp)
@@ -208,6 +215,7 @@ def main() -> int:
             ("target", "baseline"), ("user_objects", "baseline"), ("step_count", "steps_only"),
             ("call_count", "calls_only"), ("api_count", "apis_only"),
             ("block_count", "heap_blocks_only"), ("depth", "depth_only"),
+            ("valid", "tsc_hash"),
         ]
         for mode, variant in rejected:
             run_case(binaries[variant], mode, False)

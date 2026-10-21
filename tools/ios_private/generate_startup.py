@@ -36,10 +36,12 @@ def startup_lifter_class(Lifter, Unsupported):
         def insn(self, instruction, targets):
             if instruction.mnemonic == "cpuid":
                 return [f'if (!guest_cpuid(c)) guest_execution_unsupported(c,0x{instruction.address:x}u,"unsupported CPUID leaf");']
+            if instruction.mnemonic == "rdtsc":
+                return ["guest_execution_rdtsc(c);"]
             # Desktop no-ops or helpers that would falsely continue are explicit
             # probe stops. Direct g_mem/string operations need a future checked
             # implementation; typed MR* access below already has full checks.
-            if instruction.mnemonic in ("int3", "int", "hlt", "ud2", "retf", "rdtsc"):
+            if instruction.mnemonic in ("int3", "int", "hlt", "ud2", "retf"):
                 return [f'guest_execution_unsupported(c,0x{instruction.address:x}u,"probe boundary");']
             lines = super().insn(instruction, targets)
             if any("g_mem" in line or "rdtsc_shim" in line or "cpuid_shim" in line for line in lines):
@@ -141,7 +143,10 @@ def generate(exe):
                 "system_id": 32512, "module": 0, "shared": True}:
             raise ValueError("unexpected USER32 object profile")
         user_objects[slot] = [int(handle), 2, 2, 0, 32512, 1]
-    substitutions = {"EXPECTED_USER_OBJECT_COUNT": str(len(reference["user_objects"])),
+    substitutions = {"EXPECTED_TSC_NEXT": str(reference["virtual_tsc_next"]),
+                     "EXPECTED_TSC_READS": str(len(reference["rdtsc_calls"])),
+                     "EXPECTED_TSC_HASH": str(reference["virtual_tsc_hash"]),
+                     "EXPECTED_USER_OBJECT_COUNT": str(len(reference["user_objects"])),
                      "EXPECTED_USER_OBJECTS": ",".join("{"+",".join(str(x)+"u" for x in row)+"}" for row in user_objects),
                      "EXPECTED_GPRS": ",".join(f"0x{x:08x}u" for x in reference["cpu"]["r"]),
                      "EXPECTED_FLAGS": f"0x{reference['cpu']['eflags_masked']:x}u",

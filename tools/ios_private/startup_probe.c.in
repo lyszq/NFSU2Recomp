@@ -42,7 +42,9 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     GuestExecutionConfig config = {.dispatch=&table, .imports=nfs_startup_imports,
         .import_count=nfs_startup_import_count, .instruction_budget=200000u,
         .depth_limit=64u, .timeout_ns=UINT64_C(2000000000), .import_handler=guest_windows_import,
-        .import_context=&windows};
+        .import_context=&windows,
+        /* Explicit bounded-test clock, unrelated to host or gameplay time. */
+        .virtual_tsc_initial=UINT64_C(1000000), .virtual_tsc_increment=UINT64_C(1000)};
     PUSH32(0xdeadc0deu);
     /* A declared per-thread test input, never a claim of live UIKit input.
      * Host events continue to update the separate live cursor snapshot. */
@@ -99,6 +101,9 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     int heap_ok = memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@) == UINT64_C(@EXPECTED_HEAP_HASH@);
     if (result.stop != GUEST_STOP_IMPORT || result.target != @EXPECTED_TARGET@ ||
         result.ip != @EXPECTED_IP@ || !steps_ok ||
+        result.virtual_tsc_next != UINT64_C(@EXPECTED_TSC_NEXT@) ||
+        result.virtual_tsc_reads != UINT64_C(@EXPECTED_TSC_READS@) ||
+        result.virtual_tsc_hash != UINT64_C(@EXPECTED_TSC_HASH@) ||
         result.imports_handled != @EXPECTED_APIS@ ||
         guest_critical_count(&windows.critical) != @EXPECTED_CRITICALS@ ||
         guest_tls_count(&windows.tls) != @EXPECTED_TLS@ ||
@@ -140,7 +145,7 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         "%" PRIu64 " instructions / %" PRIu64 " dispatch calls / %u registered functions | "
         "%" PRIu64 " implemented API calls / %u native critical sections / %u TLS keys | "
         "x86 trace + GPR/EFLAGS + image/TEB/stack/heap/process match | "
-        "leaf regression PASS | cursor fixture (320,180) | no JIT | no game boot",
+        "leaf regression PASS | cursor fixture (320,180) | virtual TSC fixture | no JIT | no game boot",
         result.ip, import->library, import->name, result.instructions, result.calls, nfs_startup_count,
         result.imports_handled,guest_critical_count(&windows.critical),guest_tls_count(&windows.tls));
     goto cleanup;

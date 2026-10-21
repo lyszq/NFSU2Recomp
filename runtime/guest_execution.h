@@ -23,6 +23,9 @@ typedef struct GuestExecutionResult {
     uint64_t instructions, calls, trace_hash, imports_handled;
     uint32_t maximum_depth;
     CPU cpu;
+    /* Explicit per-run virtual TSC diagnostics. The hash folds each stepped
+     * RDTSC IP then its returned 64-bit value using the FNV-1a word rule. */
+    uint64_t virtual_tsc_next, virtual_tsc_reads, virtual_tsc_hash;
 } GuestExecutionResult;
 typedef struct GuestExecutionConfig {
     const GuestDispatch *dispatch;
@@ -31,6 +34,9 @@ typedef struct GuestExecutionConfig {
     uint64_t timeout_ns;
     GuestImportHandler import_handler;
     void *import_context;
+    /* Explicit virtual RDTSC fixture. A zero increment is unconfigured and
+     * leaves the RDTSC helper unsupported at its stepped instruction. */
+    uint64_t virtual_tsc_initial, virtual_tsc_increment;
 } GuestExecutionConfig;
 
 /* Validate every IAT slot before writing any. Uses the upstream 0xF... tag
@@ -50,6 +56,9 @@ void guest_execution_call(CPU *cpu, uint32_t target);
  * call depth and without pushing a synthetic return address. */
 void guest_execution_tail(CPU *cpu, uint32_t target);
 void guest_execution_step(CPU *cpu, uint32_t ip);
+/* Uses the per-run virtual TSC only when the config has a nonzero increment;
+ * otherwise stops at the current stepped instruction before modifying CPU. */
+void guest_execution_rdtsc(CPU *cpu);
 void guest_execution_unsupported(CPU *cpu, uint32_t ip, const char *mnemonic);
 void *guest_execution_pointer(uint32_t address, size_t size);
 #endif

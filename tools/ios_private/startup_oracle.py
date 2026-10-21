@@ -3251,6 +3251,10 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         "direct_calls": [],
         "indirect_jumps": [],
         "cpuid_calls": [],
+        "virtual_tsc_next": 1000000,
+        "virtual_tsc_increment": 1000,
+        "rdtsc_calls": [],
+        "virtual_tsc_hash": FNV64_OFFSET,
         "user_objects": {},
         "resource_image_base": image_base,
         "resource_missing_application_icon": missing_application_icon,
@@ -3610,6 +3614,14 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         state["instructions"] += 1
         state["trace_hash"] = ((state["trace_hash"] ^ state["last_ip"]) * FNV64_PRIME) & FNV64_MASK
 
+        if instruction.mnemonic == "rdtsc":
+            from tsc_oracle import apply_rdtsc
+            if apply_rdtsc(uc_engine, xr, address, instruction.size, state):
+                event = state["rdtsc_calls"][-1]
+                for word in (event["address"], event["value"]):
+                    state["virtual_tsc_hash"] = ((state["virtual_tsc_hash"] ^ word) * FNV64_PRIME) & FNV64_MASK
+            return
+
         if instruction.mnemonic == "cpuid":
             from cpuid_oracle import apply_cpuid
             apply_cpuid(uc_engine, xr, address, instruction.size, state)
@@ -3849,6 +3861,12 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         "resource_missing_application_icon": state["resource_missing_application_icon"],
         "cursor_profile": state["cursor_profile"],
         "cursor_fixture": list(state["cursor_coords"]),
+        "virtual_tsc_profile": "deterministic_entry_tsc_v1",
+        "virtual_tsc_initial": 1000000,
+        "virtual_tsc_increment": state["virtual_tsc_increment"],
+        "virtual_tsc_next": state["virtual_tsc_next"],
+        "virtual_tsc_hash": state["virtual_tsc_hash"],
+        "rdtsc_calls": state["rdtsc_calls"],
         "cpuid_profile": "upstream_static_x86_006d8",
         "cpuid_calls": state["cpuid_calls"],
         "image_hash_start": image_base,

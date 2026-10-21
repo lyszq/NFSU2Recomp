@@ -37,7 +37,9 @@ enum {
     IP_DEPTH_B = TEXT_BASE + 0xa0u,
     IP_DEPTH_C = TEXT_BASE + 0xb0u,
     IP_SIMPLE = TEXT_BASE + 0xc0u,
-    IP_BUSY = TEXT_BASE + 0xd0u
+    IP_BUSY = TEXT_BASE + 0xd0u,
+    IP_RDTSC_FIRST = TEXT_BASE + 0xe0u,
+    IP_RDTSC_SECOND = TEXT_BASE + 0xf0u
 };
 
 static GuestDispatch dispatch;
@@ -50,6 +52,11 @@ static int after_nested_call;
 static int leaf_ran;
 static int depth_c_ran;
 static int nested_run_rc;
+static uint64_t rdtsc_first;
+static uint64_t rdtsc_second;
+static unsigned rdtsc_after_read;
+static CPU rdtsc_after_first_cpu;
+static CPU rdtsc_after_second_cpu;
 
 static void store_u32(uint32_t address, uint32_t value) {
     memcpy(g_mem + address, &value, sizeof value);
@@ -59,6 +66,11 @@ static uint32_t load_u32(uint32_t address) {
     uint32_t value;
     memcpy(&value, g_mem + address, sizeof value);
     return value;
+}
+
+static uint64_t tsc_hash_word(uint64_t hash, uint64_t word) {
+    hash ^= word;
+    return hash * UINT64_C(1099511628211);
 }
 
 static void push_return(CPU *c, uint32_t return_ip) {
@@ -164,6 +176,21 @@ static void fn_simple(CPU *c) {
     pop_return(c);
 }
 
+static void fn_rdtsc_pair(CPU *c) {
+    guest_execution_step(c, IP_RDTSC_FIRST);
+    guest_execution_rdtsc(c);
+    rdtsc_first = ((uint64_t)c->edx << 32) | c->eax;
+    rdtsc_after_read++;
+    memcpy(&rdtsc_after_first_cpu, c, sizeof(*c));
+
+    guest_execution_step(c, IP_RDTSC_SECOND);
+    guest_execution_rdtsc(c);
+    rdtsc_second = ((uint64_t)c->edx << 32) | c->eax;
+    rdtsc_after_read++;
+    memcpy(&rdtsc_after_second_cpu, c, sizeof(*c));
+    pop_return(c);
+}
+
 static void fn_nested_run(CPU *c) {
     guest_execution_step(c, IP_BUSY);
     CPU inner_cpu = { 0 };
@@ -176,18 +203,47 @@ static void fn_nested_run(CPU *c) {
 static const uint32_t function_addresses[] = {
     IP_ROOT, IP_LEAF, IP_UNRESOLVED, IP_IMPORT, IP_UNKNOWN_IMPORT,
     IP_UNSUPPORTED, IP_MEMORY, IP_BUDGET, IP_DEPTH_A, IP_DEPTH_B,
-    IP_DEPTH_C, IP_SIMPLE, IP_BUSY
+    IP_DEPTH_C, IP_SIMPLE, IP_BUSY, IP_RDTSC_FIRST
 };
 static const GuestFunction guest_functions[] = {
     fn_root, fn_leaf, fn_unresolved_caller, fn_import_caller,
     fn_unknown_import_caller, fn_unsupported, fn_memory_crossrange,
-    fn_budget, fn_depth_a, fn_depth_b, fn_depth_c, fn_simple, fn_nested_run
+    fn_budget, fn_depth_a, fn_depth_b, fn_depth_c, fn_simple, fn_nested_run,
+    fn_rdtsc_pair
 };
 
 static void prepare_cpu(CPU *cpu) {
     memset(cpu, 0, sizeof *cpu);
     cpu->esp = STACK_TOP;
     push_return(cpu, RET_TOP);
+}
+
+static void prepare_rdtsc_cpu(CPU *cpu) {
+    prepare_cpu(cpu);
+    cpu->eax = 0x10203040u;
+    cpu->ecx = 0x21324354u;
+    cpu->edx = 0x32435465u;
+    cpu->ebx = 0x43546576u;
+    cpu->ebp = 0x54657687u;
+    cpu->esi = 0x65768798u;
+    cpu->edi = 0x768798a9u;
+    cpu->fs_base = 0x00c00000u;
+    cpu->gs_base = 0x00d00000u;
+    cpu->cf = 1u;
+    cpu->pf = 0u;
+    cpu->af = 1u;
+    cpu->zf = 0u;
+    cpu->sf = 1u;
+    cpu->of = 0u;
+    cpu->df = 1u;
+    cpu->st[0] = 3.25;
+    cpu->st[7] = -19.5;
+    cpu->top = 6;
+    cpu->fcw = 0x027fu;
+    cpu->fsw = 0x4321u;
+    cpu->mm[3] = UINT64_C(0x0123456789abcdef);
+    cpu->xmm[4].u64[0] = UINT64_C(0xfedcba9876543210);
+    cpu->xmm[4].u64[1] = UINT64_C(0x1122334455667788);
 }
 
 static GuestExecutionConfig make_config(uint32_t instruction_budget,
@@ -245,6 +301,122 @@ static int test_nested_call_and_stack_contract(void) {
           "register changes survive normal nested return");
     CHECK(load_u32(STACK_TOP - 8u) == ARG_NESTED,
           "nested argument remains at its guest stack location");
+    return 0;
+}
+
+static int test_rdtsc_fixture(void) {
+    const uint64_t initial = UINT64_C(0x1122334455667788);
+    const uint64_t increment = UINT64_C(0x0000000000000103);
+    const uint64_t hash_offset = UINT64_C(14695981039346656037);
+    CPU cpu, before, expected;
+    GuestExecutionResult result;
+    uint64_t expected_hash;
+
+    config = make_config(8, 8, NULL, 0);
+    config.virtual_tsc_initial = initial;
+    config.virtual_tsc_increment = increment;
+    rdtsc_first = rdtsc_second = 0;
+    rdtsc_after_read = 0;
+    prepare_rdtsc_cpu(&cpu);
+    before = cpu;
+    CHECK(run_expect(&config, &cpu, IP_RDTSC_FIRST, GUEST_STOP_RETURN,
+                     &result) == 0,
+          "configured RDTSC fixture returns through two reads");
+    CHECK(rdtsc_first == initial && rdtsc_second == initial + increment &&
+          rdtsc_after_read == 2u,
+          "RDTSC reads use the seeded value and configured per-read increment");
+    expected = before;
+    expected.eax = (uint32_t)initial;
+    expected.edx = (uint32_t)(initial >> 32);
+    expected.eip = IP_RDTSC_FIRST;
+    CHECK(!memcmp(&rdtsc_after_first_cpu, &expected, sizeof(expected)),
+          "first RDTSC preserves all CPU state except EAX/EDX and stepped EIP");
+    expected.eax = (uint32_t)(initial + increment);
+    expected.edx = (uint32_t)((initial + increment) >> 32);
+    expected.eip = IP_RDTSC_SECOND;
+    CHECK(!memcmp(&rdtsc_after_second_cpu, &expected, sizeof(expected)),
+          "second RDTSC preserves all CPU state except EAX/EDX and stepped EIP");
+    expected = before;
+    expected.eax = (uint32_t)(initial + increment);
+    expected.edx = (uint32_t)((initial + increment) >> 32);
+    expected.eip = RET_TOP;
+    expected.esp = STACK_TOP;
+    CHECK(!memcmp(&cpu, &expected, sizeof(cpu)) &&
+          !memcmp(&result.cpu, &expected, sizeof(expected)),
+          "RDTSC changes only EAX/EDX while stepped code owns EIP and return state");
+    CHECK(result.instructions == 2u && result.ip == IP_RDTSC_SECOND,
+          "each RDTSC is accounted by its normal instruction step");
+    expected_hash = tsc_hash_word(hash_offset, IP_RDTSC_FIRST);
+    expected_hash = tsc_hash_word(expected_hash, initial);
+    expected_hash = tsc_hash_word(expected_hash, IP_RDTSC_SECOND);
+    expected_hash = tsc_hash_word(expected_hash, initial + increment);
+    CHECK(result.virtual_tsc_next == initial + 2u * increment &&
+          result.virtual_tsc_reads == 2u &&
+          result.virtual_tsc_hash == expected_hash,
+          "result reports the next TSC, read count, and ordered IP/value hash");
+
+    /* The virtual counter is owned by one run and starts from the same seed
+     * for a later run using the same config. */
+    rdtsc_first = rdtsc_second = UINT64_MAX;
+    rdtsc_after_read = 0;
+    prepare_rdtsc_cpu(&cpu);
+    CHECK(run_expect(&config, &cpu, IP_RDTSC_FIRST, GUEST_STOP_RETURN,
+                     &result) == 0,
+          "second configured RDTSC run returns");
+    CHECK(rdtsc_first == initial && rdtsc_second == initial + increment &&
+          rdtsc_after_read == 2u,
+          "each execution resets its private counter to the configured seed");
+    CHECK(result.virtual_tsc_next == initial + 2u * increment &&
+          result.virtual_tsc_reads == 2u &&
+          result.virtual_tsc_hash == expected_hash,
+          "each run resets the TSC counters and hash to the same initial state");
+
+    /* Unsigned virtual-counter addition wraps at 64 bits. */
+    config.virtual_tsc_initial = UINT64_MAX - 15u;
+    config.virtual_tsc_increment = 32u;
+    rdtsc_first = rdtsc_second = 0;
+    rdtsc_after_read = 0;
+    prepare_rdtsc_cpu(&cpu);
+    CHECK(run_expect(&config, &cpu, IP_RDTSC_FIRST, GUEST_STOP_RETURN,
+                     &result) == 0,
+          "wrapping configured RDTSC run returns");
+    CHECK(rdtsc_first == UINT64_MAX - 15u && rdtsc_second == 16u &&
+          rdtsc_after_read == 2u,
+          "virtual TSC wraps at the unsigned 64-bit boundary");
+    expected_hash = tsc_hash_word(hash_offset, IP_RDTSC_FIRST);
+    expected_hash = tsc_hash_word(expected_hash, UINT64_MAX - 15u);
+    expected_hash = tsc_hash_word(expected_hash, IP_RDTSC_SECOND);
+    expected_hash = tsc_hash_word(expected_hash, 16u);
+    CHECK(result.virtual_tsc_next == 48u && result.virtual_tsc_reads == 2u &&
+          result.virtual_tsc_hash == expected_hash,
+          "wrapped counter result retains exact next value and deterministic hash");
+
+    /* An increment of zero means no fixture: stop on the stepped RDTSC
+     * without changing any CPU field in the helper. */
+    config.virtual_tsc_initial = UINT64_C(0x8877665544332211);
+    config.virtual_tsc_increment = 0u;
+    rdtsc_first = UINT64_C(0xaaaaaaaaaaaaaaaa);
+    rdtsc_second = UINT64_C(0xbbbbbbbbbbbbbbbb);
+    rdtsc_after_read = 0;
+    prepare_rdtsc_cpu(&cpu);
+    before = cpu;
+    CHECK(run_expect(&config, &cpu, IP_RDTSC_FIRST, GUEST_STOP_INSTRUCTION,
+                     &result) == 0,
+          "unconfigured RDTSC stops explicitly");
+    expected = before;
+    expected.eip = IP_RDTSC_FIRST; /* guest_execution_step records the fault IP */
+    CHECK(!memcmp(&cpu, &expected, sizeof(cpu)) &&
+          !memcmp(&result.cpu, &expected, sizeof(expected)),
+          "unconfigured RDTSC helper leaves CPU state unchanged");
+    CHECK(result.ip == IP_RDTSC_FIRST && result.target == IP_RDTSC_FIRST &&
+          result.instructions == 1u && rdtsc_after_read == 0u &&
+          rdtsc_first == UINT64_C(0xaaaaaaaaaaaaaaaa) &&
+          rdtsc_second == UINT64_C(0xbbbbbbbbbbbbbbbb),
+          "unsupported RDTSC stops before its following code executes");
+    CHECK(result.virtual_tsc_next == config.virtual_tsc_initial &&
+          result.virtual_tsc_reads == 0u &&
+          result.virtual_tsc_hash == hash_offset,
+          "disabled RDTSC preserves the seed and reports no reads or hash folds");
     return 0;
 }
 
@@ -610,6 +782,8 @@ int main(void) {
 
     CHECK(test_nested_call_and_stack_contract() == 0,
           "nested call contract tests pass");
+    CHECK(test_rdtsc_fixture() == 0,
+          "explicit RDTSC fixture and unsupported-stop tests pass");
     CHECK(test_import_binding_transaction() == 0,
           "import binding transaction tests pass");
     CHECK(test_unresolved_and_import_stops(imports) == 0,

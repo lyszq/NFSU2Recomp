@@ -102,6 +102,10 @@ void sub_0075bcc7(CPU *cpu) {
     if (write_frame(cpu, SYN_STEP_B, create_args, 3u)) abort();
     guest_execution_call(cpu, GUEST_IMPORT_BASE + 0u);
     guest_execution_step(cpu, SYN_STEP_B);
+    uint32_t saved_eax = cpu->eax, saved_edx = cpu->edx;
+    guest_execution_rdtsc(cpu);
+    cpu->eax = saved_eax;
+    cpu->edx = saved_edx;
 
     uint32_t heap = GUEST_HEAP_BASE;
     if (mode == MODE_BLOCK_COUNT) heap += 0x100000u;
@@ -114,6 +118,11 @@ void sub_0075bcc7(CPU *cpu) {
         guest_execution_call(cpu, GUEST_IMPORT_BASE + 4u);
     }
     guest_execution_step(cpu, SYN_STEP_C);
+    saved_eax = cpu->eax;
+    saved_edx = cpu->edx;
+    guest_execution_rdtsc(cpu);
+    cpu->eax = saved_eax;
+    cpu->edx = saved_edx;
 
     if (mode == MODE_IMAGE) g_mem[SYN_IMAGE_BASE + 0x20u] ^= 1u;
     if (mode == MODE_TEB) g_mem[GUEST_TEB_BASE + 0x80u] ^= 1u;

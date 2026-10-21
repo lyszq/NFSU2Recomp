@@ -58,6 +58,11 @@ class StartupTransferTests(unittest.TestCase):
             body, _targets = lifter.lift(BASE)
         return body
 
+    def test_rdtsc_uses_explicit_execution_fixture(self) -> None:
+        body = self.lift(b"\x0f\x31\xc3")
+        self.assertIn("guest_execution_rdtsc(c);", body)
+        self.assertNotIn("rdtsc_shim", body)
+
     def test_dynamic_indirect_jump_uses_tail_dispatch_without_push(self) -> None:
         body = self.lift(b"\xff\xe0")  # jmp eax
 

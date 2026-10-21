@@ -58,6 +58,24 @@ features. Other undeclared leaves still stop. The independent hook tests ensure
 Unicorn does not execute its own host/default CPUID and preserve GPR/flags/FP/
 XMM state outside the instruction outputs.
 
+## Explicit deterministic entry clock
+
+The independent original-x86 rerun still reaches the same
+KERNEL32!CreateToolhelp32Snapshot boundary after 191554 architectural
+instructions, 217254 raw hooks, 10482 dispatches and 865 APIs. It contains one
+RDTSC at 0x006de715 (7202581). Before this fixture, the oracle used host RDTSC
+while native execution correctly stopped at the unsupported instruction; that
+left the two sides with different clock behavior.
+
+Both sides now opt into `deterministic_entry_tsc_v1` for this bounded startup
+entry only. Its initial value is 1000000 and each read advances by 1000, so the
+single event returns 1000000 and leaves the next value at 1001000. The ordered
+IP/value word-FNV hash is 1459213057555500656. The startup harness checks the
+next value, read count and hash, and its fourteenth negative case corrupts the
+clock hash and must fail. Ordinary native RDTSC remains unsupported without
+the explicit fixture. These fixed values make the comparison reproducible;
+they do not claim to model real game timing or a real CPU clock.
+
 Original x86 execution reaches KERNEL32!CreateToolhelp32Snapshot at0076e9fc,
 targetf000008d, requesting flags2 (process snapshot), processID0. Reference:
 191554 architectural instructions,217254 raw hooks,10482 dispatches,865 APIs,

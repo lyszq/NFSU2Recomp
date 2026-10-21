@@ -130,6 +130,24 @@ void guest_execution_step(CPU *cpu, uint32_t ip) {
     active->result.trace_hash ^= ip;
     active->result.trace_hash *= UINT64_C(1099511628211);
 }
+void guest_execution_rdtsc(CPU *cpu) {
+    if (!active || cpu != active->cpu) abort();
+    if (!active->config.virtual_tsc_increment)
+        stop(GUEST_STOP_INSTRUCTION, active->result.ip);
+
+    const uint32_t ip = active->result.ip;
+    const uint64_t value = active->result.virtual_tsc_next;
+    cpu->eax = (uint32_t)value;
+    cpu->edx = (uint32_t)(value >> 32);
+
+    active->result.virtual_tsc_hash ^= (uint64_t)ip;
+    active->result.virtual_tsc_hash *= UINT64_C(1099511628211);
+    active->result.virtual_tsc_hash ^= value;
+    active->result.virtual_tsc_hash *= UINT64_C(1099511628211);
+    active->result.virtual_tsc_reads++;
+    /* Unsigned 64-bit arithmetic intentionally wraps as the x86 counter does. */
+    active->result.virtual_tsc_next += active->config.virtual_tsc_increment;
+}
 void guest_execution_unsupported(CPU *cpu, uint32_t ip, const char *mnemonic) {
     (void)mnemonic;
     if (!active || cpu != active->cpu) abort();
@@ -158,6 +176,8 @@ int guest_execution_run(const GuestExecutionConfig *config, CPU *cpu, uint32_t e
     if (!execution) return ENOMEM;
     execution->config = *config;
     execution->cpu = cpu;
+    execution->result.virtual_tsc_next = config->virtual_tsc_initial;
+    execution->result.virtual_tsc_hash = UINT64_C(14695981039346656037);
     execution->result.trace_hash = UINT64_C(14695981039346656037);
     execution->started = monotonic_ns();
     if (!execution->started) { free(execution); return EIO; }

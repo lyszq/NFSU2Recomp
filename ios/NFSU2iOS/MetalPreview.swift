@@ -324,7 +324,7 @@ struct ActivePreviewInputPanel: View {
             Text("Touch and hover readback only · not gameplay")
                 .font(.footnote)
                 .foregroundStyle(.white.opacity(0.65))
-            Text("DETERMINISTIC ENTRY PROFILE · synthetic (320, 180) · harness fixture")
+            Text("DETERMINISTIC ENTRY PROFILE · synthetic (320, 180) · virtual TSC / harness fixture")
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.55))
         }
