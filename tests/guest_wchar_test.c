@@ -253,6 +253,35 @@ int main(void) {
         CHECK(get32(TEB + 0x34) == 122);
     }
 
+    /* CP1252 C1 controls survive conversion; Windows best-fit for U+0191
+     * is byte 0x83 unless WC_NO_BEST_FIT_CHARS is requested. Verified with
+     * direct kernel32 calls on synthetic input, independently of the game. */
+    {
+        static const uint8_t bytes[] = {0x81, 0x8d, 0x8f, 0x90, 0x9d, 0x83};
+        static const uint16_t units[] = {0x81, 0x8d, 0x8f, 0x90, 0x9d, 0x192};
+        GuestImport mb_api = {0, "KERNEL32.dll", "MultiByteToWideChar"};
+        memcpy(g_mem + BUFFER_SRC, bytes, sizeof bytes);
+        CPU c = setup_cpu();
+        put32(STACK + 4, 1252); put32(STACK + 8, 1);
+        put32(STACK + 12, BUFFER_SRC); put32(STACK + 16, sizeof bytes);
+        put32(STACK + 20, BUFFER_DST); put32(STACK + 24, sizeof bytes);
+        CHECK(guest_windows_import(&c, &mb_api, &windows, &fault) == 1);
+        CHECK(c.eax == sizeof bytes && !memcmp(g_mem + BUFFER_DST, units, sizeof units));
+        CHECK(get32(TEB + 0x34) == 999);
+
+        memcpy(g_mem + BUFFER_SRC, units, sizeof units);
+        put16(BUFFER_SRC + 10, 0x191);
+        c = setup_cpu();
+        push_args(STACK, 1252, 0, BUFFER_SRC, 6, BUFFER_DST, 6, 0, BUFFER_MISC);
+        CHECK(guest_windows_import(&c, &api, &windows, &fault) == 1);
+        CHECK(c.eax == 6 && !memcmp(g_mem + BUFFER_DST, bytes, sizeof bytes));
+        CHECK(get32(BUFFER_MISC) == 0 && get32(TEB + 0x34) == 999);
+        c = setup_cpu();
+        push_args(STACK, 1252, 0x400, BUFFER_SRC, 6, BUFFER_DST, 6, 0, BUFFER_MISC);
+        CHECK(guest_windows_import(&c, &api, &windows, &fault) == 1);
+        CHECK(c.eax == 6 && g_mem[BUFFER_DST + 5] == '?');
+        CHECK(get32(BUFFER_MISC) == 1 && get32(TEB + 0x34) == 999);
+    }
     CHECK(!guest_windows_cleanup(&windows));
     CHECK(!guest_memory_shutdown());
     puts("PASS | WideCharToMultiByte, MultiByteToWideChar & GetModuleFileNameA contracts");

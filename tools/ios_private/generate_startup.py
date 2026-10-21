@@ -68,7 +68,9 @@ def generate(exe):
                 "name": entry.name.decode("ascii") if entry.name else f"#{entry.ordinal}"}
                for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
     reference = run_startup_reference(exe, imports, diagnostic_directory=ROOT / "gen/ios-private")
-    if (reference["import_name"] != "RegOpenKeyA" or reference["raw_instructions"] != 129062
+    # Windows NLS captures correct the old Python full-Unicode casing/profile;
+    # 129082 raw hooks correspond to 117395 architectural guest instructions.
+    if (reference["import_name"] != "RegOpenKeyA" or reference["raw_instructions"] != 129082
             or reference["calls"] != 6781 or reference["api_call_count"] != 558
             or reference["critical_section_count"] != 14
             or reference["tls_slot_count"] != 1 or reference["tls_thread_count"] != 1):

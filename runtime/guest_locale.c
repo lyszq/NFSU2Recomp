@@ -84,25 +84,50 @@ static int set_teb_last_error(CPU *cpu, uint32_t error_code, uint32_t *fault)
 
 static uint16_t classify_wide_char(uint16_t wc)
 {
-    if (wc < 256U) {
+    /* Unicode C1 controls remain controls in GetStringTypeW.  The CP1252
+       byte table below is used only after Unicode has been decoded. */
+    if (wc >= 0x0080U && wc <= 0x009FU) {
+        return C1_DEFINED | C1_CNTRL;
+    }
+    if (wc <= 0x007FU || (wc >= 0x00A0U && wc <= 0x00FFU)) {
         return g_ctype1_cp1252[wc];
     }
-    /* Latin Extended-A / Unicode casing ranges */
-    if ((wc >= 0x0100U && wc <= 0x017FU) || (wc >= 0x0180U && wc <= 0x024FU)) {
-        if (wc == 0x0160U || wc == 0x0152U || wc == 0x017DU || wc == 0x0178U) {
-            return C1_DEFINED | C1_ALPHA | C1_UPPER;
-        }
-        if (wc == 0x0161U || wc == 0x0153U || wc == 0x017EU) {
-            return C1_DEFINED | C1_ALPHA | C1_LOWER;
-        }
-        /* Even values in Latin Extended-A are uppercase, odd are lowercase */
-        return (wc & 1U) ? (C1_DEFINED | C1_ALPHA | C1_LOWER)
-                         : (C1_DEFINED | C1_ALPHA | C1_UPPER);
+
+    /* These Unicode characters are the defined CP1252 extensions.  Reuse the
+       exact CT_CTYPE1 entries for their corresponding byte values instead of
+       guessing from Unicode ranges. */
+    switch (wc) {
+    case 0x20ACU: return g_ctype1_cp1252[0x80U]; /* EURO SIGN */
+    case 0x201AU: return g_ctype1_cp1252[0x82U]; /* SINGLE LOW-9 QUOTE */
+    case 0x0192U: return g_ctype1_cp1252[0x83U]; /* LATIN SMALL F WITH HOOK */
+    case 0x201EU: return g_ctype1_cp1252[0x84U]; /* DOUBLE LOW-9 QUOTE */
+    case 0x2026U: return g_ctype1_cp1252[0x85U]; /* HORIZONTAL ELLIPSIS */
+    case 0x2020U: return g_ctype1_cp1252[0x86U]; /* DAGGER */
+    case 0x2021U: return g_ctype1_cp1252[0x87U]; /* DOUBLE DAGGER */
+    case 0x02C6U: return g_ctype1_cp1252[0x88U]; /* MODIFIER LETTER CIRCUMFLEX */
+    case 0x2030U: return g_ctype1_cp1252[0x89U]; /* PER MILLE SIGN */
+    case 0x0160U: return g_ctype1_cp1252[0x8AU]; /* LATIN CAPITAL S WITH CARON */
+    case 0x2039U: return g_ctype1_cp1252[0x8BU]; /* SINGLE LEFT ANGLE QUOTE */
+    case 0x0152U: return g_ctype1_cp1252[0x8CU]; /* LATIN CAPITAL OE */
+    case 0x017DU: return g_ctype1_cp1252[0x8EU]; /* LATIN CAPITAL Z WITH CARON */
+    case 0x2018U: return g_ctype1_cp1252[0x91U]; /* LEFT SINGLE QUOTE */
+    case 0x2019U: return g_ctype1_cp1252[0x92U]; /* RIGHT SINGLE QUOTE */
+    case 0x201CU: return g_ctype1_cp1252[0x93U]; /* LEFT DOUBLE QUOTE */
+    case 0x201DU: return g_ctype1_cp1252[0x94U]; /* RIGHT DOUBLE QUOTE */
+    case 0x2022U: return g_ctype1_cp1252[0x95U]; /* BULLET */
+    case 0x2013U: return g_ctype1_cp1252[0x96U]; /* EN DASH */
+    case 0x2014U: return g_ctype1_cp1252[0x97U]; /* EM DASH */
+    case 0x02DCU: return g_ctype1_cp1252[0x98U]; /* SMALL TILDE */
+    case 0x2122U: return g_ctype1_cp1252[0x99U]; /* TRADE MARK SIGN */
+    case 0x0161U: return g_ctype1_cp1252[0x9AU]; /* LATIN SMALL S WITH CARON */
+    case 0x203AU: return g_ctype1_cp1252[0x9BU]; /* SINGLE RIGHT ANGLE QUOTE */
+    case 0x0153U: return g_ctype1_cp1252[0x9CU]; /* LATIN SMALL OE */
+    case 0x017EU: return g_ctype1_cp1252[0x9EU]; /* LATIN SMALL Z WITH CARON */
+    case 0x0178U: return g_ctype1_cp1252[0x9FU]; /* LATIN CAPITAL Y WITH DIAERESIS */
+    default:
+        /* Bounded fallback for this probe, not a general Unicode ctype table. */
+        return C1_DEFINED;
     }
-    if (wc >= 0x2000U && wc <= 0x206FU) {
-        return C1_DEFINED | C1_PUNCT;
-    }
-    return C1_DEFINED;
 }
 
 static uint16_t map_wide_char(uint16_t wc, uint32_t map_flags)
@@ -114,15 +139,12 @@ static uint16_t map_wide_char(uint16_t wc, uint32_t map_flags)
         if ((wc >= 0x00C0U && wc <= 0x00D6U) || (wc >= 0x00D8U && wc <= 0x00DEU)) {
             return (uint16_t)(wc + 0x20U);
         }
+        if (wc == 0x0191U) return 0x0192U; /* Ƒ -> ƒ */
+        if (wc == 0x039CU) return 0x03BCU; /* Greek capital Mu -> small mu */
         if (wc == 0x0160U) return 0x0161U; /* Š -> š */
         if (wc == 0x0152U) return 0x0153U; /* Œ -> œ */
         if (wc == 0x017DU) return 0x017EU; /* Ž -> ž */
         if (wc == 0x0178U) return 0x00FFU; /* Ÿ -> ÿ */
-        /* Raw byte fallback if wide char is encoded as direct CP1252 byte */
-        if (wc == 0x008AU) return 0x009AU;
-        if (wc == 0x008CU) return 0x009CU;
-        if (wc == 0x008EU) return 0x009EU;
-        if (wc == 0x009FU) return 0x00FFU;
     } else if (map_flags & LCMAP_UPPERCASE) {
         if (wc >= (uint16_t)'a' && wc <= (uint16_t)'z') {
             return (uint16_t)(wc - 0x20U);
@@ -130,14 +152,12 @@ static uint16_t map_wide_char(uint16_t wc, uint32_t map_flags)
         if ((wc >= 0x00E0U && wc <= 0x00F6U) || (wc >= 0x00F8U && wc <= 0x00FEU)) {
             return (uint16_t)(wc - 0x20U);
         }
+        if (wc == 0x0192U) return 0x0191U; /* ƒ -> Ƒ */
         if (wc == 0x0161U) return 0x0160U; /* š -> Š */
         if (wc == 0x0153U) return 0x0152U; /* œ -> Œ */
         if (wc == 0x017EU) return 0x017DU; /* ž -> Ž */
         if (wc == 0x00FFU) return 0x0178U; /* ÿ -> Ÿ */
-        /* Raw byte fallback */
-        if (wc == 0x009AU) return 0x008AU;
-        if (wc == 0x009CU) return 0x008CU;
-        if (wc == 0x009EU) return 0x008EU;
+        if (wc == 0x03BCU) return 0x039CU; /* Greek small mu -> capital Mu */
     }
     return wc;
 }

@@ -1508,6 +1508,17 @@ def _heap_alloc(engine: Any, registers: Any, unicorn_module: Any,
     return True
 
 
+def _commit_heap_pages(engine, unicorn_module, mapped_ranges, address, size):
+    """Map only newly committed granules, preserving all existing payloads."""
+    engine.mem_map(address, size, unicorn_module.UC_PROT_READ | unicorn_module.UC_PROT_WRITE)
+    for index, (start, end) in enumerate(mapped_ranges):
+        if end == address:
+            mapped_ranges[index] = (start, address + size)
+            break
+    else:
+        mapped_ranges.append((address, address + size))
+
+
 def _heap_realloc(engine: Any, registers: Any, unicorn_module: Any,
                   import_row: dict[str, Any],
                   mapped_ranges: list[tuple[int, int]],
@@ -1672,15 +1683,20 @@ def _heap_free(engine: Any, registers: Any, unicorn_module: Any,
     flags = _read_u32(engine, esp + 8)
     lp_mem = _read_u32(engine, esp + 12)
     api.update(return_address=ret_addr, handle=handle, flags=flags, address=lp_mem)
+    if flags & ~1:
+        return False
 
     heaps = state.get("heaps", {})
     heap = next((h for h in heaps.values() if h.get("handle") == handle), None)
-    if heap is not None and lp_mem:
+    found = heap is not None and (not lp_mem or any(b["address"] == lp_mem for b in heap["blocks"]))
+    if found and lp_mem:
         blocks = heap.get("blocks", [])
         heap["blocks"] = [b for b in blocks if b.get("address") != lp_mem]
         heap["live_blocks"] = len(heap["blocks"])
 
-    result = 1
+    result = int(found)
+    if not found:
+        _write_u32(engine, TEB_BASE + LAST_ERROR_OFFSET, ERROR_INVALID_PARAMETER)
     engine.reg_write(registers.UC_X86_REG_EAX, result)
     engine.reg_write(registers.UC_X86_REG_ESP, esp + 16)
     engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
@@ -1814,7 +1830,7 @@ def _wide_char_to_multi_byte(engine: Any, registers: Any, unicorn_module: Any,
         s = "".join(chr(c) for c in chars)
         enc = "cp1252" if code_page in (0, 1252) else ("cp437" if code_page == 1 else f"cp{code_page}")
         try:
-            mb_bytes = s.encode(enc, errors="replace")
+            mb_bytes = _encode_cp1252(s, best_fit=not (flags & 0x400)) if enc == "cp1252" else s.encode(enc, errors="replace")
         except Exception:
             mb_bytes = s.encode("latin-1", errors="replace")
 
@@ -1972,6 +1988,52 @@ def _get_module_file_name_a(engine: Any, registers: Any, unicorn_module: Any,
     return True
 
 
+_CP1252_UNDEFINED = frozenset((0x81, 0x8D, 0x8F, 0x90, 0x9D))
+
+
+def _decode_cp1252(raw):
+    # Windows preserves the five undefined byte positions as C1 controls.
+    return "".join(chr(b) if b in _CP1252_UNDEFINED else bytes((b,)).decode("cp1252") for b in raw)
+
+
+def _encode_cp1252(text, *, best_fit=True):
+    output = bytearray()
+    for character in text:
+        value = ord(character)
+        if value in _CP1252_UNDEFINED:
+            output.append(value)
+        elif value == 0x0191 and best_fit:
+            # Windows' CP1252 best-fit for the capital F with hook is 0x83.
+            output.append(0x83)
+        else:
+            output.extend(character.encode("cp1252", errors="replace"))
+    return bytes(output)
+
+
+def _simple_windows_case(text, flags):
+    # LCMapStringW(0409) preserves sharp-s and micro-sign. Python's full
+    # Unicode casing expands/changes them, which is a different contract.
+    if flags & 0x100:
+        converted = (character.lower() for character in text)
+    elif flags & 0x200:
+        converted = (character if character in "\u00df\u00b5" else character.upper() for character in text)
+    else:
+        return text
+    return "".join(mapped if len(mapped) == 1 else original
+                   for original, mapped in zip(text, converted))
+
+
+def _classify_windows_wide(value):
+    if 0x80 <= value <= 0x9F:
+        return 0x220
+    if value < 256:
+        return _CT_CTYPE1_CP1252[value]
+    for byte in range(0x80, 0xA0):
+        if ord(_decode_cp1252(bytes((byte,)))) == value:
+            return _CT_CTYPE1_CP1252[byte]
+    return 0x200  # Bounded profile, not a complete Unicode NLS database.
+
+
 def _get_string_type_w(engine: Any, registers: Any, unicorn_module: Any,
                        import_row: dict[str, Any],
                        mapped_ranges: list[tuple[int, int]],
@@ -2037,7 +2099,7 @@ def _get_string_type_w(engine: Any, registers: Any, unicorn_module: Any,
             state["memory_fault"] = {"access": "write", "address": lp_chartype, "size": len(chars) * 2}
             return False
 
-        types = [_CT_CTYPE1_CP1252[ch] if ch < 256 else 0x0200 for ch in chars]
+        types = [_classify_windows_wide(ch) for ch in chars]
         out_bytes = struct.pack(f"<{len(types)}H", *types)
         engine.mem_write(lp_chartype, out_bytes)
         result = 1
@@ -2197,10 +2259,7 @@ def _lc_map_string_w(engine: Any, registers: Any, unicorn_module: Any,
             chars = [struct.unpack_from("<H", raw, i * 2)[0] for i in range(cch_src)]
 
         s = "".join(chr(c) for c in chars)
-        if flags & 0x0100:  # LCMAP_LOWERCASE
-            s = s.lower()
-        elif flags & 0x0200:  # LCMAP_UPPERCASE
-            s = s.upper()
+        s = _simple_windows_case(s, flags)
 
         req_len = len(s)
         if cch_dest == 0:
@@ -2294,16 +2353,13 @@ def _lc_map_string_a(engine: Any, registers: Any, unicorn_module: Any,
             raw = bytes(engine.mem_read(lp_src, cch_src))
 
         try:
-            s = raw.decode("cp1252", errors="replace")
+            s = _decode_cp1252(raw)
         except Exception:
             s = raw.decode("latin-1", errors="replace")
 
-        if flags & 0x0100:
-            s = s.lower()
-        elif flags & 0x0200:
-            s = s.upper()
+        s = _simple_windows_case(s, flags)
 
-        out_raw = s.encode("cp1252", errors="replace")
+        out_raw = _encode_cp1252(s)
         req_len = len(out_raw)
         if cch_dest == 0:
             result = req_len
@@ -2398,7 +2454,7 @@ def _multi_byte_to_wide_char(engine: Any, registers: Any, unicorn_module: Any,
 
         enc = "cp1252" if code_page in (0, 1252) else ("cp437" if code_page == 1 else f"cp{code_page}")
         try:
-            s = raw.decode(enc, errors="replace")
+            s = _decode_cp1252(raw) if enc == "cp1252" else raw.decode(enc, errors="replace")
         except Exception:
             s = raw.decode("latin-1", errors="replace")
 

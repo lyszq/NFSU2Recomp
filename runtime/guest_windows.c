@@ -208,6 +208,11 @@ static int heap_import(CPU *c, const GuestImport *import, GuestWindows *windows,
 
 static uint8_t utf16_to_cp1252_special(uint16_t w) {
     switch (w) {
+        case 0x0081: return 0x81;
+        case 0x008D: return 0x8D;
+        case 0x008F: return 0x8F;
+        case 0x0090: return 0x90;
+        case 0x009D: return 0x9D;
         case 0x20AC: return 0x80; /* Euro Sign */
         case 0x201A: return 0x82; /* Single Low-9 Quotation Mark */
         case 0x0192: return 0x83; /* Latin Small Letter F With Hook */
@@ -538,7 +543,7 @@ static int widechar_import(CPU *c, const GuestImport *import, uint32_t *fault) {
             } else if (w >= 0xA0u && w <= 0xFFu) {
                 staged[i] = (uint8_t)w;
             } else {
-                uint8_t sp = utf16_to_cp1252_special(w);
+                uint8_t sp = w == 0x0191u && !(dw_flags & 0x400u) ? 0x83u : utf16_to_cp1252_special(w);
                 if (sp) {
                     staged[i] = sp;
                 } else {
@@ -695,10 +700,10 @@ static int multibyte_import(CPU *c, const GuestImport *import, uint32_t *fault) 
             uint8_t b = src[i];
             if (b >= 0x80 && b <= 0x9F) {
                 static const uint16_t cp1252_to_unicode[32] = {
-                    0x20AC, 0x003F, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
-                    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x003F, 0x017D, 0x003F,
-                    0x003F, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
-                    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x003F, 0x017E, 0x0178
+                    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+                    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+                    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+                    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178
                 };
                 dst[i] = cp1252_to_unicode[b - 0x80];
             } else {

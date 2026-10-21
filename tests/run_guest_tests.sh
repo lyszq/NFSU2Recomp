@@ -55,3 +55,4 @@ if [[ "$(uname -s)" == Darwin ]]; then
   "$DEST/guest-memory-desktop-test"
 fi
 CC="$CC" python3 tests/ios_startup_probe_strict_test.py "$DEST"
+python3 tests/guest_locale_windows_test.py

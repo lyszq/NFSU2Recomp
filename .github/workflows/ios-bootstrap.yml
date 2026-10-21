@@ -43,6 +43,7 @@ on:
       - 'tests/input_bridge*'
       - 'tests/run_guest_tests.sh'
       - 'tests/ios_startup_probe*'
+      - 'tests/fixtures/windows_nls_cp1252.json'
       - 'tools/ios_private/startup_probe.c.in'
       - '.github/workflows/ios-bootstrap.yml'
 
