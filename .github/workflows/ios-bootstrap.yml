@@ -73,7 +73,8 @@ jobs:
 
   build-ios:
     name: Shared runtime tests + native ARM64 IPA
-    runs-on: macos-15
+    # Match the available private build host; the iOS target remains ARM64.
+    runs-on: macos-15-intel
     timeout-minutes: 40
     steps:
       - name: Checkout fork
