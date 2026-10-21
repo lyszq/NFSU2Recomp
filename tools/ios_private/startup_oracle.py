@@ -89,6 +89,10 @@ STD_ERROR_HANDLE = 0xFFFFFFF4
 STD_HANDLE_SELECTORS = frozenset((STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
                                   STD_ERROR_HANDLE))
 BOUNDARY_ARGUMENT_COUNTS = {
+    "RegOpenKeyA": 3,
+    "IsProcessorFeaturePresent": 1,
+    "GetWindowRect": 2,
+    "GetCursorPos": 1,
     "GetStartupInfoA": 1,
     "GetStdHandle": 1,
     "GetFileType": 1,
@@ -138,6 +142,9 @@ CRITICAL_SECTION_IMPORTS = {
     "DeleteCriticalSection",
 }
 SUPPORTED_IMPORTS = {
+    ("advapi32.dll", "RegOpenKeyA"),
+    ("kernel32.dll", "IsProcessorFeaturePresent"),
+    ("user32.dll", "GetWindowRect"),
     ("kernel32.dll", "GetVersionExA"),
     ("kernel32.dll", "GetModuleHandleA"),
     ("kernel32.dll", "GetStartupInfoA"),
@@ -293,6 +300,31 @@ def _range_has_permissions(engine: Any, address: int, size: int, permissions: in
 class _GuestPointerFault(Exception):
     def __init__(self, access: str, address: int, size: int):
         super().__init__(access, address, size)
+
+
+def _is_processor_feature_present(engine, registers, unicorn_module, row, mapped_ranges, state):
+    if row.get("library", "").casefold() != "kernel32.dll" or row.get("name") != "IsProcessorFeaturePresent":
+        return False
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    if not _range_has_permissions(engine, esp, 8, unicorn_module.UC_PROT_READ, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 8}
+        return False
+    ret, feature = struct.unpack("<2I", engine.mem_read(esp, 8))
+    if feature != 7:
+        return False
+    # The declared guest CPU lacks 3DNow, independently of the build host CPU.
+    state["api_calls"].append({"library": row["library"], "name": row["name"],
+        "import_index": row["index"], "tag": IMPORT_BASE + row["index"],
+        "call_ip": state["last_ip"], "esp_before": esp, "argument_count": 1,
+        "return_address": ret, "arguments": [feature], "result": 0,
+        "profile": "portable_guest_no_3dnow", "esp_after": (esp + 8) & 0xFFFFFFFF})
+    engine.reg_write(registers.UC_X86_REG_EAX, 0)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret)
+    engine.reg_write(registers.UC_X86_REG_ESP, (esp + 8) & 0xFFFFFFFF)
+    state["resume"] = True
+    return True
 
 
 def _get_version_ex_a(engine: Any, registers: Any, import_row: dict[str, Any],
@@ -3227,7 +3259,27 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
             row = import_rows[index]
             api_key = (row["library"].casefold(), row["name"])
             if api_key in SUPPORTED_IMPORTS:
-                if row["name"] == "GetVersionExA":
+                if row["name"] == "RegOpenKeyA":
+                    from registry_oracle import _registry_import
+                    handled = _registry_import(engine, xr, uc, row, mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
+                elif row["name"] == "GetWindowRect":
+                    from window_oracle import _window_query_import
+                    handled = _window_query_import(engine, xr, uc, row, mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
+                elif row["name"] == "IsProcessorFeaturePresent":
+                    handled = _is_processor_feature_present(engine, xr, uc, row, mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
+                elif row["name"] == "GetVersionExA":
                     _get_version_ex_a(engine, xr, row, mapped_ranges, state)
                 elif row["name"] == "GetModuleHandleA":
                     _get_module_handle_a(engine, xr, row, mapped_ranges, image_base, state)

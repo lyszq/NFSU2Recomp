@@ -5,6 +5,7 @@
 #include "guest_stdio.h"
 #include "guest_process.h"
 #include "guest_locale.h"
+#include "guest_registry.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -43,6 +44,19 @@ static int identity_import(CPU *c,const GuestImport *import,uint32_t *fault) {
 #define GUEST_FILETIME_HIGH 0x01c4c66eu
 #define GUEST_TICK_COUNT    1000u
 #define GUEST_PERF_COUNT    1000000ULL
+
+static int processor_feature_import(CPU *c, const GuestImport *import, uint32_t *fault) {
+    if (strcmp(import->name, "IsProcessorFeaturePresent")) return 0;
+    const uint8_t *frame = guest_memory_pointer(c->esp, 8, 0);
+    if (!frame) { *fault = c->esp; return -1; }
+    uint32_t ret = read32(frame), feature = read32(frame + 4);
+    /* PF_3DNOW_INSTRUCTIONS_AVAILABLE. The portable guest CPU does not
+     * advertise 3DNow: some upstream translations deliberately omit its
+     * refinement instructions. Other feature queries remain explicit stops. */
+    if (feature != 7u) return 0;
+    c->eax = 0; c->eip = ret; c->esp += 8u;
+    return 1;
+}
 
 static int handle_time_import(CPU *c, const GuestImport *import, uint32_t *fault) {
     int is_filetime = !strcmp(import->name, "GetSystemTimeAsFileTime");
@@ -261,6 +275,20 @@ static int set_guest_last_error(CPU *c, uint32_t error_code, uint32_t *fault) {
     }
     write32(error_ptr, error_code);
     return 0;
+}
+
+static int window_query_import(CPU *c, const GuestImport *import, uint32_t *fault) {
+    if (strcmp(import->name, "GetWindowRect")) return 0;
+    const uint8_t *frame = guest_memory_pointer(c->esp, 12, 0);
+    if (!frame) { *fault = c->esp; return -1; }
+    uint32_t ret = read32(frame), window = read32(frame + 4);
+    if (window) return 0; /* No guest HWND has been created or bound yet. */
+    /* Native Windows rejects HWND=NULL before touching lpRect. Preserve that
+     * failure instead of inventing successful dimensions for a missing window. */
+    int rc = set_guest_last_error(c, 1400u, fault);
+    if (rc) return rc;
+    c->eax = 0; c->eip = ret; c->esp += 12u;
+    return 1;
 }
 
 static int handle_get_module_file_name_a(CPU *c, const GuestImport *import,
@@ -741,6 +769,10 @@ static int multibyte_import(CPU *c, const GuestImport *import, uint32_t *fault) 
 int guest_windows_import(CPU *c, const GuestImport *import, void *context,
                          uint32_t *fault) {
     if (!c || !import || !import->name || !import->library || !fault) return 0;
+    if (!strcasecmp(import->library, "ADVAPI32.dll"))
+        return guest_registry_import(c, import, fault);
+    if (!strcasecmp(import->library, "USER32.dll"))
+        return window_query_import(c, import, fault);
     int version = !strcmp(import->name, "GetVersionExA");
     int module = !strcmp(import->name, "GetModuleHandleA");
     if (strcasecmp(import->library, "KERNEL32.dll")) return 0;
@@ -756,6 +788,8 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
         handled=identity_import(c,import,fault);
         if (handled) return handled;
         handled=handle_time_import(c,import,fault);
+        if (handled) return handled;
+        handled=processor_feature_import(c,import,fault);
         if (handled) return handled;
         handled=guest_process_import(c,import,context ? &((GuestWindows *)context)->process : NULL,fault);
         if (handled) return handled;
