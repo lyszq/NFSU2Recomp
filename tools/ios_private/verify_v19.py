@@ -26,6 +26,12 @@ p.add_argument('--run', type=int, required=True)
 p.add_argument('--public-run', type=int, required=True)
 p.add_argument('--source', required=True)
 a = p.parse_args()
+verification_commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+# A delivery verifier may be repaired after packaging; compiled inputs must
+# still be identical to the pinned source. Only this verifier can differ.
+verification_only_changes = subprocess.check_output(
+    ['git', 'diff', '--name-only', a.source, verification_commit], cwd=ROOT, text=True).splitlines()
+assert set(verification_only_changes) <= {'tools/ios_private/verify_v19.py'}
 client = GitHub('NFSU2Recomp-ios-private')
 client.private()
 private = client.api(f'/repos/{client.repository}/actions/runs/{a.run}')
@@ -97,7 +103,7 @@ rejected_cases = next(
     and any(isinstance(target, ast.Name) and target.id == 'rejected'
             for target in node.targets))
 assert isinstance(rejected_cases, ast.List) and len(rejected_cases.elts) == 16
-startup_doc = (ROOT / 'docs/ios-startup-v019.md').read_text()
+startup_doc = ' '.join((ROOT / 'docs/ios-startup-v019.md').read_text().split())
 for required_doc_text in (
         'deterministic_entry_clock_v1', '0.19.0, build 26',
         'QueryPerformanceFrequency', 'QueryPerformanceCounter',
@@ -146,6 +152,7 @@ with zipfile.ZipFile(ipa) as z:
 tracked = subprocess.check_output(['git', 'ls-files', '--', 'gen/*', 'out/*', '*.exe', '*.EXE', '*.ipa'], cwd=ROOT, text=True)
 assert not tracked
 report = dict(version='0.19.0', build='26', source_commit=a.source,
+              verification_source_commit=verification_commit, verification_only_changes=verification_only_changes,
               private_workflow=private['html_url'], public_workflow=public['html_url'],
               private_control_commit=private['head_sha'], private_jobs=[{k: j[k] for k in ('id','name','conclusion')} for j in jobs],
               ipa_bytes=ipa.stat().st_size, ipa_sha256=hashlib.sha256(ipa.read_bytes()).hexdigest(),
