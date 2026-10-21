@@ -43,6 +43,11 @@ static int set_teb_last_error(CPU *cpu, uint32_t err, uint32_t *fault)
     return 0;
 }
 
+/* Weak stub for win32_signal_event if runtime/win32.c is not linked */
+__attribute__((weak)) void win32_signal_event(uint32_t handle) {
+    (void)handle;
+}
+
 /* --- Directory Creation Helper (mkdir -p) --- */
 static void vfs_mkdir_parents(const char *path)
 {
@@ -1055,10 +1060,7 @@ static int handle_read_file(CPU *cpu, GuestFileTable *table, uint32_t *fault)
         memcpy((uint8_t *)ov_ptr + 4, &bytes_read, 4);
 
         if (hev != 0) {
-            #if defined(__APPLE__) || defined(__linux__)
-            extern void win32_signal_event(uint32_t) __attribute__((weak));
-            if (win32_signal_event) win32_signal_event(hev);
-            #endif
+            win32_signal_event(hev);
         }
     } else if (slot->is_empty) {
         got = 0; /* Instant EOF */
