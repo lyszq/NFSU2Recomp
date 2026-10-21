@@ -26,6 +26,7 @@ targets:
       - path: ../runtime/guest_bootstrap.c
       - path: ../runtime/guest_windows.c
       - path: ../runtime/guest_registry.c
+      - path: ../runtime/guest_cpuid.c
       - path: ../runtime/guest_heap.c
       - path: ../runtime/guest_critical.c
       - path: ../runtime/guest_tls.c

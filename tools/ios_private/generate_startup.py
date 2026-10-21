@@ -34,10 +34,12 @@ def startup_lifter_class(Lifter, Unsupported):
             return blocks, calls
 
         def insn(self, instruction, targets):
+            if instruction.mnemonic == "cpuid":
+                return [f'if (!guest_cpuid(c)) guest_execution_unsupported(c,0x{instruction.address:x}u,"unsupported CPUID leaf");']
             # Desktop no-ops or helpers that would falsely continue are explicit
             # probe stops. Direct g_mem/string operations need a future checked
             # implementation; typed MR* access below already has full checks.
-            if instruction.mnemonic in ("int3", "int", "hlt", "ud2", "retf", "cpuid", "rdtsc"):
+            if instruction.mnemonic in ("int3", "int", "hlt", "ud2", "retf", "rdtsc"):
                 return [f'guest_execution_unsupported(c,0x{instruction.address:x}u,"probe boundary");']
             lines = super().insn(instruction, targets)
             if any("g_mem" in line or "rdtsc_shim" in line or "cpuid_shim" in line for line in lines):
@@ -70,8 +72,8 @@ def generate(exe):
     reference = run_startup_reference(exe, imports, diagnostic_directory=ROOT / "gen/ios-private")
     # Registry, CPU capability and observed invalid-window contracts advance
     # the prefix to its first cursor query. Native comparisons stay exact.
-    if (reference["import_name"] != "GetCursorPos" or reference["raw_instructions"] != 151490
-            or reference["calls"] != 7865 or reference["api_call_count"] != 580
+    if (reference["import_name"] != "GetCursorPos" or reference["raw_instructions"] != 151491
+            or reference["calls"] != 7866 or reference["api_call_count"] != 581
             or reference["critical_section_count"] != 14
             or reference["tls_slot_count"] != 1 or reference["tls_thread_count"] != 1):
         raise ValueError(f"unexpected independent x86 entry boundary: {reference['import_name']} {reference['instructions']}")
@@ -115,7 +117,7 @@ def generate(exe):
         raise ValueError("generate the leaf regression first")
     # Preserve upstream CPU ABI, but check every generated typed access. RW is
     # intentional: probe image/stack pages are RW, never executable host pages.
-    prefix = '#include "guest_execution.h"\n'
+    prefix = '#include "guest_execution.h"\n#include "guest_cpuid.h"\n'
     for macro, typ, width in [("MR8", "uint8_t", 1), ("MR16", "uint16_t", 2),
                               ("MR32", "uint32_t", 4), ("MR64", "uint64_t", 8),
                               ("MRF32", "float", 4), ("MRF64", "double", 8)]:

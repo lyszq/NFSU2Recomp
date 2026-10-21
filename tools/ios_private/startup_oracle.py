@@ -312,15 +312,16 @@ def _is_processor_feature_present(engine, registers, unicorn_module, row, mapped
         state["memory_fault"] = {"access": "read", "address": esp, "size": 8}
         return False
     ret, feature = struct.unpack("<2I", engine.mem_read(esp, 8))
-    if feature != 7:
+    if feature not in (6, 7, 10):
         return False
-    # The declared guest CPU lacks 3DNow, independently of the build host CPU.
+    # Static guest CPUID EDX25/26 advertise SSE/SSE2; no 3DNow.
+    result = 0 if feature == 7 else 1
     state["api_calls"].append({"library": row["library"], "name": row["name"],
         "import_index": row["index"], "tag": IMPORT_BASE + row["index"],
         "call_ip": state["last_ip"], "esp_before": esp, "argument_count": 1,
-        "return_address": ret, "arguments": [feature], "result": 0,
-        "profile": "portable_guest_no_3dnow", "esp_after": (esp + 8) & 0xFFFFFFFF})
-    engine.reg_write(registers.UC_X86_REG_EAX, 0)
+        "return_address": ret, "arguments": [feature], "result": result,
+        "profile": "upstream_static_x86_006d8", "esp_after": (esp + 8) & 0xFFFFFFFF})
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
     engine.reg_write(registers.UC_X86_REG_EIP, ret)
     engine.reg_write(registers.UC_X86_REG_ESP, (esp + 8) & 0xFFFFFFFF)
     state["resume"] = True
@@ -3233,6 +3234,7 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         "raw_trace_hash": FNV64_OFFSET,
         "direct_calls": [],
         "indirect_jumps": [],
+        "cpuid_calls": [],
         "import": None,
         "api_calls": [],
         "boundary_call": None,
@@ -3565,6 +3567,11 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         state["instructions"] += 1
         state["trace_hash"] = ((state["trace_hash"] ^ state["last_ip"]) * FNV64_PRIME) & FNV64_MASK
 
+        if instruction.mnemonic == "cpuid":
+            from cpuid_oracle import apply_cpuid
+            apply_cpuid(uc_engine, xr, address, instruction.size, state)
+            return
+
         if instruction.mnemonic in ("call", "jmp") and instruction.operands:
             is_call = instruction.mnemonic == "call"
             if is_call:
@@ -3795,6 +3802,8 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         "unicorn_eip_at_stop": architectural_eip,
         "direct_calls": state["direct_calls"],
         "indirect_jumps": state["indirect_jumps"],
+        "cpuid_profile": "upstream_static_x86_006d8",
+        "cpuid_calls": state["cpuid_calls"],
         "image_hash_start": image_base,
         "image_hash_size": image_size,
         "image_hash64": _fnv1a64(image_state),

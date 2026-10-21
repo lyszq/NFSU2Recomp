@@ -22,11 +22,21 @@ checks the complete output range. Overlong strings remain explicit stops.
 
 ## CPU capabilities
 
-The next observed IsProcessorFeaturePresent argument is7,
+IsProcessorFeaturePresent argument7 is
 PF_3DNOW_INSTRUCTIONS_AVAILABLE. The portable guest does not advertise 3DNow:
 some upstream translations omit its refinement instructions. This query returns
-FALSE with the documented stdcall ABI and preserves LastError. Other feature
-numbers remain unsupported; host ARM/Intel capabilities are not substituted.
+FALSE with the documented stdcall ABI and preserves LastError. Arguments6
+and10 return TRUE for SSE/SSE2, consistent with the existing upstream static
+CPUID profile. Other feature numbers remain unsupported.
+
+CPUID explicitly uses the upstream virtual x86 profile (family/model0x006d8):
+leaf0 returns maximum basic leaf1 and GenuineIntel; leaf1 returns EAX0x006d8,
+EBX/ECX0 and EDX0x0383fbff; extended-maximum leaf0x80000000 returns four
+zeros as the upstream handler did. Other leaves stop without mutation.
+The oracle intercepts CPUID before Unicorn executes it, rather than using
+Unicorn or host CPU defaults. Synthetic actual-instruction tests verify this
+interception and next-instruction execution. Advertising SSE/SSE2 does not
+claim complete translation coverage: any unsupported instruction still stops.
 
 ## Invalid window query
 
@@ -40,8 +50,8 @@ has been created or bound. No success result or window dimensions are invented.
 ## New independent reference frontier
 
 With these declared contracts, authenticated original x86 execution reaches
-USER32.dll!GetCursorPos after138711 architectural instructions,151490 raw
-Unicorn callbacks,7865 CALL/entry dispatches and580 implemented API invocations.
+USER32.dll!GetCursorPos after138712 architectural instructions,151491 raw
+Unicorn callbacks,7866 CALL/entry dispatches and581 implemented API invocations.
 Maximum depth remains12. Every generated native comparison is exact.
 
 The current cursor query is intentionally unsupported. Actual cursor/input
@@ -52,7 +62,7 @@ milestone does not claim game boot, rendering, audio or gameplay.
 Synthetic native and independent Unicorn tests cover the new contracts,
 unsupported cases, CPU/flags preservation, aliases, permissions and range
 overflow. The private workflow tests native execution twice per host and
-checks that the actual registry handler is present in the ARM64 link map.
+checks that the actual registry and CPUID handlers are present in the ARM64 link map.
 
 Contract references: [RegOpenKeyA](https://learn.microsoft.com/en-us/windows/win32/api/winreg/nf-winreg-regopenkeya),
 [IsProcessorFeaturePresent](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-isprocessorfeaturepresent),

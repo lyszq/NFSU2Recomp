@@ -28,6 +28,7 @@ IMPORT_IP = 0xF0000015
 EAX_SENTINEL = 0xAABBCCDD
 FLAGS_SENTINEL = 0xCD5
 KNOWN_FEATURE = 7  # PF_3DNOW_INSTRUCTIONS_AVAILABLE, answered false.
+SUPPORTED_TRUE_FEATURES = (6, 10)  # SSE and SSE2, from CPUID EDX bits 25/26.
 TEB_BASE = 0x00C00000
 LAST_ERROR_OFFSET = 0x34
 LAST_ERROR_SENTINEL = 0x76543210
@@ -134,8 +135,52 @@ class ProcessorFeatureOracleTests(unittest.TestCase):
         self.assertEqual(api["return_address"], RETURN_ADDRESS)
         self.assertEqual(api["arguments"], [KNOWN_FEATURE])
         self.assertEqual(api["result"], 0)
-        self.assertEqual(api["profile"], "portable_guest_no_3dnow")
+        self.assertEqual(api["profile"], "upstream_static_x86_006d8")
         self.assertEqual(api["esp_after"], STACK_BASE + 8)
+
+    def test_sse_features_six_and_ten_return_true_without_side_effects(self) -> None:
+        self.engine.mem_map(TEB_BASE, PAGE_SIZE, unicorn.UC_PROT_ALL)
+        last_error_address = TEB_BASE + LAST_ERROR_OFFSET
+
+        for feature in SUPPORTED_TRUE_FEATURES:
+            with self.subTest(feature=feature):
+                self.state["api_calls"] = []
+                self.state["resume"] = False
+                self.state["status"] = None
+                self.engine.mem_write(
+                    last_error_address,
+                    struct.pack("<I", LAST_ERROR_SENTINEL),
+                )
+                frame = self.write_frame(feature)
+                stack_before = bytes(self.engine.mem_read(STACK_BASE, PAGE_SIZE))
+                teb_before = bytes(self.engine.mem_read(TEB_BASE, PAGE_SIZE))
+
+                self.assertTrue(self.call_import())
+
+                self.assert_success_frame(expected_eax=1)
+                self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, PAGE_SIZE)),
+                                 stack_before)
+                self.assertEqual(bytes(self.engine.mem_read(TEB_BASE, PAGE_SIZE)),
+                                 teb_before)
+                self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, 8)), frame)
+                self.assertEqual(
+                    struct.unpack("<I", self.engine.mem_read(
+                        last_error_address, 4))[0], LAST_ERROR_SENTINEL)
+
+                self.assertEqual(len(self.state["api_calls"]), 1)
+                api = self.state["api_calls"][0]
+                self.assertEqual(api["library"], "KERNEL32.dll")
+                self.assertEqual(api["name"], "IsProcessorFeaturePresent")
+                self.assertEqual(api["import_index"], 21)
+                self.assertEqual(api["tag"], IMPORT_IP)
+                self.assertEqual(api["call_ip"], IMPORT_IP)
+                self.assertEqual(api["esp_before"], STACK_BASE)
+                self.assertEqual(api["argument_count"], 1)
+                self.assertEqual(api["return_address"], RETURN_ADDRESS)
+                self.assertEqual(api["arguments"], [feature])
+                self.assertEqual(api["result"], 1)
+                self.assertEqual(api["profile"], "upstream_static_x86_006d8")
+                self.assertEqual(api["esp_after"], STACK_BASE + 8)
 
     def test_last_error_storage_is_preserved(self) -> None:
         self.engine.mem_map(TEB_BASE, PAGE_SIZE, unicorn.UC_PROT_ALL)
@@ -153,7 +198,7 @@ class ProcessorFeatureOracleTests(unittest.TestCase):
         )
 
     def test_unknown_queries_are_strictly_unsupported_without_side_effects(self) -> None:
-        for feature in (0, 6, 8, 0xFFFFFFFF):
+        for feature in (0, 8, 0xFFFFFFFF):
             with self.subTest(feature=feature):
                 self.assert_unsupported_unchanged(feature=feature)
 

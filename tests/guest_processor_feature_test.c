@@ -67,9 +67,9 @@ static int write_frame(uint32_t address, uint32_t ret, uint32_t feature) {
 }
 
 static int expect_completed_cpu(const CPU *actual, const CPU *before,
-                                uint32_t ret) {
+                                uint32_t ret, uint32_t result) {
     CPU expected = *before;
-    expected.eax = 0; /* PF_3DNOW_INSTRUCTIONS_AVAILABLE is false by policy. */
+    expected.eax = result;
     expected.eip = ret;
     expected.esp = before->esp + 8u;
     if (memcmp(actual, &expected, sizeof(expected)) == 0) return 0;
@@ -92,7 +92,8 @@ static GuestImport feature_import(const char *library, const char *name) {
     return import;
 }
 
-static int run_supported_prepared(uint32_t frame, uint32_t fs_base) {
+static int run_supported_prepared(uint32_t frame, uint32_t fs_base,
+                                  uint32_t result) {
     CPU cpu, before;
     uint8_t frame_before[8], frame_after[8];
     uint32_t fault = 0xcafebabeu, last_error = 0;
@@ -100,10 +101,11 @@ static int run_supported_prepared(uint32_t frame, uint32_t fs_base) {
                                         "IsProcessorFeaturePresent");
 
     CHECK(read_bytes(frame, frame_before, sizeof(frame_before)) == 0);
+    CHECK(write_u32(LAST_ERROR_ADDR, LAST_ERROR_SENTINEL) == 0);
     init_cpu(&cpu, frame, fs_base);
     before = cpu;
     CHECK(guest_windows_import(&cpu, &import, NULL, &fault) == 1);
-    CHECK(expect_completed_cpu(&cpu, &before, RETURN_ADDRESS) == 0);
+    CHECK(expect_completed_cpu(&cpu, &before, RETURN_ADDRESS, result) == 0);
     CHECK(read_bytes(frame, frame_after, sizeof(frame_after)) == 0);
     CHECK(memcmp(frame_before, frame_after, sizeof(frame_before)) == 0);
     CHECK(read_bytes(LAST_ERROR_ADDR, &last_error, sizeof(last_error)) == 0);
@@ -111,9 +113,10 @@ static int run_supported_prepared(uint32_t frame, uint32_t fs_base) {
     return 0;
 }
 
-static int run_supported(uint32_t frame, uint32_t fs_base) {
-    CHECK(write_frame(frame, RETURN_ADDRESS, FEATURE_3DNOW) == 0);
-    return run_supported_prepared(frame, fs_base);
+static int run_supported(uint32_t frame, uint32_t fs_base,
+                         uint32_t feature, uint32_t result) {
+    CHECK(write_frame(frame, RETURN_ADDRESS, feature) == 0);
+    return run_supported_prepared(frame, fs_base, result);
 }
 
 static int test_supported_feature(void) {
@@ -121,23 +124,35 @@ static int test_supported_feature(void) {
     CHECK(write_u32(LAST_ERROR_ADDR, LAST_ERROR_SENTINEL) == 0);
 
     /* The call is stdcall, reads an unaligned frame, and preserves all else. */
-    CHECK(run_supported(STACK_ADDR, TEB_ADDR) == 0);
+    CHECK(run_supported(STACK_ADDR, TEB_ADDR, FEATURE_3DNOW, 0) == 0);
 
     /* Neither a valid TEB nor a writable TEB is required for feature 7. */
-    CHECK(run_supported(STACK_ADDR, 0xdead0000u) == 0);
-    CHECK(run_supported(STACK_ADDR, 0) == 0);
-    CHECK(run_supported(STACK_ADDR, UINT32_MAX - 0x10u) == 0);
+    CHECK(run_supported(STACK_ADDR, 0xdead0000u, FEATURE_3DNOW, 0) == 0);
+    CHECK(run_supported(STACK_ADDR, 0, FEATURE_3DNOW, 0) == 0);
+    CHECK(run_supported(STACK_ADDR, UINT32_MAX - 0x10u, FEATURE_3DNOW, 0) == 0);
 
     /* Read-only frame memory is sufficient because the handler only reads it. */
     CHECK(write_frame(STACK_ADDR, RETURN_ADDRESS, FEATURE_3DNOW) == 0);
     CHECK(guest_memory_protect(STACK_PAGE, PAGE_SIZE, GUEST_MEMORY_READ) == 0);
-    CHECK(run_supported_prepared(STACK_ADDR, 0xdead0000u) == 0);
+    CHECK(run_supported_prepared(STACK_ADDR, 0xdead0000u, 0) == 0);
     CHECK(guest_memory_commit(STACK_PAGE, PAGE_SIZE) == 0);
     return 0;
 }
 
+static int test_true_sse_features(void) {
+    static const uint32_t features[] = { 6u, 10u };
+
+    for (size_t i = 0; i < sizeof(features) / sizeof(features[0]); ++i) {
+        /* Upstream static CPUID advertises SSE (6) and SSE2 (10). */
+        CHECK(run_supported(STACK_ADDR, TEB_ADDR, features[i], 1) == 0);
+        /* These constant queries do not need to inspect a guest TEB. */
+        CHECK(run_supported(STACK_ADDR, 0, features[i], 1) == 0);
+    }
+    return 0;
+}
+
 static int test_unknown_features_and_imports(void) {
-    static const uint32_t unknown_features[] = { 0, 6, 8, 0xffffffffu };
+    static const uint32_t unknown_features[] = { 0, 8, 0xffffffffu };
     CPU cpu, before;
     uint8_t frame_before[8], frame_after[8];
     uint32_t fault = 0xabcdef12u;
@@ -223,6 +238,7 @@ int main(void) {
     CHECK(guest_memory_commit(0x00020000u, PAGE_SIZE) == 0);
 
     CHECK(test_supported_feature() == 0);
+    CHECK(test_true_sse_features() == 0);
     CHECK(test_unknown_features_and_imports() == 0);
     CHECK(test_frame_memory_faults() == 0);
     CHECK(guest_memory_shutdown() == 0);

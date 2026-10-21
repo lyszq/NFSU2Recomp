@@ -50,11 +50,11 @@ static int processor_feature_import(CPU *c, const GuestImport *import, uint32_t 
     const uint8_t *frame = guest_memory_pointer(c->esp, 8, 0);
     if (!frame) { *fault = c->esp; return -1; }
     uint32_t ret = read32(frame), feature = read32(frame + 4);
-    /* PF_3DNOW_INSTRUCTIONS_AVAILABLE. The portable guest CPU does not
-     * advertise 3DNow: some upstream translations deliberately omit its
-     * refinement instructions. Other feature queries remain explicit stops. */
-    if (feature != 7u) return 0;
-    c->eax = 0; c->eip = ret; c->esp += 8u;
+    /* The static upstream CPUID profile advertises SSE/SSE2 (EDX25/26),
+     * but no 3DNow. These are guest capabilities, independent of the host.
+     * Unimplemented translated instructions still stop explicitly. */
+    if (feature != 6u && feature != 7u && feature != 10u) return 0;
+    c->eax = feature == 7u ? 0u : 1u; c->eip = ret; c->esp += 8u;
     return 1;
 }
 

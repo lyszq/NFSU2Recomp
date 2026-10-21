@@ -13,6 +13,8 @@ FLAGS=(-O2 -std=gnu11 -Wall -Wextra -Werror -Iruntime -fno-strict-aliasing -pthr
 "$DEST/guest-execution-tail-test"
 "$CC" "${FLAGS[@]}" runtime/guest_memory.c runtime/guest_registry.c tests/guest_registry_test.c -o "$DEST/guest-registry-test"
 "$DEST/guest-registry-test"
+"$CC" "${FLAGS[@]}" runtime/guest_cpuid.c tests/guest_cpuid_test.c -o "$DEST/guest-cpuid-test"
+"$DEST/guest-cpuid-test"
 "$CC" "${FLAGS[@]}" runtime/guest_memory.c runtime/guest_heap.c tests/guest_heap_test.c -o "$DEST/guest-heap-test"
 "$DEST/guest-heap-test"
 "$CC" "${FLAGS[@]}" runtime/guest_memory.c runtime/guest_critical.c tests/guest_critical_test.c -o "$DEST/guest-critical-test"
