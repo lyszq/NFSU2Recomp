@@ -36,6 +36,7 @@ on:
       - 'tests/guest_error*'
       - 'tests/guest_stdio*'
       - 'tests/guest_process*'
+      - 'tests/guest_time*'
       - 'tests/run_guest_tests.sh'
       - '.github/workflows/ios-bootstrap.yml'
 

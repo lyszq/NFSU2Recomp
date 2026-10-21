@@ -31,6 +31,8 @@ FLAGS=(-O2 -std=gnu11 -Wall -Wextra -Werror -Iruntime -fno-strict-aliasing -pthr
 "$DEST/guest-wchar-test"
 "$CC" "${FLAGS[@]}" runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_windows.c runtime/guest_locale.c runtime/guest_heap.c runtime/guest_critical.c runtime/guest_tls.c runtime/guest_process.c runtime/guest_startup.c runtime/guest_error.c runtime/guest_stdio.c runtime/guest_memory.c tests/guest_exception_test.c -o "$DEST/guest-exception-test"
 "$DEST/guest-exception-test"
+"$CC" "${FLAGS[@]}" runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_windows.c runtime/guest_locale.c runtime/guest_heap.c runtime/guest_critical.c runtime/guest_tls.c runtime/guest_process.c runtime/guest_startup.c runtime/guest_error.c runtime/guest_stdio.c runtime/guest_memory.c tests/guest_time_test.c -o "$DEST/guest-time-test"
+"$DEST/guest-time-test"
 "$CC" "${FLAGS[@]}" ios/NFSU2iOS/Native/NFSU2InputBridge.c tests/input_bridge_test.c -o "$DEST/input-bridge-test"
 "$DEST/input-bridge-test"
 "$CC" "${FLAGS[@]}" -c runtime/dispatch.c -o "$DEST/desktop-dispatch.o"

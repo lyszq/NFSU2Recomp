@@ -57,7 +57,13 @@ HEAP_ALLOC_SUPPORTED_FLAGS = 0x09  # HEAP_NO_SERIALIZE | HEAP_ZERO_MEMORY
 CRITICAL_SECTION_SIZE = 24
 CRITICAL_SECTION_MAX_COUNT = 64
 CRITICAL_SECTION_MAX_RECURSION = 0x7FFFFFFF
+TEB_PROCESS_ID_OFFSET = 0x20
 TEB_THREAD_ID_OFFSET = 0x24
+SYSTEM_TIME_FILETIME_LOW = 0x927c8000
+SYSTEM_TIME_FILETIME_HIGH = 0x01c4c66e
+TICK_COUNT_DEFAULT = 1000
+PERF_COUNTER_DEFAULT_LOW = 1000000
+PERF_COUNTER_DEFAULT_HIGH = 0
 TEB_TLS_SLOTS_OFFSET = 0xE10
 TLS_SLOT_COUNT = 64
 TLS_SLOT_BYTES = TLS_SLOT_COUNT * 4
@@ -118,6 +124,10 @@ BOUNDARY_ARGUMENT_COUNTS = {
     "LCMapStringA": 6,
     "MultiByteToWideChar": 6,
     "SetUnhandledExceptionFilter": 1,
+    "GetSystemTimeAsFileTime": 1,
+    "GetCurrentProcessId": 0,
+    "GetTickCount": 0,
+    "QueryPerformanceCounter": 1,
 }
 CRITICAL_SECTION_IMPORTS = {
     "InitializeCriticalSection",
@@ -153,6 +163,10 @@ SUPPORTED_IMPORTS = {
     ("kernel32.dll", "HeapFree"),
     ("kernel32.dll", "HeapSize"),
     ("kernel32.dll", "SetUnhandledExceptionFilter"),
+    ("kernel32.dll", "GetSystemTimeAsFileTime"),
+    ("kernel32.dll", "GetCurrentProcessId"),
+    ("kernel32.dll", "GetTickCount"),
+    ("kernel32.dll", "QueryPerformanceCounter"),
 }
 ERROR_MOD_NOT_FOUND = 126
 
@@ -762,6 +776,213 @@ def _set_handle_count(engine: Any, registers: Any, unicorn_module: Any,
             "address": int(address),
             "size": size,
         }
+        return False
+
+
+def _get_system_time_as_file_time(engine: Any, registers: Any, unicorn_module: Any,
+                                  import_row: dict[str, Any],
+                                  mapped_ranges: list[tuple[int, int]],
+                                  state: dict[str, Any]) -> bool:
+    """Write 64-bit UTC FILETIME to pointer argument and return."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api: dict[str, Any] = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 1,
+    }
+    state["api_calls"].append(api)
+
+    def write_fault(address: int, size: int) -> None:
+        if not _range_has_permissions(engine, address, size,
+                                      unicorn_module.UC_PROT_WRITE, mapped_ranges):
+            raise _GuestPointerFault("write", address & 0xFFFFFFFF, size)
+
+    try:
+        if not _range_has_permissions(engine, esp, 8,
+                                      unicorn_module.UC_PROT_READ, mapped_ranges):
+            raise _GuestPointerFault("read", esp, 8)
+        return_address = _read_u32(engine, esp)
+        target_ptr = _read_u32(engine, esp + 4)
+        api.update(return_address=return_address, target_ptr=target_ptr,
+                   arguments=[target_ptr])
+        if target_ptr == 0:
+            raise _GuestPointerFault("write", 0, 8)
+        write_fault(target_ptr, 8)
+        _write_u32(engine, target_ptr, SYSTEM_TIME_FILETIME_LOW)
+        _write_u32(engine, target_ptr + 4, SYSTEM_TIME_FILETIME_HIGH)
+
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        api.update(outcome="success", esp_after=(esp + 8) & 0xFFFFFFFF)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
+def _get_current_process_id(engine: Any, registers: Any, unicorn_module: Any,
+                            import_row: dict[str, Any],
+                            mapped_ranges: list[tuple[int, int]],
+                            state: dict[str, Any]) -> bool:
+    """Read active guest TEB process ID and return it with x86 ABI."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api: dict[str, Any] = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 0,
+    }
+    state["api_calls"].append(api)
+
+    def read_fault(address: int, size: int) -> None:
+        if not _range_has_permissions(engine, address, size,
+                                      unicorn_module.UC_PROT_READ, mapped_ranges):
+            raise _GuestPointerFault("read", address & 0xFFFFFFFF, size)
+
+    try:
+        read_fault(esp, 4)
+        return_address = _read_u32(engine, esp)
+        teb = int(state.get("tls_current_teb", TEB_BASE))
+        process_id_address = teb + TEB_PROCESS_ID_OFFSET
+        if teb < 0 or teb > 0xFFFFFFFF or process_id_address > 0xFFFFFFFF:
+            raise _GuestPointerFault("read", min(max(process_id_address, 0), 0xFFFFFFFF), 4)
+        read_fault(process_id_address, 4)
+        process_id = _read_u32(engine, process_id_address)
+        api.update(return_address=return_address, teb=teb,
+                   process_id_address=process_id_address, process_id=process_id,
+                   arguments=[])
+        if process_id == 0:
+            api["outcome"] = "invalid_state"
+            api["state_error"] = "current_process_id_invalid"
+            state["status"] = "GUEST_STOP_API_STATE"
+            state["target"] = process_id_address & 0xFFFFFFFF
+            state["api_state_fault"] = {
+                "api": import_row["name"],
+                "address": process_id_address & 0xFFFFFFFF,
+                "reason": "current_process_id_invalid",
+            }
+            return False
+
+        engine.reg_write(registers.UC_X86_REG_EAX, process_id)
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 4)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        api.update(outcome="success", result=process_id,
+                   esp_after=(esp + 4) & 0xFFFFFFFF)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
+def _get_tick_count(engine: Any, registers: Any, unicorn_module: Any,
+                    import_row: dict[str, Any],
+                    mapped_ranges: list[tuple[int, int]],
+                    state: dict[str, Any]) -> bool:
+    """Return monotonic milliseconds count in EAX."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api: dict[str, Any] = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 0,
+    }
+    state["api_calls"].append(api)
+
+    try:
+        if not _range_has_permissions(engine, esp, 4,
+                                      unicorn_module.UC_PROT_READ, mapped_ranges):
+            raise _GuestPointerFault("read", esp, 4)
+        return_address = _read_u32(engine, esp)
+        api.update(return_address=return_address, arguments=[])
+        engine.reg_write(registers.UC_X86_REG_EAX, TICK_COUNT_DEFAULT)
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 4)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        api.update(outcome="success", result=TICK_COUNT_DEFAULT,
+                   esp_after=(esp + 4) & 0xFFFFFFFF)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
+def _query_performance_counter(engine: Any, registers: Any, unicorn_module: Any,
+                               import_row: dict[str, Any],
+                               mapped_ranges: list[tuple[int, int]],
+                               state: dict[str, Any]) -> bool:
+    """Write 64-bit performance counter value to pointer and return TRUE (1)."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api: dict[str, Any] = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 1,
+    }
+    state["api_calls"].append(api)
+
+    def write_fault(address: int, size: int) -> None:
+        if not _range_has_permissions(engine, address, size,
+                                      unicorn_module.UC_PROT_WRITE, mapped_ranges):
+            raise _GuestPointerFault("write", address & 0xFFFFFFFF, size)
+
+    try:
+        if not _range_has_permissions(engine, esp, 8,
+                                      unicorn_module.UC_PROT_READ, mapped_ranges):
+            raise _GuestPointerFault("read", esp, 8)
+        return_address = _read_u32(engine, esp)
+        target_ptr = _read_u32(engine, esp + 4)
+        api.update(return_address=return_address, target_ptr=target_ptr,
+                   arguments=[target_ptr])
+        if target_ptr == 0:
+            raise _GuestPointerFault("write", 0, 8)
+        write_fault(target_ptr, 8)
+        _write_u32(engine, target_ptr, PERF_COUNTER_DEFAULT_LOW)
+        _write_u32(engine, target_ptr + 4, PERF_COUNTER_DEFAULT_HIGH)
+
+        engine.reg_write(registers.UC_X86_REG_EAX, 1)  # TRUE
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        api.update(outcome="success", result=1,
+                   esp_after=(esp + 8) & 0xFFFFFFFF)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
         return False
 
 
@@ -2960,6 +3181,38 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
                                                mapped_ranges, state)
                 elif row["name"] == "HeapSize":
                     handled = _heap_size(engine, xr, uc, row, mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "GetSystemTimeAsFileTime":
+                    handled = _get_system_time_as_file_time(engine, xr, uc, row,
+                                                            mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "GetCurrentProcessId":
+                    handled = _get_current_process_id(engine, xr, uc, row,
+                                                      mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "GetTickCount":
+                    handled = _get_tick_count(engine, xr, uc, row,
+                                              mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "QueryPerformanceCounter":
+                    handled = _query_performance_counter(engine, xr, uc, row,
+                                                         mapped_ranges, state)
                     if handled or state["status"] is not None:
                         engine.emu_stop()
                         return True

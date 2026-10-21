@@ -62,8 +62,8 @@ targets:
       path: NFSU2iOS/Info.plist
       properties:
         CFBundleDisplayName: NFSU2 iOS
-        CFBundleShortVersionString: '0.11.0'
-        CFBundleVersion: '17'
+        CFBundleShortVersionString: '0.12.0'
+        CFBundleVersion: '18'
         LSRequiresIPhoneOS: true
         UIRequiresFullScreen: true
         UIFileSharingEnabled: true

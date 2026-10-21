@@ -23,18 +23,80 @@ static int handle_count_import(CPU *c,const GuestImport *import,uint32_t *fault)
     return 1;
 }
 static int identity_import(CPU *c,const GuestImport *import,uint32_t *fault) {
-    if (strcmp(import->name,"GetCurrentThreadId")) return 0;
+    int is_thread = !strcmp(import->name,"GetCurrentThreadId");
+    int is_process = !strcmp(import->name,"GetCurrentProcessId");
+    if (!is_thread && !is_process) return 0;
     const void *stack=guest_memory_pointer(c->esp,4,0);
     if (!stack) { *fault=c->esp; return -1; }
     uint32_t ret=read32(stack);
     if (!c->fs_base) { *fault=0; return -2; }
-    uint64_t at=(uint64_t)c->fs_base+0x24u;
+    uint64_t at=(uint64_t)c->fs_base+(is_process ? 0x20u : 0x24u);
     const void *identity=at<=UINT32_MAX ? guest_memory_pointer((uint32_t)at,4,0) : NULL;
     if (!identity) { *fault=at>UINT32_MAX ? UINT32_MAX : (uint32_t)at; return -1; }
     uint32_t id=read32(identity);
     if (!id) { *fault=(uint32_t)at; return -2; }
     c->eax=id; c->eip=ret; c->esp+=4u;
     return 1;
+}
+
+#define GUEST_FILETIME_LOW  0x927c8000u
+#define GUEST_FILETIME_HIGH 0x01c4c66eu
+#define GUEST_TICK_COUNT    1000u
+#define GUEST_PERF_COUNT    1000000ULL
+
+static int handle_time_import(CPU *c, const GuestImport *import, uint32_t *fault) {
+    int is_filetime = !strcmp(import->name, "GetSystemTimeAsFileTime");
+    int is_tick = !strcmp(import->name, "GetTickCount");
+    int is_perf = !strcmp(import->name, "QueryPerformanceCounter");
+    if (!is_filetime && !is_tick && !is_perf) return 0;
+
+    if (is_tick) {
+        if ((uint64_t)c->esp + 4ULL > 0x100000000ULL) { *fault = c->esp; return -1; }
+        const void *stack = guest_memory_pointer(c->esp, 4, 0);
+        if (!stack) { *fault = c->esp; return -1; }
+        uint32_t ret = read32(stack);
+        c->eax = GUEST_TICK_COUNT;
+        c->eip = ret;
+        c->esp += 4u;
+        return 1;
+    }
+
+    if ((uint64_t)c->esp + 8ULL > 0x100000000ULL) { *fault = c->esp; return -1; }
+    const uint8_t *stack = guest_memory_pointer(c->esp, 8, 0);
+    if (!stack) { *fault = c->esp; return -1; }
+    uint32_t ret = read32(stack);
+    uint32_t target_ptr = read32(stack + 4);
+
+    if (is_filetime) {
+        if (!target_ptr || (uint64_t)target_ptr + 8ULL > 0x100000000ULL) {
+            *fault = target_ptr;
+            return -1;
+        }
+        uint8_t *out = guest_memory_pointer(target_ptr, 8, 1);
+        if (!out) { *fault = target_ptr; return -1; }
+        write32(out, GUEST_FILETIME_LOW);
+        write32(out + 4, GUEST_FILETIME_HIGH);
+        c->eip = ret;
+        c->esp += 8u;
+        return 1;
+    }
+
+    if (is_perf) {
+        if (!target_ptr || (uint64_t)target_ptr + 8ULL > 0x100000000ULL) {
+            *fault = target_ptr;
+            return -1;
+        }
+        uint8_t *out = guest_memory_pointer(target_ptr, 8, 1);
+        if (!out) { *fault = target_ptr; return -1; }
+        write32(out, (uint32_t)(GUEST_PERF_COUNT & 0xFFFFFFFFu));
+        write32(out + 4, (uint32_t)(GUEST_PERF_COUNT >> 32));
+        c->eax = 1; /* TRUE */
+        c->eip = ret;
+        c->esp += 8u;
+        return 1;
+    }
+
+    return 0;
 }
 static int tls_import(CPU *c,const GuestImport *import,GuestWindows *windows,uint32_t *fault) {
     GuestTLSOperation op; unsigned nargs;
@@ -682,6 +744,8 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
         handled=handle_count_import(c,import,fault);
         if (handled) return handled;
         handled=identity_import(c,import,fault);
+        if (handled) return handled;
+        handled=handle_time_import(c,import,fault);
         if (handled) return handled;
         handled=guest_process_import(c,import,context ? &((GuestWindows *)context)->process : NULL,fault);
         if (handled) return handled;

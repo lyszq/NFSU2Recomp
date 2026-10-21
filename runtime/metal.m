@@ -4969,7 +4969,9 @@ void metal_run_main_loop(void){
         g_layer.framebufferOnly = NO;
         /* NOVSYNC=1: vsync'i kapat.  Yalnizca OLCUM icin -- kapaliyken
          * goruntu yirtilir, 1:1 sadakat bozulur. */
+#if !TARGET_OS_IPHONE
         if (ENVC("NOVSYNC")) g_layer.displaySyncEnabled = NO;
+#endif
 
         /* Yesil dugme tam ekrana gecsin.  Cizim yuzeyi oyunun istedigi
          * boyutta kaliyor; en-boy oranini KORUYARAK buyutulsun, yoksa
