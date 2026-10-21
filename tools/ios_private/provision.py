@@ -79,6 +79,8 @@ def main():
     parser.add_argument("--create", action="store_true", help="create a new PRIVATE control repository if absent")
     parser.add_argument("--exe", type=Path, help="upload only the authenticated EXE as a PRIVATE release asset")
     parser.add_argument("--dispatch", action="store_true", help="start the configured private workflow")
+    parser.add_argument("--mode", choices=["startup", "full"], default="startup",
+                        help="Explicit build lane; full links the complete legacy game runtime")
     parser.add_argument("--macos-runner", choices=["macos-15", "macos-26", "macos-15-intel"], default="macos-15",
                         help="standard macOS build host; the iOS output remains ARM64 on every host")
     args = parser.parse_args()
@@ -103,7 +105,8 @@ def main():
             "has_projects": False, "has_wiki": False})
         if not created["private"]: raise ValueError("private creation was not confirmed")
         client.private()
-    template = (ROOT / "tools/ios_private/ios-private.yml").read_text(encoding="utf-8")
+    template_name = "ios-full-runtime.yml" if args.mode == "full" else "ios-private.yml"
+    template = (ROOT / "tools/ios_private" / template_name).read_text(encoding="utf-8")
     if template.count("SOURCE_COMMIT_PLACEHOLDER") != 1:
         raise ValueError("invalid workflow template")
     workflow = template.replace("SOURCE_COMMIT_PLACEHOLDER", sha)
@@ -114,8 +117,11 @@ def main():
         "lifted C is generated on the runner and never committed.\n\n"
         f"Pinned public source: `{sha}`. Run the manual Actions workflow to build.\n"
         "Artifacts contain game-derived executable code and must remain private.\n"
-        "Unsigned IPA still requires signing. It tests actual lifted functions and a bounded "
-        "entry prefix with implemented guest API contracts; no game boot or gameplay.\n")
+        "Unsigned IPA still requires signing. " +
+        ("Full-runtime build lane: all generated shards and the real Metal/audio backends. "
+         "Compile/link evidence does not establish game boot or gameplay.\n" if args.mode == "full" else
+         "Startup diagnostic lane: actual lifted functions and a bounded entry prefix with "
+         "implemented guest API contracts; no game boot or gameplay.\n"))
     if blob is not None:
         client.private()
         try:
@@ -143,7 +149,7 @@ def main():
         client.api(f"/repos/{client.repository}/actions/workflows/ios-private.yml/dispatches",
                    "POST", body={"ref": branch, "inputs": {"macos_runner": args.macos_runner}})
     print(json.dumps({"repository": client.repository, "private": client.private()["private"],
-                      "source_sha": sha, "dispatched": args.dispatch, "macos_runner": args.macos_runner,
+                      "source_sha": sha, "mode": args.mode, "dispatched": args.dispatch, "macos_runner": args.macos_runner,
                       "url": f"https://github.com/{client.repository}/actions"}, indent=2))
 
 

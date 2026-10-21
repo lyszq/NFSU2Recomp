@@ -6,6 +6,7 @@
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
 #import <UIKit/UIKit.h>
+#import "../ios/NFSU2iOS/Native/NFSU2InputBridge.h"
 #else
 #import <Cocoa/Cocoa.h>
 #import <CoreServices/CoreServices.h>
@@ -24,6 +25,14 @@
 #import <Metal/Metal.h>
 #include "enhance.h"
 #include "perflog.h"
+#ifndef NFS_FULL_RUNTIME
+#define NFS_FULL_RUNTIME 0
+#endif
+
+#if NFS_FULL_RUNTIME
+extern void nfs_game_session_checkpoint(void);
+#endif
+
 /* Weak fallbacks if perflog.c is omitted */
 __attribute__((weak)) int g_perflog = 0;
 __attribute__((weak)) char g_pl_dir[900] = {0};
@@ -114,7 +123,9 @@ static _Atomic int      g_should_quit   = 0;
 /* --- fare durumu: on yuz fareyle geziliyor (DIMOUSESTATE2) --------------
  * DirectInput goreli hareket ister; mutlak konumu da GetCursorPos icin
  * saklıyoruz. */
+#if !TARGET_OS_IPHONE
 static _Atomic int g_mouse_x = 640, g_mouse_y = 360;
+#endif
 /* --- sunum geometrisi --------------------------------------------------
  * Cizim yuzeyi PIKSEL, pencere icerigi NOKTA cinsindendir; Retina'da bu
  * ikisi 2 kat farklidir.  Ikisini birbirine esit saymak iki ayri hataya
@@ -142,7 +153,9 @@ void metal_set_ui_aspect(float a){
 }
 __attribute__((weak)) void com_request_reset(void) {}
 static _Atomic int g_mouse_dx = 0, g_mouse_dy = 0, g_mouse_dz = 0;
+#if !TARGET_OS_IPHONE
 static _Atomic unsigned g_mouse_btn = 0;
+#endif
 
 void metal_mouse_add(int dx, int dy){                 /* sentetik hareket (test) */
     atomic_fetch_add(&g_mouse_dx, dx); atomic_fetch_add(&g_mouse_dy, dy); }
@@ -151,7 +164,23 @@ void metal_fill_mouse(unsigned char *dst, unsigned n){
     int dx = atomic_exchange(&g_mouse_dx, 0);
     int dy = atomic_exchange(&g_mouse_dy, 0);
     int dz = atomic_exchange(&g_mouse_dz, 0);
+#if TARGET_OS_IPHONE
+    int32_t x = 0, y = 0;
+    uint32_t flags = 0;
+    int available = nfsu2_input_get_cursor_snapshot(&x, &y, &flags) &&
+                    (flags & NFSU2_INPUT_CURSOR_FLAG_AVAILABLE) != 0;
+    static int32_t last_x, last_y;
+    static int last_valid;
+    if (available){
+        if (last_valid){ dx += x - last_x; dy += y - last_y; }
+        last_x = x; last_y = y; last_valid = 1;
+    } else {
+        last_valid = 0;
+    }
+    unsigned b = (available && (flags & NFSU2_INPUT_CURSOR_FLAG_DOWN)) ? 1u : 0u;
+#else
     unsigned b = atomic_load(&g_mouse_btn);
+#endif
     memcpy(dst + 0, &dx, 4);
     memcpy(dst + 4, &dy, 4);
     memcpy(dst + 8, &dz, 4);
@@ -164,8 +193,17 @@ void metal_get_cursor(int *x, int *y){
           int n2 = sscanf(e, "%d,%d@%d,%d,%d", &ax, &ay, &f2, &bx, &by);
           if (n2 == 5 && atomic_load(&g_frames_drawn) >= f2){ ax = bx; ay = by; }
           if (x) *x = ax; if (y) *y = ay; return; } }
+#if TARGET_OS_IPHONE
+    int32_t cx = 0, cy = 0;
+    uint32_t flags = 0;
+    int available = nfsu2_input_get_cursor_snapshot(&cx, &cy, &flags) &&
+                    (flags & NFSU2_INPUT_CURSOR_FLAG_AVAILABLE) != 0;
+    if (x) *x = available ? cx : 0;
+    if (y) *y = available ? cy : 0;
+#else
     if (x) *x = atomic_load(&g_mouse_x);
     if (y) *y = atomic_load(&g_mouse_y);
+#endif
 }
 /* Oyunun sandigi pencere boyutu (GetClientRect/GetWindowRect).  Oyun
  * GetCursorPos'u bu dikdortgene gore kendi arayuz uzayina olcekliyor;
@@ -4065,6 +4103,9 @@ void metal_clear_target_ex(unsigned argb, unsigned flags, float z){
 }
 
 void metal_present(void){
+#if NFS_FULL_RUNTIME
+    nfs_game_session_checkpoint();
+#endif
     if (!g_layer || !g_vbuf[0]) return;
     pthread_mutex_lock(&g_qlock);
     /* Onceki kare henuz ekrana konmadiysa BEKLE.  Beklemezsek guest bir

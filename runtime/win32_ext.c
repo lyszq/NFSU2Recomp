@@ -8,6 +8,15 @@
 #include <time.h>
 #include <sys/event.h>
 #include <sched.h>
+#include <TargetConditionals.h>
+
+#ifndef NFS_FULL_RUNTIME
+#define NFS_FULL_RUNTIME 0
+#endif
+
+#if NFS_FULL_RUNTIME
+extern void nfs_game_session_checkpoint(void);
+#endif
 
 void dispatch_indirect(CPU*,uint32_t);
 void mem_commit(uint32_t,uint32_t);
@@ -89,7 +98,12 @@ static void gil_gave(void){
         }
     }
 }
-void guest_lock(CPU *c){ pthread_mutex_lock(&g_guest); tl_cpu=c; g_cur_cpu=c; reg_cpu(c); gil_took(); }
+void guest_lock(CPU *c){
+#if NFS_FULL_RUNTIME
+    nfs_game_session_checkpoint();
+#endif
+    pthread_mutex_lock(&g_guest); tl_cpu=c; g_cur_cpu=c; reg_cpu(c); gil_took();
+}
 void guest_unlock(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
 static void guest_yield_begin(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
 static void guest_yield_end(void){ pthread_mutex_lock(&g_guest); g_cur_cpu = tl_cpu; gil_took(); }
@@ -262,6 +276,9 @@ void guest_fair_yield(void){
     if ((n & 0x7FFFu) == 0){
         struct timespec ts = {0, 50000L}; nanosleep(&ts, 0);
     }
+#if NFS_FULL_RUNTIME
+    nfs_game_session_checkpoint();
+#endif
     guest_yield_end();
 }
 
@@ -296,15 +313,31 @@ void mem_altstack_install(void);
  * (tests/boot.c) 1 GB veriliyordu ama oyunun CreateThread ile actigi isci
  * thread'leri `pthread_create(...,0,...)` ile macOS varsayilani 512 KB
  * aliyordu -> derin ozyinelemede HOST YIGIN TASMASI (SIGSEGV, guest alani
- * disinda bir adres).  Rezervasyon sanal adres alani; ancak kullanildikca
- * commit edilir. */
+ * disinda bir adres).  Masaustu 256 MB rezervasyon kullanir; iOS'ta her oyun
+ * thread'ine 16 MB baslangic butcesi verilir.  Bunlar host yiginlaridir,
+ * guest'in Windows yigin boyutundan ayri tutulur. */
 static int guest_pthread_create(pthread_t *th, void *(*fn)(void*), void *arg){
     pthread_attr_t at;
-    if (pthread_attr_init(&at) != 0) return pthread_create(th, 0, fn, arg);
-    pthread_attr_setstacksize(&at, 256ull*1024ull*1024ull);
-    int rc = pthread_create(th, &at, fn, arg);
+    int rc = pthread_attr_init(&at);
+#if TARGET_OS_IPHONE
+    const size_t stack_size = 16ull * 1024ull * 1024ull;
+    if (rc != 0) return rc;
+    rc = pthread_attr_setstacksize(&at, stack_size);
+    if (rc != 0){ pthread_attr_destroy(&at); return rc; }
+#else
+    const size_t stack_size = 256ull * 1024ull * 1024ull;
+    if (rc != 0) return pthread_create(th, 0, fn, arg);
+    rc = pthread_attr_setstacksize(&at, stack_size);
+    if (rc != 0){
+        pthread_attr_destroy(&at);
+        return pthread_create(th, 0, fn, arg);
+    }
+#endif
+    rc = pthread_create(th, &at, fn, arg);
     pthread_attr_destroy(&at);
+#if !TARGET_OS_IPHONE
     if (rc != 0) rc = pthread_create(th, 0, fn, arg);   /* son care */
+#endif
     return rc;
 }
 
@@ -895,7 +928,13 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
             if (!g_timer_running){
                 g_timer_running = 1;
                 pthread_t th2;
-                if (pthread_create(&th2,0,timer_thread_main,0)==0) pthread_detach(th2);
+#if TARGET_OS_IPHONE
+                /* Timer callbacks execute lifted guest functions too. */
+                int timer_rc = guest_pthread_create(&th2, timer_thread_main, 0);
+#else
+                int timer_rc = pthread_create(&th2, 0, timer_thread_main, 0);
+#endif
+                if (timer_rc == 0) pthread_detach(th2);
                 else g_timer_running = 0;
             }
             for (int i=0;i<MAXTIMER;i++){

@@ -2,6 +2,116 @@ import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
 
+#if NFS_FULL_RUNTIME
+struct ContentView: View {
+    @EnvironmentObject private var files: GameFileState
+    @State private var chooseExecutable = false
+    @State private var chooseGameFolder = false
+
+    var body: some View {
+        ZStack {
+            Color.black.ignoresSafeArea()
+            if files.isVerified && files.hasGameAssets {
+                GameMetalView()
+                    .environmentObject(files)
+            } else if files.isVerified {
+                VStack(spacing: 18) {
+                    Image(systemName: "folder.badge.plus")
+                        .font(.system(size: 42, weight: .bold))
+                        .foregroundStyle(.mint)
+                    Text("IMPORT GAME FOLDER")
+                        .font(.system(.title2, design: .monospaced, weight: .black))
+                        .foregroundStyle(.white)
+                    Text("Select the full game folder containing the same verified SPEED2.EXE and its asset directories. Files are copied into the app sandbox; the source folder is left untouched.")
+                        .font(.body)
+                        .foregroundStyle(.white.opacity(0.72))
+                        .multilineTextAlignment(.center)
+                    Button {
+                        chooseGameFolder = true
+                    } label: {
+                        Label(files.assetImportRunning ? "IMPORTING GAME DATA…" : "IMPORT GAME FOLDER",
+                              systemImage: files.assetImportRunning ? "hourglass" : "folder.badge.plus")
+                            .fontWeight(.bold)
+                            .frame(maxWidth: 360)
+                            .padding(12)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.mint)
+                    .disabled(files.assetImportRunning)
+                    if files.assetImportRunning { ProgressView().tint(.mint) }
+                    Text(files.assetImportMessage)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.78))
+                        .multilineTextAlignment(.center)
+                        .textSelection(.enabled)
+                        .frame(maxWidth: 560)
+                    Text("The app checks the folder executable against the saved build and copies only missing files. Asset completeness is not inferred from the file count.")
+                        .font(.footnote)
+                        .foregroundStyle(.white.opacity(0.55))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 560)
+                }
+                .padding(28)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(red: 0.045, green: 0.07, blue: 0.095))
+            } else {
+                VStack(spacing: 18) {
+                    Image(systemName: "flag.checkered")
+                        .font(.system(size: 44, weight: .bold))
+                        .foregroundStyle(.mint)
+                    Text("NFSU2 · FULL RUNTIME")
+                        .font(.system(.title2, design: .monospaced, weight: .black))
+                        .foregroundStyle(.white)
+                    Text("Select the supported SPEED2.EXE. The app authenticates and stores its private copy in Application Support before starting the guest runtime.")
+                        .font(.body)
+                        .foregroundStyle(.white.opacity(0.72))
+                        .multilineTextAlignment(.center)
+                    Button {
+                        chooseExecutable = true
+                    } label: {
+                        Label("SELECT SPEED2.EXE", systemImage: "doc.badge.plus")
+                            .fontWeight(.bold)
+                            .frame(maxWidth: 360)
+                            .padding(12)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.mint)
+                    Text(files.message)
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(files.isVerified ? .mint : .white.opacity(0.7))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: 520)
+                    Text("Game assets are resolved from the app sandbox game folder. Save data is written under Application Support/NFSU2/Saves. Starting the runtime does not confirm a visible game frame.")
+                        .font(.footnote)
+                        .foregroundStyle(.white.opacity(0.55))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 520)
+                }
+                .padding(28)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color(red: 0.045, green: 0.07, blue: 0.095))
+            }
+        }
+        .preferredColorScheme(.dark)
+        .fileImporter(isPresented: $chooseExecutable, allowedContentTypes: [.item]) { result in
+            switch result {
+            case .success(let url):
+                files.importExecutable(from: url)
+            case .failure(let error):
+                files.message = "File selection failed: \(error.localizedDescription)"
+            }
+        }
+        .fileImporter(isPresented: $chooseGameFolder, allowedContentTypes: [.folder]) { result in
+            switch result {
+            case .success(let url):
+                files.importGameAssets(from: url)
+            case .failure(let error):
+                files.assetImportMessage = "Asset folder selection failed: \(error.localizedDescription)"
+            }
+        }
+    }
+}
+#else
 struct ContentView: View {
     @EnvironmentObject private var files: GameFileState
     @Environment(\.isScrollEnabled) private var inheritedScrollEnabled
@@ -194,3 +304,4 @@ struct ContentView: View {
         }
     }
 }
+#endif

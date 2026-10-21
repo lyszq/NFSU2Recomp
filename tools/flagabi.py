@@ -65,8 +65,8 @@ if __name__ == '__main__':
     cikti = sys.argv[2] if len(sys.argv) > 2 else 'out/flagabi.json'
     t0 = time.time()
     sys.argv = sys.argv[:2]            # genall argv[2]=NSHARD bekliyor
-    import genall                      # discover_all: genall.EXE = sys.argv[1]
-    funcs = genall.discover_all()
+    import genall
+    funcs = genall.discover_all(EXE)
     print(f'{len(funcs)} fonksiyon ({time.time()-t0:.0f}s)')
     with mp.Pool(mp.cpu_count(), initializer=_init) as pool:
         G = dict(pool.map(ozet, funcs, chunksize=64))

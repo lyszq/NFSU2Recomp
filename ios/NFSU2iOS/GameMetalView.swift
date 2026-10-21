@@ -786,6 +786,15 @@ public final class NFSU2MetalRenderUIView: UIView {
     }
     
     private var displayLink: CADisplayLink?
+#if NFS_FULL_RUNTIME
+    private var executablePath: String?
+    private var assetRootPath: String?
+    private var saveRootPath: String?
+    private var sessionStartRequested = false
+    private var sessionStartAttempted = false
+    private var sessionStatusTimer: Timer?
+    private var sessionStatusHandler: ((Int32, String) -> Void)?
+#endif
     
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -799,8 +808,14 @@ public final class NFSU2MetalRenderUIView: UIView {
         mtl.contentsGravity = .resizeAspect
         mtl.contentsScale = UIScreen.main.scale
         
+#if NFS_FULL_RUNTIME
+        // The strong runtime owns this CAMetalLayer. Attach it on UIKit's
+        // thread before the guest creates any renderer resources.
+        metal_init_ios(Unmanaged.passUnretained(mtl).toOpaque())
+#else
         metal_init()
         metal_set_layer(Unmanaged.passUnretained(mtl).toOpaque())
+#endif
         startDisplayLink()
         setupNotificationObservers()
         setupPointerInteraction()
@@ -829,10 +844,16 @@ public final class NFSU2MetalRenderUIView: UIView {
         stopDisplayLink()
         nfsu2_input_clear_all()
         nfsu2_input_set_cursor_available(false)
+#if NFS_FULL_RUNTIME
+        nfs_game_session_set_active(0)
+#endif
     }
     
     @objc private func applicationWillEnterForeground() {
         startDisplayLink()
+#if NFS_FULL_RUNTIME
+        nfs_game_session_set_active(1)
+#endif
     }
     
     public override func layoutSubviews() {
@@ -848,6 +869,9 @@ public final class NFSU2MetalRenderUIView: UIView {
             var gh: UInt32 = 720
             metal_game_size(&gw, &gh)
             nfsu2_input_set_viewport(UInt32(bounds.width), UInt32(bounds.height), gw, gh)
+#if NFS_FULL_RUNTIME
+            startSessionIfReady()
+#endif
         }
     }
     
@@ -870,8 +894,90 @@ public final class NFSU2MetalRenderUIView: UIView {
     
     deinit {
         stopDisplayLink()
+#if NFS_FULL_RUNTIME
+        sessionStatusTimer?.invalidate()
+        // The guest/runtime is process-lifetime state. View teardown only
+        // releases input and presentation; it never unmaps live guest memory.
+        nfsu2_input_clear_all()
+        nfs_game_session_set_active(0)
+#endif
         NotificationCenter.default.removeObserver(self)
     }
+
+#if NFS_FULL_RUNTIME
+    func configureSession(executablePath: String?, assetRootPath: String?,
+                          saveRootPath: String?, startRequested: Bool,
+                          statusHandler: ((Int32, String) -> Void)?) {
+        self.executablePath = executablePath
+        self.assetRootPath = assetRootPath
+        self.saveRootPath = saveRootPath
+        self.sessionStartRequested = startRequested
+        self.sessionStatusHandler = statusHandler
+        if startRequested { startSessionIfReady() }
+    }
+
+    private func startSessionIfReady() {
+        guard sessionStartRequested, !sessionStartAttempted,
+              bounds.width > 0, bounds.height > 0 else { return }
+        guard let executablePath, let assetRootPath, let saveRootPath else {
+            sessionStartAttempted = true
+            sessionStatusHandler?(Int32(NFS_GAME_SESSION_FAILED),
+                "The verified executable or sandbox roots are unavailable.")
+            return
+        }
+        guard metal_available() != 0, metal_window_ready() != 0 else {
+            sessionStartAttempted = true
+            sessionStatusHandler?(Int32(NFS_GAME_SESSION_FAILED),
+                "The real Metal device or CAMetalLayer is not ready; the guest was not started.")
+            return
+        }
+
+        sessionStartAttempted = true
+        sessionStatusHandler?(Int32(NFS_GAME_SESSION_PREPARING),
+            "Authenticating SPEED2.EXE and preparing the full runtime…")
+        let timer = Timer(timeInterval: 0.75, repeats: true) { [weak self] _ in
+            self?.refreshSessionStatus()
+        }
+        sessionStatusTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+
+        GameFileState.runtimeQueue.async { [weak self] in
+            var resultBuffer = [CChar](repeating: 0, count: 512)
+            let result = executablePath.withCString { exe in
+                assetRootPath.withCString { assets in
+                    saveRootPath.withCString { saves in
+                        resultBuffer.withUnsafeMutableBufferPointer { buffer in
+                            nfs_game_session_start(exe, assets, saves,
+                                buffer.baseAddress, buffer.count)
+                        }
+                    }
+                }
+            }
+            let immediateMessage = String(cString: resultBuffer)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if result != 0 {
+                    self.sessionStatusHandler?(nfs_game_session_get_state(), immediateMessage)
+                }
+                self.refreshSessionStatus()
+            }
+        }
+    }
+
+    private func refreshSessionStatus() {
+        var buffer = [CChar](repeating: 0, count: 512)
+        let state = nfs_game_session_get_state()
+        buffer.withUnsafeMutableBufferPointer { ptr in
+            nfs_game_session_get_status(ptr.baseAddress, ptr.count)
+        }
+        let message = String(cString: buffer)
+        sessionStatusHandler?(state, message)
+        if state == Int32(NFS_GAME_SESSION_FAILED) || state == Int32(NFS_GAME_SESSION_EXITED) {
+            sessionStatusTimer?.invalidate()
+            sessionStatusTimer = nil
+        }
+    }
+#endif
 
 
 
@@ -927,21 +1033,57 @@ public final class NFSU2MetalRenderUIView: UIView {
 }
 
 public struct NFSU2MetalSurfaceView: UIViewRepresentable {
-    public init() {}
-    
-    public func makeUIView(context: Context) -> NFSU2MetalRenderUIView {
-        NFSU2MetalRenderUIView(frame: .zero)
+    private var executablePath: String?
+    private var assetRootPath: String?
+    private var saveRootPath: String?
+    private var startRequested: Bool
+    private var statusHandler: ((Int32, String) -> Void)?
+
+    public init(executablePath: String? = nil, assetRootPath: String? = nil,
+                saveRootPath: String? = nil, startRequested: Bool = false,
+                statusHandler: ((Int32, String) -> Void)? = nil) {
+        self.executablePath = executablePath
+        self.assetRootPath = assetRootPath
+        self.saveRootPath = saveRootPath
+        self.startRequested = startRequested
+        self.statusHandler = statusHandler
     }
     
-    public func updateUIView(_ uiView: NFSU2MetalRenderUIView, context: Context) {}
+    public func makeUIView(context: Context) -> NFSU2MetalRenderUIView {
+        let view = NFSU2MetalRenderUIView(frame: .zero)
+#if NFS_FULL_RUNTIME
+        view.configureSession(executablePath: executablePath,
+                              assetRootPath: assetRootPath,
+                              saveRootPath: saveRootPath,
+                              startRequested: startRequested,
+                              statusHandler: statusHandler)
+#endif
+        return view
+    }
+    
+    public func updateUIView(_ uiView: NFSU2MetalRenderUIView, context: Context) {
+#if NFS_FULL_RUNTIME
+        uiView.configureSession(executablePath: executablePath,
+                                assetRootPath: assetRootPath,
+                                saveRootPath: saveRootPath,
+                                startRequested: startRequested,
+                                statusHandler: statusHandler)
+#endif
+    }
 }
 
 // MARK: - GameMetalView (Metal Renderer + Dokunmatik Kontroller + GameController Entegrasyonu)
 
 public struct GameMetalView: View {
     @Environment(\.scenePhase) private var scenePhase
+    @EnvironmentObject private var files: GameFileState
     @StateObject private var controllerManager = GameControllerManager.shared
     @State private var showTouchOverlay: Bool = true
+#if NFS_FULL_RUNTIME
+    @State private var startRuntimeRequested = false
+    @State private var sessionState = Int32(NFS_GAME_SESSION_IDLE)
+    @State private var sessionStatus = "Game files imported. Start begins one persistent guest session."
+#endif
     
     // Kullanıcı kontrolcü bağlı olsa bile dokunmatiği zorla açabilir / kapatabilir
     @State private var userOverrideOverlay: Bool? = nil
@@ -950,34 +1092,118 @@ public struct GameMetalView: View {
     
     public var body: some View {
         ZStack {
-            // Arka plandaki Metal Görünümü (60-120 FPS native Metal render yüzeyi)
+#if NFS_FULL_RUNTIME
+            NFSU2MetalSurfaceView(
+                executablePath: files.executablePath,
+                assetRootPath: files.assetRootPath,
+                saveRootPath: files.saveRootPath,
+                startRequested: startRuntimeRequested,
+                statusHandler: { state, message in
+                    sessionState = state
+                    sessionStatus = message
+                })
+                .ignoresSafeArea()
+
+            if startRuntimeRequested {
+                OnScreenControlsOverlay(showControls: Binding(
+                    get: {
+                        if let overrideValue = userOverrideOverlay {
+                            return overrideValue
+                        }
+                        return !controllerManager.isControllerConnected
+                    },
+                    set: { newValue in
+                        userOverrideOverlay = newValue
+                    }
+                ))
+                VStack {
+                    HStack {
+                        Text(sessionStatus)
+                            .font(.system(.caption2, design: .monospaced, weight: .medium))
+                            .foregroundStyle(sessionState == Int32(NFS_GAME_SESSION_FAILED) ? .red : .white)
+                            .lineLimit(2)
+                            .textSelection(.enabled)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 7)
+                            .background(.black.opacity(0.66), in: RoundedRectangle(cornerRadius: 9))
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding(.top, 8)
+                .padding(.horizontal, 12)
+                .allowsHitTesting(false)
+            } else {
+                VStack(spacing: 12) {
+                    Text("FULL RUNTIME · GAME FILES IMPORTED")
+                        .font(.system(.headline, design: .monospaced, weight: .bold))
+                        .foregroundStyle(.white)
+                    Text("The saved executable is verified and game files are staged in the app sandbox. Asset completeness is not validated. Saves use a separate sandbox directory.")
+                        .font(.system(.footnote, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.75))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 520)
+                    Button {
+                        startRuntimeRequested = true
+                    } label: {
+                        Label("START FULL RUNTIME", systemImage: "play.fill")
+                            .fontWeight(.bold)
+                            .padding(.horizontal, 18)
+                            .padding(.vertical, 12)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(.mint)
+                    Text("Starting the guest does not confirm a visible game frame or playable race.")
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.65))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 520)
+                }
+                .padding(20)
+                .background(.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 16))
+                .padding(24)
+            }
+#else
             NFSU2MetalSurfaceView()
                 .ignoresSafeArea()
-            
-            // Üstteki Etkileşimli Kontrol Katmanı
+
             OnScreenControlsOverlay(showControls: Binding(
                 get: {
                     if let overrideValue = userOverrideOverlay {
                         return overrideValue
                     }
-                    // Kontrolcü bağlı ise dokunmatik kontroller otomatik gizlenir
                     return !controllerManager.isControllerConnected
                 },
                 set: { newValue in
                     userOverrideOverlay = newValue
                 }
             ))
+#endif
         }
         .onAppear {
             controllerManager.checkForExistingControllers()
+#if NFS_FULL_RUNTIME
+            nfs_game_session_set_active(1)
+#endif
         }
         .onDisappear {
             nfsu2_input_clear_all()
+#if NFS_FULL_RUNTIME
+            nfs_game_session_set_active(0)
+#endif
         }
         .onChange(of: scenePhase) { phase in
             if phase != .active {
                 // Uygulama arka plana geçtiğinde veya kesintiye uğradığında takılı tuşları sıfırla
                 nfsu2_input_clear_all()
+#if NFS_FULL_RUNTIME
+                nfsu2_input_set_cursor_available(false)
+                nfs_game_session_set_active(0)
+#endif
+            } else {
+#if NFS_FULL_RUNTIME
+                nfs_game_session_set_active(1)
+#endif
             }
         }
         .onChange(of: controllerManager.isControllerConnected) { connected in

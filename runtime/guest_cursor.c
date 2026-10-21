@@ -429,6 +429,11 @@ int guest_user32_show_cursor(CPU *c, const GuestImport *import, uint32_t *fault)
     return 1;
 }
 
+#ifndef NFSU2_LEGACY_METAL_INPUT
+#define NFSU2_LEGACY_METAL_INPUT 0
+#endif
+
+#if !NFSU2_LEGACY_METAL_INPUT
 void metal_get_cursor(int *x, int *y) {
     GuestCursorSnapshot snapshot = guest_cursor_get_snapshot();
     bool available = snapshot.position_valid &&
@@ -487,3 +492,4 @@ void metal_mouse_add(int dx, int dy) {
     g_cursor_state.mouse_dy = saturating_add_i32(g_cursor_state.mouse_dy, dy);
     pthread_mutex_unlock(&g_cursor_mutex);
 }
+#endif

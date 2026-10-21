@@ -7,6 +7,13 @@
  *
  * Bu dosyadaki hicbir sey terminalden calistirmayi degistirmez: tum yollar
  * once "paketten mi calisiyoruz" diye bakar, degilse hemen doner.        */
+#include <TargetConditionals.h>
+
+#if TARGET_OS_IPHONE
+/* AppKit's file picker, defaults and Finder logging are desktop host services.
+ * The UIKit game session owns iOS bundle discovery and sandbox save paths. */
+enum { NFSU2_BUNDLE_DESKTOP_HOST_SERVICES_ONLY = 1 };
+#else
 #import <Cocoa/Cocoa.h>
 #include <string.h>
 #include "enhance.h"
@@ -227,3 +234,4 @@ void app_no_game(void){
               "Oyun klasorunu (icinde SPEED2.EXE olan) uygulamanin yanina "
               "koyabilir ya da uygulamayi tekrar acip klasoru secebilirsin.");
 }
+#endif

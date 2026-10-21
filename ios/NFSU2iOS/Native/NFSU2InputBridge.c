@@ -107,9 +107,11 @@ void metal_fill_keyboard(unsigned char *dst, unsigned int n) {
  * runtime/com.c uyumluluğu: DirectInput hook'larının metal_fill_keyboard()
  * çağrısını yapabilmesi için metal_available() gereklidir.
  */
+#if !defined(NFS_FULL_RUNTIME)
 __attribute__((weak)) int metal_available(void) {
     return 1;
 }
+#endif
 
 void nfsu2_input_set_cursor(float host_x, float host_y, bool is_down) {
     guest_cursor_set_host_pos(host_x, host_y, is_down);

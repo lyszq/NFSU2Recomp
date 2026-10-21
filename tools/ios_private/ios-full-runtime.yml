@@ -1,0 +1,158 @@
+# TEMPLATE ONLY. Provision into the marked PRIVATE control repository.
+name: Private full runtime ARM64 iOS compile and link
+on:
+  workflow_dispatch:
+    inputs:
+      macos_runner:
+        description: macOS build host (output always ARM64 iOS)
+        type: choice
+        default: macos-15-intel
+        options: [macos-15, macos-26, macos-15-intel]
+permissions:
+  contents: read
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  SOURCE_SHA: SOURCE_COMMIT_PLACEHOLDER
+jobs:
+  native-reference-linux:
+    if: github.event.repository.private == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Require private repository and pinned public source
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git clone --filter=blob:none --no-checkout https://github.com/lyszq/NFSU2Recomp.git "$RUNNER_TEMP/source"
+          cd "$RUNNER_TEMP/source"
+          git fetch --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Native and independent contract tests
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/private-python"
+          "$RUNNER_TEMP/private-python/bin/pip" install -r tools/ios_private/requirements.txt
+          "$RUNNER_TEMP/private-python/bin/python" -m unittest discover -s tools/ios_private -p 'test_*.py'
+          bash tests/run_guest_tests.sh "$RUNNER_TEMP/guest-tests"
+
+      - name: Generate and verify actual lifted entry privately on Linux
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          gh release download private-input-v1 --repo "$GH_REPO" --pattern SPEED2.EXE --dir "$RUNNER_TEMP/private-input"
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/generate_probe.py --exe "$RUNNER_TEMP/private-input/SPEED2.EXE"
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/generate_startup.py --exe "$RUNNER_TEMP/private-input/SPEED2.EXE"
+          bash tools/ios_private/run_native_probe.sh "$RUNNER_TEMP/native-probe" "$RUNNER_TEMP/private-input/SPEED2.EXE" | tee "$RUNNER_TEMP/private-linux-evidence.txt"
+
+      - name: Upload private Linux diagnostics only
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSU2-private-linux-evidence
+          path: ${{ runner.temp }}/private-linux-evidence.txt
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Remove confidential Linux runner inputs and generated C
+        if: always()
+        working-directory: ${{ runner.temp }}
+        run: |
+          rm -f "$RUNNER_TEMP/private-input/SPEED2.EXE"
+          rm -f "$RUNNER_TEMP/source/gen/ios-private/lifted.c" "$RUNNER_TEMP/source/gen/ios-private/private_probe.c" "$RUNNER_TEMP/source/gen/ios-private/startup_lifted.c" "$RUNNER_TEMP/source/gen/ios-private/startup_probe.c"
+          rm -f "$RUNNER_TEMP/source/gen/ios-private/"startup_*.bin
+
+  full-runtime-ios:
+    if: github.event.repository.private == true
+    runs-on: ${{ inputs.macos_runner || 'macos-15-intel' }}
+    timeout-minutes: 90
+    steps:
+      - name: Require private repository and exact source pin
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git clone --filter=blob:none --no-checkout https://github.com/lyszq/NFSU2Recomp.git "$RUNNER_TEMP/source"
+          cd "$RUNNER_TEMP/source"
+          git fetch --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Host tools and unchanged contract tests
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          python3 -m venv "$RUNNER_TEMP/private-python"
+          "$RUNNER_TEMP/private-python/bin/pip" install -r tools/ios_private/requirements.txt
+          "$RUNNER_TEMP/private-python/bin/python" -m unittest discover -s tools/ios_private -p 'test_*.py'
+          bash tests/run_guest_tests.sh "$RUNNER_TEMP/guest-tests" | tee "$RUNNER_TEMP/contract-tests.txt"
+          brew install xcodegen
+      - name: Authenticate input and generate all 128 shards with import metadata
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          gh release download private-input-v1 --repo "$GH_REPO" --pattern SPEED2.EXE --dir "$RUNNER_TEMP/private-input"
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/generate_shards.py --exe "$RUNNER_TEMP/private-input/SPEED2.EXE" --shards 128
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/configure_project.py --mode all
+      - name: Compile and link the complete ARM64 iOS runtime
+        working-directory: ${{ runner.temp }}/source/ios
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project-private.yml
+          xcodebuild -project NFSU2iOS.xcodeproj -scheme NFSU2iOS -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -jobs 3 \
+            -derivedDataPath "$RUNNER_TEMP/FullDerivedData" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build \
+            > "$RUNNER_TEMP/full-build.log" 2>&1 || { tail -n 180 "$RUNNER_TEMP/full-build.log"; exit 1; }
+          tail -n 12 "$RUNNER_TEMP/full-build.log"
+      - name: Verify all shard objects and strong real backend linkage
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/FullDerivedData/Build/Products/Release-iphoneos/NFSU2iOS.app"
+          test "$(lipo -archs "$APP/NFSU2iOS")" = arm64
+          MAP="$RUNNER_TEMP/FullDerivedData/Build/Intermediates.noindex/NFSU2iOS.build/Release-iphoneos/NFSU2iOS.build/NFSU2iOS-LinkMap-normal-arm64.txt"
+          cp "$MAP" "$RUNNER_TEMP/full-runtime-link-map.txt"
+          xcrun nm -m "$APP/NFSU2iOS" > "$RUNNER_TEMP/full-runtime-nm.txt"
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/verify_full_link.py \
+            --map "$MAP" --nm "$RUNNER_TEMP/full-runtime-nm.txt" --binary "$APP/NFSU2iOS" \
+            --manifest gen/all/ios-full-manifest.json --source "$SOURCE_SHA" \
+            --out "$RUNNER_TEMP/full-runtime-verification.json"
+          cp gen/all/ios-full-manifest.json "$RUNNER_TEMP/full-runtime-provenance.json"
+          mkdir -p "$RUNNER_TEMP/full-ipa/Payload"
+          ditto "$APP" "$RUNNER_TEMP/full-ipa/Payload/NFSU2iOS.app"
+          (cd "$RUNNER_TEMP/full-ipa" && zip -qry "$RUNNER_TEMP/NFSU2iOS-full-runtime-unsigned.ipa" Payload)
+          shasum -a 256 "$RUNNER_TEMP/NFSU2iOS-full-runtime-unsigned.ipa" > "$RUNNER_TEMP/full-ipa-sha256.txt"
+      - name: Upload private compile diagnostics even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSU2-full-runtime-private-evidence
+          path: |
+            ${{ runner.temp }}/full-build.log
+            ${{ runner.temp }}/contract-tests.txt
+            ${{ runner.temp }}/full-runtime-link-map.txt
+            ${{ runner.temp }}/full-runtime-nm.txt
+            ${{ runner.temp }}/full-runtime-verification.json
+            ${{ runner.temp }}/full-runtime-provenance.json
+            ${{ runner.temp }}/full-ipa-sha256.txt
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Upload unsigned full runtime IPA privately
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSU2iOS-full-runtime-private-unsigned
+          path: ${{ runner.temp }}/NFSU2iOS-full-runtime-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove confidential runner inputs and generated code
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/private-input/SPEED2.EXE"
+          rm -rf "$RUNNER_TEMP/source/gen/all"
