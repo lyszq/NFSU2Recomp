@@ -85,9 +85,16 @@ void nfsu2_input_set_brake(float analog_val);    /* 0.0 .. 1.0 */
 /*
  * Fare / İmleç ve Dokunmatik Giriş Köprüsü (SwiftUI / UIKit -> C Çalışma Zamanı)
  */
+enum {
+    NFSU2_INPUT_CURSOR_FLAG_AVAILABLE = 1u << 0,
+    NFSU2_INPUT_CURSOR_FLAG_DOWN = 1u << 2,
+    NFSU2_INPUT_CURSOR_FLAG_SYNTHETIC = 1u << 3
+};
 void nfsu2_input_set_cursor(float host_x, float host_y, bool is_down);
 void nfsu2_input_set_cursor_available(bool available);
 bool nfsu2_input_get_cursor(int *x, int *y);
+/* Returns one coherent snapshot. False means no valid position with AVAILABLE set. */
+bool nfsu2_input_get_cursor_snapshot(int32_t *x, int32_t *y, uint32_t *flags);
 void nfsu2_input_set_viewport(uint32_t viewport_w, uint32_t viewport_h,
                                uint32_t game_w, uint32_t game_h);
 

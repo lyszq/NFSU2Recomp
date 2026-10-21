@@ -4,6 +4,7 @@
 #include "guest_bootstrap.h"
 #include "guest_memory.h"
 #include "guest_windows.h"
+#include "guest_cursor.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <stdio.h>
@@ -28,6 +29,7 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     CPU *c = &context;
     GuestExecutionResult result = {0};
     GuestWindows windows={.image_base=image->image_base};
+    int cursor_fixture_started = 0;
     int rc = guest_execution_bind_imports(image, nfs_startup_imports, nfs_startup_import_count);
     if (rc) goto failed;
     rc = guest_bootstrap_init(c, image);
@@ -42,7 +44,14 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         .depth_limit=64u, .timeout_ns=UINT64_C(2000000000), .import_handler=guest_windows_import,
         .import_context=&windows};
     PUSH32(0xdeadc0deu);
+    /* A declared per-thread test input, never a claim of live UIKit input.
+     * Host events continue to update the separate live cursor snapshot. */
+    if (guest_cursor_is_synthetic()) { rc = EBUSY; goto failed; }
+    guest_cursor_inject_synthetic(320, 180, GUEST_CURSOR_FLAG_AVAILABLE);
+    cursor_fixture_started = 1;
     rc = guest_execution_run(&config, c, image->entry_point, &result);
+    guest_cursor_clear_synthetic();
+    cursor_fixture_started = 0;
     if (rc) goto failed;
 #ifdef NFS_PRIVATE_TRACE
     nfs_private_trace_finish(image);
@@ -121,13 +130,14 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         "%" PRIu64 " instructions / %" PRIu64 " dispatch calls / %u registered functions | "
         "%" PRIu64 " implemented API calls / %u native critical sections / %u TLS keys | "
         "x86 trace + GPR/EFLAGS + image/TEB/stack/heap/process match | "
-        "leaf regression PASS | no JIT | no game boot",
+        "leaf regression PASS | cursor fixture (320,180) | no JIT | no game boot",
         result.ip, import->library, import->name, result.instructions, result.calls, nfs_startup_count,
         result.imports_handled,guest_critical_count(&windows.critical),guest_tls_count(&windows.tls));
     goto cleanup;
 failed:
     (void)snprintf(out, capacity, "FAIL | native entry setup/execution | error=%d", rc);
 cleanup:
+    if (cursor_fixture_started) guest_cursor_clear_synthetic();
     guest_dispatch_destroy(&table);
     {
         int cleanup_rc=guest_windows_cleanup(&windows);

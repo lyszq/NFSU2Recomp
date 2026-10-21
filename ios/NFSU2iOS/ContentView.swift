@@ -4,7 +4,9 @@ import UniformTypeIdentifiers
 
 struct ContentView: View {
     @EnvironmentObject private var files: GameFileState
+    @Environment(\.isScrollEnabled) private var inheritedScrollEnabled
     @State private var chooseExecutable = false
+    @State private var previewTouchActive = false
     @State private var smokeRunning = false
     @State private var smokePassed = false
     @State private var smokeOutput = "Not run yet. Tap RUN CPU + MEMORY TEST."
@@ -77,7 +79,7 @@ struct ContentView: View {
                         .tracking(1.1)
                         .foregroundStyle(.mint)
 
-                    MetalPreview()
+                    MetalPreview(previewTouchActive: $previewTouchActive)
                         .frame(height: max(190, min(geometry.size.height * 0.30, 320)))
                         .background(.black)
                         .clipShape(RoundedRectangle(cornerRadius: 16))
@@ -87,6 +89,8 @@ struct ContentView: View {
                                 .padding(12)
                                 .foregroundStyle(.white.opacity(0.85))
                         }
+
+                    ActivePreviewInputPanel()
 
                     HStack(spacing: 8) {
                         Image(systemName: "checkmark.circle.fill")
@@ -176,6 +180,7 @@ struct ContentView: View {
                 .frame(maxWidth: 800)
                 .frame(maxWidth: .infinity)
             }
+            .scrollDisabled(previewTouchActive || !inheritedScrollEnabled)
             .background(Color(red: 0.045, green: 0.07, blue: 0.095))
         }
         .preferredColorScheme(.dark)

@@ -6,6 +6,7 @@
 #include "guest_memory.h"
 #include "guest_process.h"
 #include "guest_windows.h"
+#include "guest_cursor.h"
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -88,6 +89,9 @@ void sub_0075bdc7(CPU *cpu) {
 }
 
 void sub_0075bcc7(CPU *cpu) {
+    GuestCursorSnapshot fixture = guest_cursor_get_snapshot();
+    if (!guest_cursor_is_synthetic() || fixture.coords.x != 320 ||
+        fixture.coords.y != 180 || !(fixture.flags & GUEST_CURSOR_FLAG_AVAILABLE)) abort();
     if (mode == MODE_DEPTH) guest_execution_call(cpu, SYN_NESTED);
 
     guest_execution_step(cpu, mode == MODE_TRACE ? SYN_STEP_ALT : SYN_STEP_A);
@@ -227,7 +231,15 @@ int main(int argc, char **argv) {
         .entry_point = SYN_ENTRY
     };
     char output[512] = {0};
+    guest_cursor_reset();
+    guest_cursor_set_host_pos(900.0f, 500.0f, true);
     rc = nfs_private_startup_probe(&image, output, sizeof output);
+    GuestCursorSnapshot live = guest_cursor_get_snapshot();
+    if (guest_cursor_is_synthetic() || live.coords.x != 900 || live.coords.y != 500 ||
+        !(live.flags & GUEST_CURSOR_FLAG_DOWN)) {
+        fprintf(stderr, "startup fixture leaked or mutated live cursor\n");
+        return 2;
+    }
     puts(output);
     int shutdown_rc = guest_memory_shutdown();
     if (shutdown_rc) {

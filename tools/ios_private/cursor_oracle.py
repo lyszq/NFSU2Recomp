@@ -7,7 +7,7 @@ from typing import Any
 
 CURSOR_IMPORT_LIBRARY = "user32.dll"
 CURSOR_IMPORT_NAME = "GetCursorPos"
-CURSOR_PROFILE = "headless_default_cursor"
+CURSOR_PROFILE = "deterministic_cursor_fixture_v1"
 IMPORT_BASE = 0xF0000000
 TEB_BASE = 0x00C00000
 LAST_ERROR_OFFSET = 0x34
@@ -95,8 +95,11 @@ def _cursor_query_import(engine: Any, registers: Any, unicorn_module: Any,
             return False
 
         last_error_address = teb + LAST_ERROR_OFFSET
-        if last_error_address > 0xFFFFFFFF or last_error_address + 4 > 0x100000000:
-            _memory_fault(state, "write", last_error_address & 0xFFFFFFFF, 4)
+        if last_error_address > 0xFFFFFFFF:
+            _memory_fault(state, "write", 0xFFFFFFFF, 4)
+            return False
+        if last_error_address + 4 > 0x100000000:
+            _memory_fault(state, "write", last_error_address, 4)
             return False
         if not _range_has_permissions(
                 engine, last_error_address, 4, unicorn_module.UC_PROT_WRITE,
@@ -137,7 +140,18 @@ def _cursor_query_import(engine: Any, registers: Any, unicorn_module: Any,
         _memory_fault(state, "write", lp_point, 8)
         return False
 
-    coords = state.get("cursor_coords", (0, 0))
+    # A valid POINT result requires an explicit display/input snapshot. Without
+    # one, leave the call unsupported instead of inventing a headless (0, 0).
+    # Preflight the output pointer first to preserve the native fault ordering.
+    coords = state.get("cursor_coords")
+    profile = state.get("cursor_profile")
+    if (state.get("cursor_available") is not True or
+            not isinstance(coords, (tuple, list)) or len(coords) != 2 or
+            any(type(value) is not int or value < -0x80000000 or
+                value > 0x7FFFFFFF for value in coords) or
+            profile != CURSOR_PROFILE):
+        return False
+
     engine.mem_write(lp_point, struct.pack("<ii", int(coords[0]), int(coords[1])))
 
     api = {
@@ -152,7 +166,7 @@ def _cursor_query_import(engine: Any, registers: Any, unicorn_module: Any,
         "arguments": [lp_point],
         "result": 1,
         "outcome": "success",
-        "profile": CURSOR_PROFILE,
+        "profile": profile,
         "esp_after": (esp + 8) & 0xFFFFFFFF,
     }
     state.setdefault("api_calls", []).append(api)

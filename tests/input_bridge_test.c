@@ -160,6 +160,55 @@ static void test_cursor_bridge(void) {
     printf("PASS: test_cursor_bridge\n");
 }
 
+static void test_cursor_snapshot_bridge(void) {
+    guest_cursor_reset();
+
+    int32_t x = -1, y = -1;
+    uint32_t flags = UINT32_MAX;
+    bool available = nfsu2_input_get_cursor_snapshot(&x, &y, &flags);
+    assert(!available);
+    assert((flags & GUEST_CURSOR_FLAG_AVAILABLE) == 0);
+    assert((flags & GUEST_CURSOR_FLAG_DOWN) == 0);
+
+    nfsu2_input_set_viewport(1280, 720, 1280, 720);
+    nfsu2_input_set_cursor(640.0f, 360.0f, true);
+    available = nfsu2_input_get_cursor_snapshot(&x, &y, &flags);
+    assert(available);
+    assert(x == 640 && y == 360);
+    assert((flags & GUEST_CURSOR_FLAG_AVAILABLE) != 0);
+    assert((flags & GUEST_CURSOR_FLAG_DOWN) != 0);
+    assert((flags & GUEST_CURSOR_FLAG_SYNTHETIC) == 0);
+
+    /* The deterministic 320,180 fixture is explicit and must not replace live state. */
+    const uint32_t fixture_flags = GUEST_CURSOR_FLAG_AVAILABLE |
+                                   GUEST_CURSOR_FLAG_DOWN |
+                                   GUEST_CURSOR_FLAG_SYNTHETIC;
+    guest_cursor_inject_synthetic(320, 180, fixture_flags);
+    available = nfsu2_input_get_cursor_snapshot(&x, &y, &flags);
+    assert(available);
+    assert(x == 320 && y == 180);
+    assert(flags == fixture_flags);
+
+    guest_cursor_inject_synthetic(320, 180, GUEST_CURSOR_FLAG_SYNTHETIC);
+    available = nfsu2_input_get_cursor_snapshot(&x, &y, &flags);
+    assert(!available);
+    assert(x == 320 && y == 180);
+    assert(flags == GUEST_CURSOR_FLAG_SYNTHETIC);
+
+    guest_cursor_clear_synthetic();
+    available = nfsu2_input_get_cursor_snapshot(&x, &y, &flags);
+    assert(available);
+    assert(x == 640 && y == 360);
+    assert((flags & GUEST_CURSOR_FLAG_DOWN) != 0);
+
+    nfsu2_input_set_cursor_available(false);
+    available = nfsu2_input_get_cursor_snapshot(&x, &y, &flags);
+    assert(!available);
+    assert((flags & GUEST_CURSOR_FLAG_AVAILABLE) == 0);
+    assert((flags & GUEST_CURSOR_FLAG_DOWN) == 0);
+    printf("PASS: test_cursor_snapshot_bridge\n");
+}
+
 static void test_metal_fill_mouse_bridge(void) {
     guest_cursor_reset();
     nfsu2_input_set_viewport(1280, 720, 1280, 720);
@@ -198,6 +247,7 @@ int main(void) {
     test_metal_fill_keyboard_compat();
     test_metal_available();
     test_cursor_bridge();
+    test_cursor_snapshot_bridge();
     test_metal_fill_mouse_bridge();
     printf("=== All NFSU2InputBridge Tests PASSED ===\n");
     return 0;

@@ -34,7 +34,7 @@ LIBS=(-lm)
 "$DEST/guest-locale-test"
 "$CC" "${FLAGS[@]}" runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_windows.c runtime/guest_cursor.c runtime/guest_registry.c runtime/guest_locale.c runtime/guest_heap.c runtime/guest_critical.c runtime/guest_tls.c runtime/guest_process.c runtime/guest_startup.c runtime/guest_error.c runtime/guest_stdio.c runtime/guest_memory.c tests/guest_windows_test.c -o "$DEST/guest-windows-test" "${LIBS[@]}"
 "$DEST/guest-windows-test"
-for API_TEST in processor_feature window_query cursor; do
+for API_TEST in processor_feature window_query cursor metrics; do
   "$CC" "${FLAGS[@]}" runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_windows.c runtime/guest_cursor.c runtime/guest_registry.c runtime/guest_locale.c runtime/guest_heap.c runtime/guest_critical.c runtime/guest_tls.c runtime/guest_process.c runtime/guest_startup.c runtime/guest_error.c runtime/guest_stdio.c runtime/guest_memory.c "tests/guest_${API_TEST}_test.c" -o "$DEST/guest-${API_TEST}-test" "${LIBS[@]}"
   "$DEST/guest-${API_TEST}-test"
 done

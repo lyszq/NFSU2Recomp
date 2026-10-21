@@ -71,9 +71,9 @@ def generate(exe):
                for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
     reference = run_startup_reference(exe, imports, diagnostic_directory=ROOT / "gen/ios-private")
     # Registry, CPU capability, cursor and window contracts advance
-    # the prefix to its GetSystemMetrics query. Native comparisons stay exact.
-    if (reference["import_name"] != "GetSystemMetrics" or reference["raw_instructions"] != 151595
-            or reference["calls"] != 7872 or reference["api_call_count"] != 586
+    # the explicit fixture prefix to its LoadIconA resource query. Native comparisons stay exact.
+    if (reference["import_name"] != "LoadIconA" or reference["raw_instructions"] != 206298
+            or reference["calls"] != 9511 or reference["api_call_count"] != 745
             or reference["critical_section_count"] != 14
             or reference["tls_slot_count"] != 1 or reference["tls_thread_count"] != 1):
         raise ValueError(f"unexpected independent x86 entry boundary: {reference['import_name']} {reference['instructions']}")
@@ -85,7 +85,7 @@ def generate(exe):
     seen = set()
     bodies, omitted = {}, []
     lifter = StartupLifter(str(exe), comments=False, trap=False)
-    while queue and len(bodies) < 600:
+    while queue and len(bodies) < 800:
         address = queue.popleft()
         if address in seen or address == LEAF:
             continue
@@ -111,7 +111,7 @@ def generate(exe):
     if ENTRY not in bodies or not all(a in bodies for a in [0x00760DA0, 0x0075C4D0]):
         raise ValueError("authentic entry prefix is not completely lifted")
     if any(address not in bodies and address != LEAF for address in observed):
-        raise ValueError("an executed startup function was not statically lifted")
+        raise ValueError("executed targets not lifted: " + ",".join(f"{a:08x}" for a in observed if a not in bodies and a != LEAF))
     output = ROOT / "gen/ios-private"
     if not (output / "manifest.json").is_file():
         raise ValueError("generate the leaf regression first")

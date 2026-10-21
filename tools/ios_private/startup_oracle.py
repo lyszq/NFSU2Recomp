@@ -95,6 +95,8 @@ BOUNDARY_ARGUMENT_COUNTS = {
     "GetClientRect": 2,
     "GetCursorPos": 1,
     "GetSystemMetrics": 1,
+    "LoadIconA": 2,
+    "LoadCursorA": 2,
     "GetStartupInfoA": 1,
     "GetStdHandle": 1,
     "GetFileType": 1,
@@ -149,6 +151,7 @@ SUPPORTED_IMPORTS = {
     ("user32.dll", "GetWindowRect"),
     ("user32.dll", "GetClientRect"),
     ("user32.dll", "GetCursorPos"),
+    ("user32.dll", "GetSystemMetrics"),
     ("kernel32.dll", "GetVersionExA"),
     ("kernel32.dll", "GetModuleHandleA"),
     ("kernel32.dll", "GetStartupInfoA"),
@@ -3239,6 +3242,9 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         "direct_calls": [],
         "indirect_jumps": [],
         "cpuid_calls": [],
+        "cursor_coords": (320, 180),
+        "cursor_available": True,
+        "cursor_profile": "deterministic_cursor_fixture_v1",
         "import": None,
         "api_calls": [],
         "boundary_call": None,
@@ -3275,6 +3281,13 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
                 elif row["name"] in ("GetWindowRect", "GetClientRect"):
                     from window_oracle import _window_query_import
                     handled = _window_query_import(engine, xr, uc, row, mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
+                elif row["name"] == "GetSystemMetrics":
+                    from metrics_oracle import apply_metrics
+                    handled = apply_metrics(engine, xr, uc, row, mapped_ranges, state)
                     if handled or state["status"] is not None:
                         engine.emu_stop()
                         return True
@@ -3781,7 +3794,7 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
     }
     result = {
         "schema_version": 1,
-        "reference": "Unicorn x86-32; authentic PE instructions with declared bounded KERNEL32 contracts",
+        "reference": "Unicorn x86-32; authentic PE instructions with declared API contracts and deterministic cursor fixture",
         "executable_size": len(blob),
         "executable_sha256": digest,
         "image_base": image_base,
@@ -3813,6 +3826,8 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         "unicorn_eip_at_stop": architectural_eip,
         "direct_calls": state["direct_calls"],
         "indirect_jumps": state["indirect_jumps"],
+        "cursor_profile": state["cursor_profile"],
+        "cursor_fixture": list(state["cursor_coords"]),
         "cpuid_profile": "upstream_static_x86_006d8",
         "cpuid_calls": state["cpuid_calls"],
         "image_hash_start": image_base,

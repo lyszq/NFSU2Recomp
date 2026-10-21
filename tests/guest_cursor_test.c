@@ -1,12 +1,10 @@
-/*
- * Unit tests for guest_cursor (coordinate scaling, thread-safe atomics, Win32 USER32 cursor imports)
- */
+/* Native regression tests for coherent live cursor state and explicit fixtures. */
 
 #include "guest_cursor.h"
 #include "guest_memory.h"
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #define STACK_ADDR 0x00100000u
@@ -26,311 +24,423 @@ static void init_cpu(CPU *c, uint32_t esp, uint32_t fs_base) {
     c->eip = 0x88888888u;
     c->fs_base = fs_base;
     eflags_set(c, 0x246u);
+    for (int i = 0; i < 8; i++) c->st[i] = (double)(i + 1) * 1.25;
+    c->top = 3;
+    c->fcw = 0x037fu;
+    c->fsw = 0x1200u;
+    for (int i = 0; i < 8; i++) c->mm[i] = UINT64_C(0x0102030405060708) + (uint64_t)i;
+    for (int i = 0; i < 8; i++) {
+        for (int j = 0; j < 16; j++) c->xmm[i].b[j] = (uint8_t)(i * 16 + j);
+    }
 }
 
-static void test_viewport_scaling(void) {
-    guest_cursor_reset();
+static void write_get_frame(uint32_t ret_ip, uint32_t point) {
+    uint8_t *stk = guest_memory_pointer(STACK_ADDR, 8, 1);
+    assert(stk != NULL);
+    memcpy(stk, &ret_ip, 4);
+    memcpy(stk + 4, &point, 4);
+}
 
-    /* 1:1 scaling */
+static void write_set_frame(uint32_t ret_ip, int32_t x, int32_t y) {
+    uint8_t *stk = guest_memory_pointer(STACK_ADDR, 12, 1);
+    assert(stk != NULL);
+    memcpy(stk, &ret_ip, 4);
+    memcpy(stk + 4, &x, 4);
+    memcpy(stk + 8, &y, 4);
+}
+
+static int32_t read_i32(const void *p) {
+    int32_t value;
+    memcpy(&value, p, sizeof(value));
+    return value;
+}
+
+static void test_initial_state_and_viewport(void) {
+    guest_cursor_reset();
+    GuestCursorSnapshot snapshot = guest_cursor_get_snapshot();
+    assert(!(snapshot.flags & GUEST_CURSOR_FLAG_AVAILABLE));
+    assert(!snapshot.position_valid);
+    assert(snapshot.flags & GUEST_CURSOR_FLAG_VISIBLE);
+
+    int32_t gx = -1;
+    int32_t gy = -1;
     guest_cursor_set_viewport(1280, 720, 1280, 720, GUEST_CURSOR_SCALE_FIT);
-    int32_t gx = 0, gy = 0;
     guest_cursor_host_to_game(640.0f, 360.0f, &gx, &gy);
     assert(gx == 640 && gy == 360);
 
-    /* 1920x1080 viewport with 640x480 (4:3) game:
-     * scale = min(1920/640, 1080/480) = min(3.0, 2.25) = 2.25
-     * pillarbox margins: gw*scale = 640*2.25 = 1440. offset_x = (1920 - 1440) / 2 = 240.
-     * offset_y = 0.
-     */
     guest_cursor_set_viewport(1920, 1080, 640, 480, GUEST_CURSOR_SCALE_FIT);
     guest_cursor_host_to_game(240.0f, 0.0f, &gx, &gy);
     assert(gx == 0 && gy == 0);
-
     guest_cursor_host_to_game(960.0f, 540.0f, &gx, &gy);
     assert(gx == 320 && gy == 240);
-
-    /* Out of bounds clamping */
     guest_cursor_host_to_game(50.0f, 540.0f, &gx, &gy);
-    assert(gx == 0); /* Left black bar clamps to 0 */
-
+    assert(gx == 0);
     guest_cursor_host_to_game(1900.0f, 540.0f, &gx, &gy);
-    assert(gx == 639); /* Right black bar clamps to 639 */
+    assert(gx == 639);
 
-    printf("PASS: test_viewport_scaling\n");
+    float hx = 0.0f;
+    float hy = 0.0f;
+    guest_cursor_game_to_host(320, 240, &hx, &hy);
+    assert(hx == 960.0f && hy == 540.0f);
+
+    /* Invalid dimensions do not partially replace the current viewport. */
+    guest_cursor_set_viewport(0, 10, 20, 30, GUEST_CURSOR_SCALE_STRETCH);
+    guest_cursor_host_to_game(960.0f, 540.0f, &gx, &gy);
+    assert(gx == 320 && gy == 240);
+    printf("PASS: test_initial_state_and_viewport\n");
 }
 
-static void test_host_ingress_and_synthetic(void) {
+static GuestCursorSnapshot g_worker_snapshot;
+
+static void *read_live_snapshot(void *unused) {
+    (void)unused;
+    g_worker_snapshot = guest_cursor_get_snapshot();
+    return NULL;
+}
+
+static void test_live_and_thread_local_synthetic_snapshot(void) {
     guest_cursor_reset();
     guest_cursor_set_viewport(1280, 720, 1280, 720, GUEST_CURSOR_SCALE_FIT);
-
     guest_cursor_set_host_pos(100.0f, 200.0f, true);
-    GuestCursorCoords coords = guest_cursor_get_coords();
-    assert(coords.x == 100 && coords.y == 200);
-    assert(guest_cursor_get_flags() & GUEST_CURSOR_FLAG_DOWN);
-    assert(guest_cursor_get_flags() & GUEST_CURSOR_FLAG_AVAILABLE);
 
-    /* Synthetic injection override */
-    guest_cursor_inject_synthetic(999, 888, GUEST_CURSOR_FLAG_AVAILABLE);
+    GuestCursorSnapshot live = guest_cursor_get_snapshot();
+    assert(live.position_valid);
+    assert(live.flags & GUEST_CURSOR_FLAG_AVAILABLE);
+    assert(live.flags & GUEST_CURSOR_FLAG_DOWN);
+    assert(live.coords.x == 100 && live.coords.y == 200);
+
+    const uint32_t fixture_flags = GUEST_CURSOR_FLAG_AVAILABLE | GUEST_CURSOR_FLAG_VISIBLE;
+    guest_cursor_inject_synthetic(999, 888, fixture_flags);
     assert(guest_cursor_is_synthetic());
-    coords = guest_cursor_get_coords();
-    assert(coords.x == 999 && coords.y == 888);
+    GuestCursorSnapshot fixture = guest_cursor_get_snapshot();
+    assert(fixture.position_valid);
+    assert(fixture.coords.x == 999 && fixture.coords.y == 888);
+    assert(fixture.flags == fixture_flags); /* No synthetic or live bits are added. */
 
-    /* Host ingress must be suppressed while synthetic is active */
+    /* The fixture belongs only to the injecting thread. */
+    pthread_t reader;
+    assert(pthread_create(&reader, NULL, read_live_snapshot, NULL) == 0);
+    assert(pthread_join(reader, NULL) == 0);
+    assert(g_worker_snapshot.position_valid);
+    assert(g_worker_snapshot.coords.x == 100 && g_worker_snapshot.coords.y == 200);
+    assert(g_worker_snapshot.flags & GUEST_CURSOR_FLAG_DOWN);
+
+    /* UI ingress remains live while this thread sees the fixture override. */
     guest_cursor_set_host_pos(50.0f, 50.0f, false);
-    coords = guest_cursor_get_coords();
-    assert(coords.x == 999 && coords.y == 888);
+    fixture = guest_cursor_get_snapshot();
+    assert(fixture.coords.x == 999 && fixture.coords.y == 888);
+    assert(fixture.flags == fixture_flags);
 
-    /* Clear synthetic */
     guest_cursor_clear_synthetic();
     assert(!guest_cursor_is_synthetic());
-    guest_cursor_set_host_pos(300.0f, 400.0f, false);
-    coords = guest_cursor_get_coords();
-    assert(coords.x == 300 && coords.y == 400);
+    live = guest_cursor_get_snapshot();
+    assert(live.position_valid);
+    assert(live.coords.x == 50 && live.coords.y == 50);
+    assert(live.flags & GUEST_CURSOR_FLAG_AVAILABLE);
+    assert(!(live.flags & GUEST_CURSOR_FLAG_DOWN));
 
-    printf("PASS: test_host_ingress_and_synthetic\n");
+    guest_cursor_set_available(false);
+    live = guest_cursor_get_snapshot();
+    assert(!(live.flags & GUEST_CURSOR_FLAG_AVAILABLE));
+    assert(!(live.flags & GUEST_CURSOR_FLAG_DOWN));
+    assert(!live.position_valid);
+    printf("PASS: test_live_and_thread_local_synthetic_snapshot\n");
 }
 
-static void test_win32_get_cursor_pos_success(void) {
+static void test_get_cursor_pos_unavailable_is_unsupported(void) {
     guest_cursor_reset();
-    guest_cursor_inject_synthetic(500, 300, GUEST_CURSOR_FLAG_AVAILABLE);
-
     CPU cpu;
     init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    write_get_frame(0x1234u, POINT_ADDR);
+    uint8_t *point = guest_memory_pointer(POINT_ADDR, 8, 1);
+    assert(point != NULL);
+    memset(point, 0xA5, 8);
+
+    GuestImport import = { .iat = 0, .library = "USER32.dll", .name = "GetCursorPos" };
+    uint32_t fault = 0xDEADBEEFu;
     CPU before = cpu;
+    uint8_t point_before[8];
+    memcpy(point_before, point, sizeof(point_before));
+    assert(guest_user32_get_cursor_pos(&cpu, &import, &fault) == 0);
+    assert(memcmp(&cpu, &before, sizeof(cpu)) == 0);
+    assert(memcmp(point, point_before, sizeof(point_before)) == 0);
+    assert(fault == 0xDEADBEEFu);
 
-    /* Push args on stack: return_ip (0x1234), lpPoint (POINT_ADDR) */
-    uint8_t *stk = guest_memory_pointer(STACK_ADDR, 8, 1);
-    assert(stk != NULL);
-    memcpy(stk, "\x34\x12\x00\x00", 4);
-    uint32_t pt_addr = POINT_ADDR;
-    memcpy(stk + 4, &pt_addr, 4);
-
-    /* Fill POINT_ADDR with canary */
-    uint8_t *pt = guest_memory_pointer(POINT_ADDR, 8, 1);
-    assert(pt != NULL);
-    memset(pt, 0xAA, 8);
-
-    GuestImport imp = { .iat = 0, .library = "USER32.dll", .name = "GetCursorPos" };
-    uint32_t fault = 0;
-    int rc = guest_user32_get_cursor_pos(&cpu, &imp, &fault);
-    assert(rc == 1);
-    assert(cpu.eax == 1); /* TRUE */
-    assert(cpu.eip == 0x00001234u);
-    assert(cpu.esp == STACK_ADDR + 8u); /* Callee cleaned 4 bytes + ret 4 = 8 */
-
-    /* Callee-saved registers intact */
-    assert(cpu.ebx == before.ebx);
-    assert(cpu.esi == before.esi);
-    assert(cpu.edi == before.edi);
-    assert(cpu.ebp == before.ebp);
-
-    /* Verify coordinates written to point */
-    int32_t rx = 0, ry = 0;
-    memcpy(&rx, pt, 4);
-    memcpy(&ry, pt + 4, 4);
-    assert(rx == 500 && ry == 300);
-
-    printf("PASS: test_win32_get_cursor_pos_success\n");
+    /* Availability alone does not invent a coordinate. */
+    guest_cursor_set_available(true);
+    before = cpu;
+    assert(guest_user32_get_cursor_pos(&cpu, &import, &fault) == 0);
+    assert(memcmp(&cpu, &before, sizeof(cpu)) == 0);
+    assert(memcmp(point, point_before, sizeof(point_before)) == 0);
+    assert(fault == 0xDEADBEEFu);
+    printf("PASS: test_get_cursor_pos_unavailable_is_unsupported\n");
 }
 
-static void test_win32_get_cursor_pos_null(void) {
+static void test_get_cursor_pos_live_and_fixture(void) {
     guest_cursor_reset();
-
     CPU cpu;
     init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
-    CPU before = cpu;
-
-    /* Push args: return_ip (0x1234), lpPoint = NULL (0) */
-    uint8_t *stk = guest_memory_pointer(STACK_ADDR, 8, 1);
-    assert(stk != NULL);
-    memcpy(stk, "\x34\x12\x00\x00", 4);
-    memset(stk + 4, 0, 4);
-
-    GuestImport imp = { .iat = 0, .library = "USER32.dll", .name = "GetCursorPos" };
+    write_get_frame(0x1234u, POINT_ADDR);
+    uint8_t *point = guest_memory_pointer(POINT_ADDR, 8, 1);
+    assert(point != NULL);
+    memset(point, 0xAA, 8);
+    GuestImport import = { .iat = 0, .library = "USER32.dll", .name = "GetCursorPos" };
     uint32_t fault = 0;
-    int rc = guest_user32_get_cursor_pos(&cpu, &imp, &fault);
-    assert(rc == 1);
-    assert(cpu.eax == 0); /* FALSE */
-    assert(cpu.eip == 0x00001234u);
-    assert(cpu.esp == STACK_ADDR + 8u);
-    assert(cpu.ebx == before.ebx);
 
-    /* Verify LastError set to 998 (ERROR_NOACCESS) at TEB+0x34 */
-    uint8_t *teb = guest_memory_pointer(TEB_ADDR + 0x34u, 4, 0);
+    guest_cursor_set_host_pos(500.0f, 300.0f, false);
+    CPU before = cpu;
+    assert(guest_user32_get_cursor_pos(&cpu, &import, &fault) == 1);
+    CPU expected = before;
+    expected.eax = 1;
+    expected.eip = 0x1234u;
+    expected.esp += 8u;
+    assert(memcmp(&cpu, &expected, sizeof(cpu)) == 0);
+    assert(read_i32(point) == 500 && read_i32(point + 4) == 300);
+
+    guest_cursor_inject_synthetic(321, 123, GUEST_CURSOR_FLAG_AVAILABLE);
+    write_get_frame(0x5678u, POINT_ADDR);
+    memset(point, 0xCC, 8);
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    assert(guest_user32_get_cursor_pos(&cpu, &import, &fault) == 1);
+    expected = before;
+    expected.eax = 1;
+    expected.eip = 0x5678u;
+    expected.esp += 8u;
+    assert(memcmp(&cpu, &expected, sizeof(cpu)) == 0);
+    assert(read_i32(point) == 321 && read_i32(point + 4) == 123);
+
+    guest_cursor_clear_synthetic();
+    write_get_frame(0x9ABCu, POINT_ADDR);
+    memset(point, 0xDD, 8);
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    assert(guest_user32_get_cursor_pos(&cpu, &import, &fault) == 1);
+    expected = before;
+    expected.eax = 1;
+    expected.eip = 0x9ABCu;
+    expected.esp += 8u;
+    assert(memcmp(&cpu, &expected, sizeof(cpu)) == 0);
+    assert(read_i32(point) == 500 && read_i32(point + 4) == 300);
+    printf("PASS: test_get_cursor_pos_live_and_fixture\n");
+}
+
+static void test_get_cursor_pos_null_pointer(void) {
+    guest_cursor_reset();
+    CPU cpu;
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    write_get_frame(0x1234u, 0);
+
+    GuestImport import = { .iat = 0, .library = "USER32.dll", .name = "GetCursorPos" };
+    uint32_t fault = 0;
+    CPU before = cpu;
+    assert(guest_user32_get_cursor_pos(&cpu, &import, &fault) == 1);
+    CPU expected = before;
+    expected.eax = 0;
+    expected.eip = 0x1234u;
+    expected.esp += 8u;
+    assert(memcmp(&cpu, &expected, sizeof(cpu)) == 0);
+
+    const uint8_t *teb = guest_memory_pointer(TEB_ADDR + 0x34u, 4, 0);
     assert(teb != NULL);
-    uint32_t err = 0;
-    memcpy(&err, teb, 4);
-    assert(err == 998u);
-
-    printf("PASS: test_win32_get_cursor_pos_null\n");
+    uint32_t error_code = 0;
+    memcpy(&error_code, teb, 4);
+    assert(error_code == 998u);
+    printf("PASS: test_get_cursor_pos_null_pointer\n");
 }
 
-static void test_win32_set_and_show_cursor(void) {
+static void test_set_and_show_cursor(void) {
     guest_cursor_reset();
-
     CPU cpu;
     init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    GuestImport set_import = { .iat = 0, .library = "USER32.dll", .name = "SetCursorPos" };
+    uint32_t fault = 0xF00DF00Du;
+    write_set_frame(0x3456u, 150, 250);
 
-    /* SetCursorPos(150, 250) */
-    uint8_t *stk = guest_memory_pointer(STACK_ADDR, 12, 1);
+    CPU before = cpu;
+    assert(guest_user32_set_cursor_pos(&cpu, &set_import, &fault) == 0);
+    assert(memcmp(&cpu, &before, sizeof(cpu)) == 0);
+    assert(fault == 0xF00DF00Du);
+    assert(!guest_cursor_get_snapshot().position_valid);
+
+    /* An explicit available fixture can satisfy the call without touching live state. */
+    guest_cursor_inject_synthetic(7, 9, GUEST_CURSOR_FLAG_AVAILABLE);
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    write_set_frame(0x4567u, 30, 40);
+    before = cpu;
+    assert(guest_user32_set_cursor_pos(&cpu, &set_import, &fault) == 1);
+    CPU expected = before;
+    expected.eax = 1;
+    expected.eip = 0x4567u;
+    expected.esp += 12u;
+    assert(memcmp(&cpu, &expected, sizeof(cpu)) == 0);
+    GuestCursorSnapshot fixture = guest_cursor_get_snapshot();
+    assert(fixture.coords.x == 30 && fixture.coords.y == 40);
+    guest_cursor_clear_synthetic();
+    assert(!guest_cursor_get_snapshot().position_valid);
+
+    /* A real host position establishes live availability before SetCursorPos. */
+    guest_cursor_set_host_pos(10.0f, 20.0f, false);
+    write_set_frame(0x3456u, 150, 250);
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    assert(guest_user32_set_cursor_pos(&cpu, &set_import, &fault) == 1);
+    expected = before;
+    expected.eax = 1;
+    expected.eip = 0x3456u;
+    expected.esp += 12u;
+    assert(memcmp(&cpu, &expected, sizeof(cpu)) == 0);
+    GuestCursorSnapshot snapshot = guest_cursor_get_snapshot();
+    assert(snapshot.position_valid && (snapshot.flags & GUEST_CURSOR_FLAG_AVAILABLE));
+    assert(snapshot.coords.x == 150 && snapshot.coords.y == 250);
+
+    GuestImport show_import = { .iat = 0, .library = "USER32.dll", .name = "ShowCursor" };
+    uint8_t *stk = guest_memory_pointer(cpu.esp, 8, 1);
     assert(stk != NULL);
-    memcpy(stk, "\x56\x34\x00\x00", 4); /* ret */
-    int32_t x = 150, y = 250;
-    memcpy(stk + 4, &x, 4);
-    memcpy(stk + 8, &y, 4);
+    uint32_t ret_ip = 0x5678u;
+    uint32_t show = 1;
+    memcpy(stk, &ret_ip, 4);
+    memcpy(stk + 4, &show, 4);
+    before = cpu;
+    assert(guest_user32_show_cursor(&cpu, &show_import, &fault) == 1);
+    expected = before;
+    expected.eax = 1;
+    expected.eip = ret_ip;
+    expected.esp += 8u;
+    assert(memcmp(&cpu, &expected, sizeof(cpu)) == 0);
+    assert(guest_cursor_get_flags() & GUEST_CURSOR_FLAG_VISIBLE);
 
-    GuestImport imp_set = { .iat = 0, .library = "USER32.dll", .name = "SetCursorPos" };
-    uint32_t fault = 0;
-    int rc = guest_user32_set_cursor_pos(&cpu, &imp_set, &fault);
-    assert(rc == 1);
-    assert(cpu.eax == 1);
-    assert(cpu.esp == STACK_ADDR + 12u);
-    GuestCursorCoords c = guest_cursor_get_coords();
-    assert(c.x == 150 && c.y == 250);
-
-    /* ShowCursor(TRUE) */
     stk = guest_memory_pointer(cpu.esp, 8, 1);
     assert(stk != NULL);
-    memcpy(stk, "\x78\x56\x00\x00", 4);
-    uint32_t bshow = 1;
-    memcpy(stk + 4, &bshow, 4);
+    ret_ip = 0x789Au;
+    show = 0;
+    memcpy(stk, &ret_ip, 4);
+    memcpy(stk + 4, &show, 4);
+    before = cpu;
+    assert(guest_user32_show_cursor(&cpu, &show_import, &fault) == 1);
+    expected = before;
+    expected.eax = 0;
+    expected.eip = ret_ip;
+    expected.esp += 8u;
+    assert(memcmp(&cpu, &expected, sizeof(cpu)) == 0);
+    assert(guest_cursor_get_flags() & GUEST_CURSOR_FLAG_VISIBLE);
+    assert(guest_cursor_get_display_count() == 0);
 
-    GuestImport imp_show = { .iat = 0, .library = "USER32.dll", .name = "ShowCursor" };
-    rc = guest_user32_show_cursor(&cpu, &imp_show, &fault);
-    assert(rc == 1);
-    assert((int32_t)cpu.eax == 1); /* Count incremented from 0 to 1 */
-
-    /* ShowCursor(FALSE) */
+    /* ShowCursor inside a fixture must not alter the live display state. */
+    GuestCursorSnapshot live_before_fixture = guest_cursor_get_snapshot();
+    guest_cursor_inject_synthetic(320, 180, GUEST_CURSOR_FLAG_AVAILABLE);
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
     stk = guest_memory_pointer(cpu.esp, 8, 1);
     assert(stk != NULL);
-    memcpy(stk, "\x90\x78\x00\x00", 4);
-    bshow = 0;
-    memcpy(stk + 4, &bshow, 4);
-    rc = guest_user32_show_cursor(&cpu, &imp_show, &fault);
-    assert(rc == 1);
-    assert((int32_t)cpu.eax == 0); /* Count decremented to 0 */
+    ret_ip = 0x1357u;
+    show = 0;
+    memcpy(stk, &ret_ip, 4);
+    memcpy(stk + 4, &show, 4);
+    assert(guest_user32_show_cursor(&cpu, &show_import, &fault) == 1);
+    assert((int32_t)cpu.eax == -1);
+    assert(guest_cursor_get_display_count() == -1);
+    assert(!(guest_cursor_get_flags() & GUEST_CURSOR_FLAG_VISIBLE));
 
-    printf("PASS: test_win32_set_and_show_cursor\n");
+    stk = guest_memory_pointer(cpu.esp, 8, 1);
+    assert(stk != NULL);
+    ret_ip = 0x2468u;
+    show = 1;
+    memcpy(stk, &ret_ip, 4);
+    memcpy(stk + 4, &show, 4);
+    assert(guest_user32_show_cursor(&cpu, &show_import, &fault) == 1);
+    assert((int32_t)cpu.eax == 0);
+    assert(guest_cursor_get_display_count() == 0);
+    assert(guest_cursor_get_flags() & GUEST_CURSOR_FLAG_VISIBLE);
+    guest_cursor_clear_synthetic();
+    GuestCursorSnapshot live_after_fixture = guest_cursor_get_snapshot();
+    assert(live_after_fixture.flags == live_before_fixture.flags);
+    assert(live_after_fixture.position_valid == live_before_fixture.position_valid);
+    assert(guest_cursor_get_display_count() == 0);
+    printf("PASS: test_set_and_show_cursor\n");
 }
 
-static void test_metal_fill_mouse(void) {
+static void test_mouse_state_sizes_and_guards(void) {
     guest_cursor_reset();
     guest_cursor_set_viewport(1280, 720, 1280, 720, GUEST_CURSOR_SCALE_FIT);
 
-    /* 1. Initial coordinate snapshot: establishes base coordinates without delta */
+    unsigned char buffer[24];
     guest_cursor_set_host_pos(100.0f, 100.0f, false);
-    unsigned char buf[20];
-    memset(buf, 0xAA, sizeof(buf));
-    metal_fill_mouse(buf, 20);
-
-    int32_t dx = 0, dy = 0, dz = 0;
-    memcpy(&dx, buf + 0, 4);
-    memcpy(&dy, buf + 4, 4);
-    memcpy(&dz, buf + 8, 4);
-    assert(dx == 0);
-    assert(dy == 0);
-    assert(dz == 0);
-    assert(buf[12] == 0x00); /* Button 0 UP */
-    for (int i = 1; i < 8; i++) {
-        assert(buf[12 + i] == 0x00);
-    }
-
-    /* 2. Cursor movement with touch / primary button pressed */
     guest_cursor_set_host_pos(125.0f, 140.0f, true);
-    memset(buf, 0, sizeof(buf));
-    metal_fill_mouse(buf, 20);
-    memcpy(&dx, buf + 0, 4);
-    memcpy(&dy, buf + 4, 4);
-    memcpy(&dz, buf + 8, 4);
-    assert(dx == 25);
-    assert(dy == 40);
-    assert(dz == 0);
-    assert(buf[12] == 0x80); /* Button 0 DOWN (0x80) */
-    for (int i = 1; i < 8; i++) {
-        assert(buf[12 + i] == 0x00);
-    }
+    memset(buffer, 0xA5, sizeof(buffer));
+    unsigned char canary[24];
+    memcpy(canary, buffer, sizeof(canary));
+    metal_fill_mouse(buffer, 15);
+    assert(memcmp(buffer, canary, sizeof(buffer)) == 0);
+    metal_fill_mouse(buffer, 17);
+    assert(memcmp(buffer, canary, sizeof(buffer)) == 0);
+    metal_fill_mouse(buffer, 19);
+    assert(memcmp(buffer, canary, sizeof(buffer)) == 0);
 
-    /* 3. Consecutive query: deltas must be reset to 0, button state maintained */
-    memset(buf, 0xFF, sizeof(buf));
-    metal_fill_mouse(buf, 20);
-    memcpy(&dx, buf + 0, 4);
-    memcpy(&dy, buf + 4, 4);
-    memcpy(&dz, buf + 8, 4);
-    assert(dx == 0);
-    assert(dy == 0);
-    assert(dz == 0);
-    assert(buf[12] == 0x80); /* Still DOWN */
-    for (int i = 1; i < 8; i++) {
-        assert(buf[12 + i] == 0x00);
-    }
+    metal_fill_mouse(buffer, 16);
+    assert(read_i32(buffer) == 25);
+    assert(read_i32(buffer + 4) == 40);
+    assert(read_i32(buffer + 8) == 0);
+    assert(buffer[12] == 0x80);
+    assert(buffer[13] == 0 && buffer[14] == 0 && buffer[15] == 0);
+    assert(buffer[16] == 0xA5 && buffer[23] == 0xA5); /* exact 16-byte write */
 
-    /* 4. Multiple incremental movements accumulate deltas before query */
-    guest_cursor_set_host_pos(135.0f, 150.0f, true); /* +10, +10 */
-    guest_cursor_set_host_pos(130.0f, 160.0f, true); /* -5,  +10 -> net: +5, +20 */
-    memset(buf, 0, sizeof(buf));
-    metal_fill_mouse(buf, 20);
-    memcpy(&dx, buf + 0, 4);
-    memcpy(&dy, buf + 4, 4);
-    assert(dx == 5);
-    assert(dy == 20);
-    assert(buf[12] == 0x80);
+    /* The previous short calls did not consume this relative movement. */
+    guest_cursor_set_host_pos(135.0f, 150.0f, true);
+    guest_cursor_set_host_pos(130.0f, 160.0f, true);
+    memset(buffer, 0xA5, sizeof(buffer));
+    metal_fill_mouse(buffer, 20);
+    assert(read_i32(buffer) == 5);
+    assert(read_i32(buffer + 4) == 20);
+    assert(read_i32(buffer + 8) == 0);
+    assert(buffer[12] == 0x80);
+    for (int i = 13; i < 20; i++) assert(buffer[i] == 0);
+    assert(buffer[20] == 0xA5 && buffer[23] == 0xA5); /* trailing guard */
 
-    /* 5. Button release */
-    guest_cursor_set_host_pos(130.0f, 160.0f, false);
-    memset(buf, 0, sizeof(buf));
-    metal_fill_mouse(buf, 20);
-    memcpy(&dx, buf + 0, 4);
-    memcpy(&dy, buf + 4, 4);
-    assert(dx == 0);
-    assert(dy == 0);
-    assert(buf[12] == 0x00); /* Button 0 UP */
+    /* Fixture mouse reads use isolated deltas and preserve pending live motion. */
+    guest_cursor_set_host_pos(150.0f, 170.0f, true); /* Live delta +20,+10. */
+    guest_cursor_inject_synthetic(320, 180,
+        GUEST_CURSOR_FLAG_AVAILABLE | GUEST_CURSOR_FLAG_DOWN | GUEST_CURSOR_FLAG_VISIBLE);
+    metal_mouse_add(3, -4); /* Synthetic deltas are local to this fixture/thread. */
+    memset(buffer, 0xA5, sizeof(buffer));
+    metal_fill_mouse(buffer, 20);
+    assert(read_i32(buffer) == 3 && read_i32(buffer + 4) == -4);
+    assert(buffer[12] == 0x80);
+    guest_cursor_clear_synthetic();
+    memset(buffer, 0xA5, sizeof(buffer));
+    metal_fill_mouse(buffer, 20);
+    assert(read_i32(buffer) == 20 && read_i32(buffer + 4) == 10);
+    assert(buffer[12] == 0x80);
 
-    /* 6. Synthetic delta injection via metal_mouse_add */
+    guest_cursor_set_available(false);
+    memset(buffer, 0xA5, sizeof(buffer));
+    metal_fill_mouse(buffer, 20);
+    assert(buffer[12] == 0); /* cancellation releases button 0 */
+    assert(buffer[13] == 0 && buffer[19] == 0);
+
     metal_mouse_add(12, -8);
-    memset(buf, 0, sizeof(buf));
-    metal_fill_mouse(buf, 20);
-    memcpy(&dx, buf + 0, 4);
-    memcpy(&dy, buf + 4, 4);
-    assert(dx == 12);
-    assert(dy == -8);
-
-    /* 7. Buffer guard: n < 20 must do nothing and preserve accumulated deltas */
-    guest_cursor_set_host_pos(150.0f, 180.0f, true); /* +20, +20 */
-    memset(buf, 0xCC, sizeof(buf));
-    metal_fill_mouse(buf, 19);
-    for (int i = 0; i < 20; i++) {
-        assert(buf[i] == 0xCC);
-    }
-    metal_fill_mouse(buf, 20);
-    memcpy(&dx, buf + 0, 4);
-    memcpy(&dy, buf + 4, 4);
-    assert(dx == 20);
-    assert(dy == 20);
-    assert(buf[12] == 0x80);
-
-    printf("PASS: test_metal_fill_mouse\n");
+    memset(buffer, 0xA5, sizeof(buffer));
+    metal_fill_mouse(buffer, 24);
+    assert(read_i32(buffer) == 12 && read_i32(buffer + 4) == -8);
+    assert(buffer[20] == 0xA5 && buffer[23] == 0xA5);
+    printf("PASS: test_mouse_state_sizes_and_guards\n");
 }
 
 int main(void) {
     printf("=== Running guest_cursor Native Tests ===\n");
-    int rc = guest_memory_init();
-    assert(rc == 0);
+    assert(guest_memory_init() == 0);
+    assert(guest_memory_commit(STACK_ADDR, 0x10000u) == 0);
+    assert(guest_memory_commit(TEB_ADDR, 0x10000u) == 0);
+    assert(guest_memory_commit(POINT_ADDR, 0x10000u) == 0);
 
-    rc = guest_memory_commit(STACK_ADDR, 0x10000u);
-    assert(rc == 0);
-    rc = guest_memory_commit(TEB_ADDR, 0x10000u);
-    assert(rc == 0);
-    rc = guest_memory_commit(POINT_ADDR, 0x10000u);
-    assert(rc == 0);
+    test_initial_state_and_viewport();
+    test_live_and_thread_local_synthetic_snapshot();
+    test_get_cursor_pos_unavailable_is_unsupported();
+    test_get_cursor_pos_live_and_fixture();
+    test_get_cursor_pos_null_pointer();
+    test_set_and_show_cursor();
+    test_mouse_state_sizes_and_guards();
 
-    test_viewport_scaling();
-    test_host_ingress_and_synthetic();
-    test_win32_get_cursor_pos_success();
-    test_win32_get_cursor_pos_null();
-    test_win32_set_and_show_cursor();
-    test_metal_fill_mouse();
-
-    guest_memory_shutdown();
+    assert(guest_memory_shutdown() == 0);
     printf("=== All guest_cursor Native Tests PASSED ===\n");
     return 0;
 }

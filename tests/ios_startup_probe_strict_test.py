@@ -148,6 +148,8 @@ def compile_case(directory: Path, name: str, base: dict[str, str],
         str(ROOT / "runtime/guest_memory.c"),
         str(ROOT / "runtime/guest_process.c"),
         str(ROOT / "runtime/guest_heap.c"),
+        str(ROOT / "runtime/guest_cursor.c"),
+        "-lm",
         "-o", str(executable),
     ]
     subprocess.run(command, cwd=ROOT, check=True)

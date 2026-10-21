@@ -120,10 +120,19 @@ void nfsu2_input_set_cursor_available(bool available) {
 }
 
 bool nfsu2_input_get_cursor(int *x, int *y) {
-    GuestCursorCoords coords = guest_cursor_get_coords();
-    if (x) *x = coords.x;
-    if (y) *y = coords.y;
-    return (guest_cursor_get_flags() & GUEST_CURSOR_FLAG_AVAILABLE) != 0;
+    GuestCursorSnapshot snapshot = guest_cursor_get_snapshot();
+    if (x) *x = snapshot.coords.x;
+    if (y) *y = snapshot.coords.y;
+    return (snapshot.flags & GUEST_CURSOR_FLAG_AVAILABLE) != 0;
+}
+
+bool nfsu2_input_get_cursor_snapshot(int32_t *x, int32_t *y, uint32_t *flags) {
+    GuestCursorSnapshot snapshot = guest_cursor_get_snapshot();
+    if (x) *x = snapshot.coords.x;
+    if (y) *y = snapshot.coords.y;
+    if (flags) *flags = snapshot.flags;
+    return snapshot.position_valid &&
+           (snapshot.flags & GUEST_CURSOR_FLAG_AVAILABLE) != 0;
 }
 
 void nfsu2_input_set_viewport(uint32_t viewport_w, uint32_t viewport_h,
