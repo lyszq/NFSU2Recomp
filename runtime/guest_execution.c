@@ -13,6 +13,8 @@ typedef struct Execution {
     jmp_buf escape;
     uint64_t started;
     uint32_t depth;
+    uint32_t tail_target;
+    int tail_pending;
 } Execution;
 static _Thread_local Execution *active;
 
@@ -47,9 +49,8 @@ int guest_execution_bind_imports(const GuestPEImage *image, const GuestImport *i
     }
     return 0;
 }
-void guest_execution_call(CPU *cpu, uint32_t target) {
-    if (!active || cpu != active->cpu) abort();
-    active->result.calls++;
+static GuestFunction resolve_target(CPU *cpu, uint32_t target, int *completed) {
+    *completed = 0;
     if (target >= GUEST_IMPORT_BASE) {
         uint32_t index = target - GUEST_IMPORT_BASE;
         if (index < active->config.import_count) {
@@ -60,7 +61,11 @@ void guest_execution_call(CPU *cpu, uint32_t target) {
                     active->config.import_context, &fault);
                 if (handled == -1) stop(GUEST_STOP_MEMORY, fault);
                 if (handled < -1) stop(GUEST_STOP_API_STATE, fault);
-                if (handled > 0) { active->result.imports_handled++; return; }
+                if (handled > 0) {
+                    active->result.imports_handled++;
+                    *completed = 1;
+                    return NULL;
+                }
             }
             stop(GUEST_STOP_IMPORT, target);
         }
@@ -68,12 +73,43 @@ void guest_execution_call(CPU *cpu, uint32_t target) {
     }
     GuestFunction function = guest_dispatch_lookup(active->config.dispatch, target);
     if (!function) stop(GUEST_STOP_UNRESOLVED, target);
+    return function;
+}
+
+static void dispatch_call_chain(CPU *cpu, uint32_t target) {
+    int completed = 0;
+    GuestFunction function = resolve_target(cpu, target, &completed);
+    if (completed) return;
     if (active->depth >= active->config.depth_limit) stop(GUEST_STOP_DEPTH, target);
     active->depth++;
     if (active->depth > active->result.maximum_depth)
         active->result.maximum_depth = active->depth;
-    function(cpu);
+    for (;;) {
+        active->tail_pending = 0;
+        function(cpu);
+        if (!active->tail_pending) break;
+        target = active->tail_target;
+        active->tail_pending = 0;
+        function = resolve_target(cpu, target, &completed);
+        if (completed) break;
+    }
     active->depth--;
+}
+
+void guest_execution_call(CPU *cpu, uint32_t target) {
+    if (!active || cpu != active->cpu) abort();
+    active->result.calls++;
+    dispatch_call_chain(cpu, target);
+}
+
+void guest_execution_tail(CPU *cpu, uint32_t target) {
+    if (!active || cpu != active->cpu) abort();
+    /* A generated JMP/branch is terminal in its current function. A second
+     * transfer before that function returns means the generated control flow
+     * violated this contract. */
+    if (active->tail_pending) abort();
+    active->tail_target = target;
+    active->tail_pending = 1;
 }
 void guest_execution_step(CPU *cpu, uint32_t ip) {
     if (!active || cpu != active->cpu) abort();

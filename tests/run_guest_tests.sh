@@ -9,6 +9,8 @@ FLAGS=(-O2 -std=gnu11 -Wall -Wextra -Werror -Iruntime -fno-strict-aliasing -pthr
 "$DEST/guest-dispatch-test"
 "$CC" "${FLAGS[@]}" runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_bootstrap.c   runtime/guest_memory.c tests/guest_execution_test.c -o "$DEST/guest-execution-test"
 "$DEST/guest-execution-test"
+"$CC" "${FLAGS[@]}" runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_memory.c tests/guest_execution_tail_test.c -o "$DEST/guest-execution-tail-test"
+"$DEST/guest-execution-tail-test"
 "$CC" "${FLAGS[@]}" runtime/guest_memory.c runtime/guest_heap.c tests/guest_heap_test.c -o "$DEST/guest-heap-test"
 "$DEST/guest-heap-test"
 "$CC" "${FLAGS[@]}" runtime/guest_memory.c runtime/guest_critical.c tests/guest_critical_test.c -o "$DEST/guest-critical-test"
@@ -52,3 +54,4 @@ if [[ "$(uname -s)" == Darwin ]]; then
     tests/guest_memory_desktop_test.c -o "$DEST/guest-memory-desktop-test"
   "$DEST/guest-memory-desktop-test"
 fi
+CC="$CC" python3 tests/ios_startup_probe_strict_test.py "$DEST"

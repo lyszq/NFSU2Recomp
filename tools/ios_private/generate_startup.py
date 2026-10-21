@@ -15,22 +15,18 @@ LEAF = 0x0048B1E0
 SHA256 = "8f6a9ae2c4cfa01181d2fd755d99c6f4b7103f60273908ea1de1e719dfe2a297"
 
 
-def generate(exe):
-    sys.path.insert(0, str(ROOT / "out" / "private-deps"))
-    sys.path.insert(0, str(ROOT / "tools"))
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    import pefile
-    from lift import Lifter, Unsupported
-    from startup_oracle import run_startup_reference
-    blob = exe.read_bytes()
-    if len(blob) != 4788224 or hashlib.sha256(blob).hexdigest() != SHA256:
-        raise ValueError("unsupported executable")
-    os.environ["FLAGOPT"] = "0"
-    os.environ["RETEIP"] = "1"
-    os.environ.pop("FLAGABI", None)
-    os.environ.pop("X87OPT", None)
+def observed_startup_targets(reference):
+    """CALL entries and dynamic JMP entries, never invented dispatch stubs."""
+    transfers = reference["direct_calls"] + reference["indirect_jumps"]
+    return list(dict.fromkeys(event["target"] for event in transfers))
 
+
+def startup_lifter_class(Lifter, Unsupported):
+    """Create the bounded lifter without opening a proprietary input."""
     class StartupLifter(Lifter):
+        def tail_dispatch(self, expression):
+            return f"guest_execution_tail(c, {expression}); return;"
+
         def discover(self, entry, maxins=512):
             blocks, calls = super().discover(entry, maxins=maxins)
             if len(blocks) > 256 or sum(len(b) for b in blocks.values()) > 2048:
@@ -48,12 +44,31 @@ def generate(exe):
                 return [f'guest_execution_unsupported(c,0x{instruction.address:x}u,"unchecked bulk operation");']
             return lines
 
+    return StartupLifter
+
+
+def generate(exe):
+    sys.path.insert(0, str(ROOT / "out" / "private-deps"))
+    sys.path.insert(0, str(ROOT / "tools"))
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import pefile
+    from lift import Lifter, Unsupported
+    from startup_oracle import run_startup_reference
+    blob = exe.read_bytes()
+    if len(blob) != 4788224 or hashlib.sha256(blob).hexdigest() != SHA256:
+        raise ValueError("unsupported executable")
+    os.environ["FLAGOPT"] = "0"
+    os.environ["RETEIP"] = "1"
+    os.environ.pop("FLAGABI", None)
+    os.environ.pop("X87OPT", None)
+    StartupLifter = startup_lifter_class(Lifter, Unsupported)
+
     pe = pefile.PE(data=blob)
     imports = [{"iat": entry.address, "library": descriptor.dll.decode("ascii"),
                 "name": entry.name.decode("ascii") if entry.name else f"#{entry.ordinal}"}
                for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
     reference = run_startup_reference(exe, imports)
-    if (reference["import_name"] != "RegOpenKeyA" or reference["instructions"] != 129062
+    if (reference["import_name"] != "RegOpenKeyA" or reference["raw_instructions"] != 129062
             or reference["calls"] != 6781 or reference["api_call_count"] != 558
             or reference["critical_section_count"] != 14
             or reference["tls_slot_count"] != 1 or reference["tls_thread_count"] != 1):
@@ -61,7 +76,7 @@ def generate(exe):
     # Prioritize the authentic observed startup path within the bounded static
     # graph. This changes generation order, never the guest instructions or API
     # outcomes. Missing/unliftable executed functions must fail generation.
-    observed = list(dict.fromkeys(call["target"] for call in reference["direct_calls"]))
+    observed = observed_startup_targets(reference)
     queue = collections.deque([ENTRY] + observed)
     seen = set()
     bodies, omitted = {}, []

@@ -40,7 +40,7 @@ jobs:
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/private-python"
           "$RUNNER_TEMP/private-python/bin/pip" install -r tools/ios_private/requirements.txt
-          "$RUNNER_TEMP/private-python/bin/python" -m unittest discover -s tools/ios_private -p test_oracle_contracts.py
+          "$RUNNER_TEMP/private-python/bin/python" -m unittest discover -s tools/ios_private -p 'test_*.py'
           bash tests/run_guest_tests.sh "$RUNNER_TEMP/guest-tests"
 
       - name: Generate and verify actual lifted entry privately on Linux
@@ -91,7 +91,7 @@ jobs:
           set -euo pipefail
           python3 -m venv "$RUNNER_TEMP/private-python"
           "$RUNNER_TEMP/private-python/bin/pip" install -r tools/ios_private/requirements.txt
-          "$RUNNER_TEMP/private-python/bin/python" -m unittest discover -s tools/ios_private -p test_oracle_contracts.py
+          "$RUNNER_TEMP/private-python/bin/python" -m unittest discover -s tools/ios_private -p 'test_*.py'
           bash tests/run_guest_tests.sh "$RUNNER_TEMP/guest-tests"
           brew install xcodegen
 

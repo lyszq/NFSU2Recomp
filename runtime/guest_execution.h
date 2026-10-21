@@ -45,6 +45,10 @@ int guest_execution_bind_imports(const GuestPEImage *image, const GuestImport *i
 int guest_execution_run(const GuestExecutionConfig *config, CPU *cpu, uint32_t entry,
                          GuestExecutionResult *result);
 void guest_execution_call(CPU *cpu, uint32_t target);
+/* Records an x86 tail transfer. Generated code must return immediately after
+ * this call; the enclosing dispatch loop runs the target at the same guest
+ * call depth and without pushing a synthetic return address. */
+void guest_execution_tail(CPU *cpu, uint32_t target);
 void guest_execution_step(CPU *cpu, uint32_t ip);
 void guest_execution_unsupported(CPU *cpu, uint32_t ip, const char *mnemonic);
 void *guest_execution_pointer(uint32_t address, size_t size);

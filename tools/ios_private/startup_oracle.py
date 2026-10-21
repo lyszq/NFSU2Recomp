@@ -2999,6 +2999,19 @@ def _register_id(registers: Any, name: str) -> int:
     return mapping[name]
 
 
+def _is_rep_continuation(state: dict, address: int, mnemonic: str) -> bool:
+    """Unicorn reports REP micro-iterations, including the final ECX=0 hook.
+
+    The native step hook records the architectural instruction once. Only
+    consecutive callbacks at the same REP IP are coalesced; all original x86
+    iterations still execute, and branching back starts a new instruction.
+    """
+    repeated = mnemonic.split()[0] in ("rep", "repe", "repz", "repne", "repnz")
+    continuation = repeated and state.get("rep_ip") == address
+    state["rep_ip"] = address if repeated else None
+    return continuation
+
+
 def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
     """Run the exact PE entry until its first unimplemented import thunk.
 
@@ -3128,7 +3141,10 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "depth": 1,
         "maximum_depth": 1,
         "trace_hash": FNV64_OFFSET,
+        "raw_instructions": 0,
+        "raw_trace_hash": FNV64_OFFSET,
         "direct_calls": [],
+        "indirect_jumps": [],
         "import": None,
         "api_calls": [],
         "boundary_call": None,
@@ -3414,11 +3430,6 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
             # Match runtime/cpu.h eflags_get() by clearing bit 21 (ID flag)
             flags = uc_engine.reg_read(xr.UC_X86_REG_EFLAGS)
             uc_engine.reg_write(xr.UC_X86_REG_EFLAGS, (flags & EFLAGS_MASK) | 0x202)
-        if state["instructions"] >= INSTRUCTION_BUDGET:
-            state["status"] = "GUEST_STOP_BUDGET"
-            state["target"] = address
-            engine.emu_stop()
-            return
         try:
             instruction = next(md.disasm(bytes(uc_engine.mem_read(address, min(size, 15))), address), None)
         except Exception:
@@ -3429,12 +3440,23 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
             engine.emu_stop()
             return
 
+        state["raw_instructions"] += 1
+        state["raw_trace_hash"] = ((state["raw_trace_hash"] ^ address) * FNV64_PRIME) & FNV64_MASK
+        if _is_rep_continuation(state, address, instruction.mnemonic):
+            return
+        if state["instructions"] >= INSTRUCTION_BUDGET:
+            state["status"] = "GUEST_STOP_BUDGET"
+            state["target"] = address
+            engine.emu_stop()
+            return
         state["last_ip"] = int(address) & 0xFFFFFFFF
         state["instructions"] += 1
         state["trace_hash"] = ((state["trace_hash"] ^ state["last_ip"]) * FNV64_PRIME) & FNV64_MASK
 
-        if instruction.mnemonic == "call" and instruction.operands:
-            state["calls"] += 1
+        if instruction.mnemonic in ("call", "jmp") and instruction.operands:
+            is_call = instruction.mnemonic == "call"
+            if is_call:
+                state["calls"] += 1
             operand = instruction.operands[0]
             target = None
             if operand.type == X86_OP_IMM:
@@ -3461,9 +3483,16 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
                     engine.emu_stop()
                     return
             if target is not None and target < IMPORT_BASE and IMAGE_BASE <= target < IMAGE_BASE + image_size:
-                state["direct_calls"].append({"ip": int(address), "target": target})
-                state["depth"] += 1
-                state["maximum_depth"] = max(state["maximum_depth"], state["depth"])
+                event = {"ip": int(address), "target": target}
+                if is_call:
+                    state["direct_calls"].append(event)
+                    state["depth"] += 1
+                    state["maximum_depth"] = max(state["maximum_depth"], state["depth"])
+                elif operand.type != X86_OP_IMM and event not in state["indirect_jumps"]:
+                    # Direct in-image jumps are already local CFG edges. Dynamic
+                    # jumps need separately registered entries, without a CALL
+                    # count/depth increment or a synthetic return frame.
+                    state["indirect_jumps"].append(event)
             elif target is not None and target >= IMPORT_BASE:
                 # The actual CALL executes after this hook and pushes its return
                 # address. The code hook at the tagged destination stops before
@@ -3639,9 +3668,12 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "calls": int(state["calls"]),
         "maximum_depth": int(state["maximum_depth"]),
         "trace_hash": int(state["trace_hash"]),
+        "raw_instructions": int(state["raw_instructions"]),
+        "raw_trace_hash": int(state["raw_trace_hash"]),
         "cpu": cpu_state,
         "unicorn_eip_at_stop": architectural_eip,
         "direct_calls": state["direct_calls"],
+        "indirect_jumps": state["indirect_jumps"],
         "image_hash_start": image_base,
         "image_hash_size": image_size,
         "image_hash64": _fnv1a64(image_state),

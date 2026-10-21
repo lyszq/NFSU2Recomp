@@ -1569,6 +1569,10 @@ class Lifter:
 
         raise Unsupported(m)
 
+    def tail_dispatch(self, expression):
+        """Transfer an existing guest frame; platforms may trampoline it."""
+        return f"dispatch_indirect(c, {expression}); return;"
+
     # ---------- fonksiyon -> C ----------
     def lift(self, entry):
         blocks, calls = self.discover(entry)
@@ -1613,10 +1617,10 @@ class Lifter:
                         body.append(f"    goto L_{o0.imm:08x};"); continue
                     if o0.type==X86_OP_IMM:
                         self.oob_branch = getattr(self,'oob_branch',0)+1
-                        body.append(f"    dispatch_indirect(c, 0x{o0.imm & 0xffffffff:x}u); return;")
+                        body.append("    " + self.tail_dispatch(f"0x{o0.imm & 0xffffffff:x}u"))
                         continue
                     if o0.type!=X86_OP_IMM:
-                        body.append(f"    dispatch_indirect(c, {self.rd(o0)}); return;   /* dolayli tail-call */")
+                        body.append("    " + self.tail_dispatch(self.rd(o0)))
                         continue
                 # jecxz/jcxz ve loop ailesi: kosul CC tablosunda degil.
                 # KRITIK: bunlar lift edilmezse CRT'nin strncmp/strlen gibi
@@ -1627,7 +1631,7 @@ class Lifter:
                     if self.in_text(_t):
                         body.append(f"    if({LOOPC[m]}) goto L_{_t:08x};")
                     else:
-                        body.append(f"    if({LOOPC[m]}) {{ dispatch_indirect(c, 0x{_t & 0xffffffff:x}u); return; }}")
+                        body.append(f"    if({LOOPC[m]}) {{ {self.tail_dispatch(f'0x{_t & 0xffffffff:x}u')} }}")
                     nxt=i.address+i.size
                     if k==len(ins)-1 and nxt in lbl: body.append(f"    goto L_{nxt:08x};")
                     continue
@@ -1639,7 +1643,7 @@ class Lifter:
                     if self.in_text(_t):
                         body.append(f"    if(c->ecx != 0u{extra}) goto L_{_t:08x};")
                     else:
-                        body.append(f"    if(c->ecx != 0u{extra}) {{ dispatch_indirect(c, 0x{_t & 0xffffffff:x}u); return; }}")
+                        body.append(f"    if(c->ecx != 0u{extra}) {{ {self.tail_dispatch(f'0x{_t & 0xffffffff:x}u')} }}")
                     nxt=i.address+i.size
                     if k==len(ins)-1 and nxt in lbl: body.append(f"    goto L_{nxt:08x};")
                     continue

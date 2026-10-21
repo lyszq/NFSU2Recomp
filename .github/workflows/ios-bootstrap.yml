@@ -42,6 +42,8 @@ on:
       - 'tests/guest_time*'
       - 'tests/input_bridge*'
       - 'tests/run_guest_tests.sh'
+      - 'tests/ios_startup_probe*'
+      - 'tools/ios_private/startup_probe.c.in'
       - '.github/workflows/ios-bootstrap.yml'
 
 permissions:
