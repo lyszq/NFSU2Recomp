@@ -806,8 +806,6 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
     if (!strcasecmp(import->library, "USER32.dll")) {
         int handled = window_query_import(c, import, fault);
         if (handled) return handled;
-        handled = guest_user32_get_system_metrics(c, import, fault);
-        if (handled) return handled;
         handled = guest_user32_get_cursor_pos(c, import, fault);
         if (handled) return handled;
         handled = guest_user32_set_cursor_pos(c, import, fault);
