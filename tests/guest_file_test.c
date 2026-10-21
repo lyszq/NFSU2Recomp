@@ -537,13 +537,15 @@ static int test_handle_limits_and_thread_safety(void) {
 
 int main(void) {
     printf("=== Starting NFSU2 Guest File & VFS Unit Tests ===\n");
-    if (test_path_normalization() != 0) return 1;
-    if (test_case_map_cache() != 0) return 1;
-    if (test_dual_root_and_copy_up() != 0) return 1;
-    if (test_multi_root_priorities() != 0) return 1;
-    if (test_win32_api_imports() != 0) return 1;
-    if (test_extended_win32_file_apis() != 0) return 1;
-    if (test_handle_limits_and_thread_safety() != 0) return 1;
+    if (guest_memory_init() != 0) return 1;
+    if (test_path_normalization() != 0) { guest_memory_shutdown(); return 1; }
+    if (test_case_map_cache() != 0) { guest_memory_shutdown(); return 1; }
+    if (test_dual_root_and_copy_up() != 0) { guest_memory_shutdown(); return 1; }
+    if (test_multi_root_priorities() != 0) { guest_memory_shutdown(); return 1; }
+    if (test_win32_api_imports() != 0) { guest_memory_shutdown(); return 1; }
+    if (test_extended_win32_file_apis() != 0) { guest_memory_shutdown(); return 1; }
+    if (test_handle_limits_and_thread_safety() != 0) { guest_memory_shutdown(); return 1; }
+    guest_memory_shutdown();
     printf("=== All NFSU2 Guest File & VFS Unit Tests PASSED ===\n");
     return 0;
 }
