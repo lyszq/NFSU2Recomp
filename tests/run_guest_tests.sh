@@ -4,7 +4,7 @@ set -euo pipefail
 DEST="${1:?usage: tests/run_guest_tests.sh output-directory}"
 mkdir -p "$DEST"
 CC="${CC:-clang}"
-FLAGS=(-O2 -std=gnu11 -Wall -Wextra -Werror -Iruntime -fno-strict-aliasing -pthread -lm)
+FLAGS=(-O2 -std=gnu11 -Wall -Wextra -Werror -Iruntime -fno-strict-aliasing -pthread)
 "$CC" "${FLAGS[@]}" runtime/guest_dispatch.c tests/guest_dispatch_test.c -o "$DEST/guest-dispatch-test"
 "$DEST/guest-dispatch-test"
 "$CC" "${FLAGS[@]}" runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_bootstrap.c   runtime/guest_memory.c tests/guest_execution_test.c -o "$DEST/guest-execution-test"
