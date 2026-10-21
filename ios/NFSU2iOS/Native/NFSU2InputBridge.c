@@ -107,7 +107,7 @@ void metal_fill_keyboard(unsigned char *dst, unsigned int n) {
  * runtime/com.c uyumluluğu: DirectInput hook'larının metal_fill_keyboard()
  * çağrısını yapabilmesi için metal_available() gereklidir.
  */
-int metal_available(void) {
+__attribute__((weak)) int metal_available(void) {
     return 1;
 }
 

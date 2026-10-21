@@ -149,7 +149,6 @@ SUPPORTED_IMPORTS = {
     ("user32.dll", "GetWindowRect"),
     ("user32.dll", "GetClientRect"),
     ("user32.dll", "GetCursorPos"),
-    ("user32.dll", "GetSystemMetrics"),
     ("kernel32.dll", "GetVersionExA"),
     ("kernel32.dll", "GetModuleHandleA"),
     ("kernel32.dll", "GetStartupInfoA"),
@@ -3283,13 +3282,6 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
                 elif row["name"] == "GetCursorPos":
                     from cursor_oracle import _cursor_query_import
                     handled = _cursor_query_import(engine, xr, uc, row, mapped_ranges, state)
-                    if handled or state["status"] is not None:
-                        engine.emu_stop()
-                        return True
-                    _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
-                elif row["name"] == "GetSystemMetrics":
-                    from metrics_oracle import _metrics_query_import
-                    handled = _metrics_query_import(engine, xr, uc, row, mapped_ranges, state)
                     if handled or state["status"] is not None:
                         engine.emu_stop()
                         return True

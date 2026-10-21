@@ -68,7 +68,10 @@ int guest_user32_get_cursor_pos(CPU *c, const GuestImport *import, uint32_t *fau
 int guest_user32_set_cursor_pos(CPU *c, const GuestImport *import, uint32_t *fault);
 int guest_user32_show_cursor(CPU *c, const GuestImport *import, uint32_t *fault);
 
+/* DirectInput / Metal Bridge Mouse Emulation */
+void metal_fill_mouse(unsigned char *dst, unsigned int n);
 void metal_get_cursor(int *x, int *y);
+void metal_mouse_add(int dx, int dy);
 
 #ifdef __cplusplus
 }

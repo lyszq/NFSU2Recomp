@@ -213,6 +213,104 @@ static void test_win32_set_and_show_cursor(void) {
     printf("PASS: test_win32_set_and_show_cursor\n");
 }
 
+static void test_metal_fill_mouse(void) {
+    guest_cursor_reset();
+    guest_cursor_set_viewport(1280, 720, 1280, 720, GUEST_CURSOR_SCALE_FIT);
+
+    /* 1. Initial coordinate snapshot: establishes base coordinates without delta */
+    guest_cursor_set_host_pos(100.0f, 100.0f, false);
+    unsigned char buf[20];
+    memset(buf, 0xAA, sizeof(buf));
+    metal_fill_mouse(buf, 20);
+
+    int32_t dx = 0, dy = 0, dz = 0;
+    memcpy(&dx, buf + 0, 4);
+    memcpy(&dy, buf + 4, 4);
+    memcpy(&dz, buf + 8, 4);
+    assert(dx == 0);
+    assert(dy == 0);
+    assert(dz == 0);
+    assert(buf[12] == 0x00); /* Button 0 UP */
+    for (int i = 1; i < 8; i++) {
+        assert(buf[12 + i] == 0x00);
+    }
+
+    /* 2. Cursor movement with touch / primary button pressed */
+    guest_cursor_set_host_pos(125.0f, 140.0f, true);
+    memset(buf, 0, sizeof(buf));
+    metal_fill_mouse(buf, 20);
+    memcpy(&dx, buf + 0, 4);
+    memcpy(&dy, buf + 4, 4);
+    memcpy(&dz, buf + 8, 4);
+    assert(dx == 25);
+    assert(dy == 40);
+    assert(dz == 0);
+    assert(buf[12] == 0x80); /* Button 0 DOWN (0x80) */
+    for (int i = 1; i < 8; i++) {
+        assert(buf[12 + i] == 0x00);
+    }
+
+    /* 3. Consecutive query: deltas must be reset to 0, button state maintained */
+    memset(buf, 0xFF, sizeof(buf));
+    metal_fill_mouse(buf, 20);
+    memcpy(&dx, buf + 0, 4);
+    memcpy(&dy, buf + 4, 4);
+    memcpy(&dz, buf + 8, 4);
+    assert(dx == 0);
+    assert(dy == 0);
+    assert(dz == 0);
+    assert(buf[12] == 0x80); /* Still DOWN */
+    for (int i = 1; i < 8; i++) {
+        assert(buf[12 + i] == 0x00);
+    }
+
+    /* 4. Multiple incremental movements accumulate deltas before query */
+    guest_cursor_set_host_pos(135.0f, 150.0f, true); /* +10, +10 */
+    guest_cursor_set_host_pos(130.0f, 160.0f, true); /* -5,  +10 -> net: +5, +20 */
+    memset(buf, 0, sizeof(buf));
+    metal_fill_mouse(buf, 20);
+    memcpy(&dx, buf + 0, 4);
+    memcpy(&dy, buf + 4, 4);
+    assert(dx == 5);
+    assert(dy == 20);
+    assert(buf[12] == 0x80);
+
+    /* 5. Button release */
+    guest_cursor_set_host_pos(130.0f, 160.0f, false);
+    memset(buf, 0, sizeof(buf));
+    metal_fill_mouse(buf, 20);
+    memcpy(&dx, buf + 0, 4);
+    memcpy(&dy, buf + 4, 4);
+    assert(dx == 0);
+    assert(dy == 0);
+    assert(buf[12] == 0x00); /* Button 0 UP */
+
+    /* 6. Synthetic delta injection via metal_mouse_add */
+    metal_mouse_add(12, -8);
+    memset(buf, 0, sizeof(buf));
+    metal_fill_mouse(buf, 20);
+    memcpy(&dx, buf + 0, 4);
+    memcpy(&dy, buf + 4, 4);
+    assert(dx == 12);
+    assert(dy == -8);
+
+    /* 7. Buffer guard: n < 20 must do nothing and preserve accumulated deltas */
+    guest_cursor_set_host_pos(150.0f, 180.0f, true); /* +20, +20 */
+    memset(buf, 0xCC, sizeof(buf));
+    metal_fill_mouse(buf, 19);
+    for (int i = 0; i < 20; i++) {
+        assert(buf[i] == 0xCC);
+    }
+    metal_fill_mouse(buf, 20);
+    memcpy(&dx, buf + 0, 4);
+    memcpy(&dy, buf + 4, 4);
+    assert(dx == 20);
+    assert(dy == 20);
+    assert(buf[12] == 0x80);
+
+    printf("PASS: test_metal_fill_mouse\n");
+}
+
 int main(void) {
     printf("=== Running guest_cursor Native Tests ===\n");
     int rc = guest_memory_init();
@@ -230,6 +328,7 @@ int main(void) {
     test_win32_get_cursor_pos_success();
     test_win32_get_cursor_pos_null();
     test_win32_set_and_show_cursor();
+    test_metal_fill_mouse();
 
     guest_memory_shutdown();
     printf("=== All guest_cursor Native Tests PASSED ===\n");

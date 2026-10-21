@@ -20,6 +20,8 @@ typedef struct GuestWindows {
     GuestProcess process;
     uint32_t unhandled_exception_filter;
 } GuestWindows;
+int guest_user32_get_system_metrics(CPU *cpu, const GuestImport *import,
+                                    uint32_t *fault);
 int guest_windows_import(CPU *cpu, const GuestImport *import, void *context,
                          uint32_t *fault);
 /* Quiesced runtime teardown; required even when execution stops or longjmps. */

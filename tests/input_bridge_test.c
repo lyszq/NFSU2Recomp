@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../ios/NFSU2iOS/Native/NFSU2InputBridge.h"
+#include "guest_cursor.h"
 #include "guest_memory.h"
 
 /* Guest memory emulation for standalone test runner */

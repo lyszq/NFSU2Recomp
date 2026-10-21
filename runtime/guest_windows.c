@@ -292,6 +292,37 @@ static int window_query_import(CPU *c, const GuestImport *import, uint32_t *faul
     return 1;
 }
 
+int guest_user32_get_system_metrics(CPU *c, const GuestImport *import, uint32_t *fault) {
+    if (!c || !import || !import->name || !fault) return 0;
+    if (strcmp(import->name, "GetSystemMetrics") != 0) return 0;
+    if (import->library && strcasecmp(import->library, "USER32.dll") != 0) return 0;
+
+    const uint8_t *frame = guest_memory_pointer(c->esp, 8, 0);
+    if (!frame) {
+        *fault = c->esp;
+        return -1;
+    }
+
+    uint32_t ret_ip = read32(frame);
+    uint32_t metric = read32(frame + 4);
+
+    uint32_t val = 0;
+    if (metric == 0) {
+        val = 640; /* SM_CXSCREEN */
+    } else if (metric == 1) {
+        val = 480; /* SM_CYSCREEN */
+    } else if (metric == 23) {
+        val = 0;   /* SM_SWAPBUTTON: normal mouse buttons, left is primary */
+    } else {
+        val = 0;
+    }
+
+    c->eax = val;
+    c->eip = ret_ip;
+    c->esp += 8u;
+    return 1;
+}
+
 static int handle_get_module_file_name_a(CPU *c, const GuestImport *import,
                                          GuestWindows *windows, uint32_t *fault) {
     if (strcmp(import->name, "GetModuleFileNameA") != 0) return 0;
@@ -774,6 +805,8 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
         return guest_registry_import(c, import, fault);
     if (!strcasecmp(import->library, "USER32.dll")) {
         int handled = window_query_import(c, import, fault);
+        if (handled) return handled;
+        handled = guest_user32_get_system_metrics(c, import, fault);
         if (handled) return handled;
         handled = guest_user32_get_cursor_pos(c, import, fault);
         if (handled) return handled;

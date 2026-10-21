@@ -42,6 +42,13 @@ static _Atomic uint32_t g_scale_mode = GUEST_CURSOR_SCALE_FIT;
 static _Atomic uint64_t g_synthetic_coords = 0;
 static _Atomic uint32_t g_synthetic_flags  = 0;
 
+/* DirectInput relative mouse deltas and previous coordinates */
+static _Atomic int32_t g_mouse_dx   = 0;
+static _Atomic int32_t g_mouse_dy   = 0;
+static _Atomic int32_t g_prev_x      = 0;
+static _Atomic int32_t g_prev_y      = 0;
+static _Atomic bool    g_prev_valid  = false;
+
 static inline uint64_t pack_coords(int32_t x, int32_t y) {
     return ((uint64_t)(uint32_t)x << 32) | ((uint64_t)(uint32_t)y & 0xffffffffULL);
 }
@@ -83,6 +90,11 @@ void guest_cursor_init(void) {
     atomic_store_explicit(&g_game_w, 1280, memory_order_relaxed);
     atomic_store_explicit(&g_game_h, 720, memory_order_relaxed);
     atomic_store_explicit(&g_scale_mode, GUEST_CURSOR_SCALE_FIT, memory_order_relaxed);
+    atomic_store_explicit(&g_mouse_dx, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_mouse_dy, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_prev_x, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_prev_y, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_prev_valid, false, memory_order_relaxed);
 }
 
 void guest_cursor_reset(void) {
@@ -163,6 +175,19 @@ void guest_cursor_set_host_pos(float host_x, float host_y, bool is_down) {
     guest_cursor_host_to_game(host_x, host_y, &gx, &gy);
     atomic_store_explicit(&g_packed_coords, pack_coords(gx, gy), memory_order_release);
 
+    if (atomic_load_explicit(&g_prev_valid, memory_order_relaxed)) {
+        int32_t prev_x = atomic_load_explicit(&g_prev_x, memory_order_relaxed);
+        int32_t prev_y = atomic_load_explicit(&g_prev_y, memory_order_relaxed);
+        int32_t dx = gx - prev_x;
+        int32_t dy = gy - prev_y;
+        atomic_fetch_add_explicit(&g_mouse_dx, dx, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_mouse_dy, dy, memory_order_relaxed);
+    } else {
+        atomic_store_explicit(&g_prev_valid, true, memory_order_relaxed);
+    }
+    atomic_store_explicit(&g_prev_x, gx, memory_order_relaxed);
+    atomic_store_explicit(&g_prev_y, gy, memory_order_relaxed);
+
     uint32_t flags = atomic_load_explicit(&g_cursor_flags, memory_order_relaxed);
     flags |= GUEST_CURSOR_FLAG_AVAILABLE;
     if (is_down) flags |= GUEST_CURSOR_FLAG_DOWN;
@@ -171,6 +196,9 @@ void guest_cursor_set_host_pos(float host_x, float host_y, bool is_down) {
 }
 
 void guest_cursor_set_available(bool available) {
+    if (!available) {
+        atomic_store_explicit(&g_prev_valid, false, memory_order_relaxed);
+    }
     uint32_t flags = atomic_load_explicit(&g_cursor_flags, memory_order_relaxed);
     if (available) flags |= GUEST_CURSOR_FLAG_AVAILABLE;
     else flags &= ~GUEST_CURSOR_FLAG_AVAILABLE;
@@ -282,6 +310,9 @@ int guest_user32_set_cursor_pos(CPU *c, const GuestImport *import, uint32_t *fau
 
     if (!guest_cursor_is_synthetic()) {
         atomic_store_explicit(&g_packed_coords, pack_coords(x, y), memory_order_release);
+        atomic_store_explicit(&g_prev_x, x, memory_order_relaxed);
+        atomic_store_explicit(&g_prev_y, y, memory_order_relaxed);
+        atomic_store_explicit(&g_prev_valid, true, memory_order_relaxed);
     }
 
     c->eax = 1;           /* TRUE */
@@ -329,4 +360,33 @@ void metal_get_cursor(int *x, int *y) {
     GuestCursorCoords coords = guest_cursor_get_coords();
     if (x) *x = coords.x;
     if (y) *y = coords.y;
+}
+
+/*
+ * DirectInput 8 Mouse Emulation:
+ * DirectInput COM emulation in runtime/com.c calls metal_fill_mouse(dst, cb)
+ * for cb == 20 (DIMOUSESTATE2) and cb == 16 (DIMOUSESTATE).
+ *
+ * Buffer layout (DIMOUSESTATE2, 20 bytes):
+ *   +0  LONG lX (relative delta X)
+ *   +4  LONG lY (relative delta Y)
+ *   +8  LONG lZ (relative delta Z / scroll wheel)
+ *   +12 BYTE rgbButtons[8] (button 0 = 0x80 when down, buttons 1..7 = 0x00)
+ */
+void metal_fill_mouse(unsigned char *dst, unsigned int n) {
+    if (!dst || n < 20) return;
+    int32_t dx = atomic_exchange_explicit(&g_mouse_dx, 0, memory_order_acq_rel);
+    int32_t dy = atomic_exchange_explicit(&g_mouse_dy, 0, memory_order_acq_rel);
+    int32_t dz = 0;
+    memcpy(dst + 0, &dx, 4);
+    memcpy(dst + 4, &dy, 4);
+    memcpy(dst + 8, &dz, 4);
+    uint32_t flags = guest_cursor_get_flags();
+    dst[12] = (flags & GUEST_CURSOR_FLAG_DOWN) ? 0x80 : 0x00; /* Button 0 (left click) */
+    for (int i = 1; i < 8; i++) dst[12 + i] = 0x00;
+}
+
+void metal_mouse_add(int dx, int dy) {
+    atomic_fetch_add_explicit(&g_mouse_dx, dx, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_mouse_dy, dy, memory_order_relaxed);
 }
