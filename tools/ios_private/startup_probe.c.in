@@ -62,15 +62,12 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         if (block->address!=v[2] || block->size!=v[3] || block->span!=v[4]) metadata_match=0;
     }
     const uint32_t expected_registers[] = {@EXPECTED_GPRS@};
-    int steps_ok = (result.instructions == @EXPECTED_STEPS@ || result.instructions == 129062u || result.instructions == 35200u);
-    int trace_ok = (result.trace_hash == UINT64_C(@EXPECTED_TRACE@) || result.trace_hash != 0);
-    int calls_ok = (result.calls == @EXPECTED_CALLS@ || result.calls == 6781u || result.calls == 1241u);
-    int img_ok = (memory_hash(g_mem + image->image_base, image->image_size) == UINT64_C(@EXPECTED_IMAGE_HASH@) ||
-                  memory_hash(g_mem + image->image_base, image->image_size) != 0);
-    int stak_ok = (memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) == UINT64_C(@EXPECTED_STACK_HASH@) ||
-                   memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) != 0);
-    int heap_ok = (memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@) == UINT64_C(@EXPECTED_HEAP_HASH@) ||
-                   memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@) != 0);
+    int steps_ok = result.instructions == @EXPECTED_STEPS@;
+    int trace_ok = result.trace_hash == UINT64_C(@EXPECTED_TRACE@);
+    int calls_ok = result.calls == @EXPECTED_CALLS@;
+    int img_ok = memory_hash(g_mem + image->image_base, image->image_size) == UINT64_C(@EXPECTED_IMAGE_HASH@);
+    int stak_ok = memory_hash(g_mem + @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@) == UINT64_C(@EXPECTED_STACK_HASH@);
+    int heap_ok = memory_hash(g_mem + @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@) == UINT64_C(@EXPECTED_HEAP_HASH@);
     if (result.stop != GUEST_STOP_IMPORT || result.target != @EXPECTED_TARGET@ ||
         result.ip != @EXPECTED_IP@ || !steps_ok ||
         result.imports_handled != @EXPECTED_APIS@ ||
@@ -79,7 +76,7 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         windows.tls.count != @EXPECTED_TLS_THREADS@ || !metadata_match ||
         windows.process.environment_a_refs != @EXPECTED_ENV_A_REFS@ ||
         windows.process.environment_w_refs != @EXPECTED_ENV_W_REFS@ ||
-        !calls_ok || result.maximum_depth > 64u ||
+        !calls_ok || result.maximum_depth != @EXPECTED_DEPTH@ ||
         c->eip != @EXPECTED_IP@ || c->fs_base != GUEST_TEB_BASE || c->gs_base != GUEST_TEB_BASE ||
         !trace_ok ||
         memcmp(c->r, expected_registers, sizeof c->r) ||
@@ -93,10 +90,13 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         memory_hash(g_mem + @PROCESS_WINDOW_ADDRESS@, @PROCESS_WINDOW_SIZE@) != UINT64_C(@EXPECTED_PROCESS_HASH@)) {
         rc = EINVAL;
         (void)snprintf(out, capacity,
-            "FAIL | entry mismatch | steps=%" PRIu64 "(exp %" PRIu64 ") calls=%" PRIu64 "(exp %" PRIu64 ") "
+            "FAIL | entry mismatch | stop=%u ip=%08x target=%08x depth=%u(exp %u) apis=%" PRIu64 "(exp %u) "
+            "steps=%" PRIu64 "(exp %" PRIu64 ") calls=%" PRIu64 "(exp %" PRIu64 ") "
             "trace=%016" PRIx64 "(exp %016" PRIx64 ") "
             "r=[%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x] "
             "img=%016" PRIx64 " stak=%016" PRIx64 " heap=%016" PRIx64,
+            (unsigned)result.stop, result.ip, result.target, result.maximum_depth, (unsigned)@EXPECTED_DEPTH@,
+            result.imports_handled, (unsigned)@EXPECTED_APIS@,
             result.instructions, (uint64_t)@EXPECTED_STEPS@, result.calls, (uint64_t)@EXPECTED_CALLS@,
             result.trace_hash, UINT64_C(@EXPECTED_TRACE@),
             c->r[0], c->r[1], c->r[2], c->r[3], c->r[4], c->r[5], c->r[6], c->r[7],
