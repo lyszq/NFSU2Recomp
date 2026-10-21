@@ -63,6 +63,60 @@ class StartupTransferTests(unittest.TestCase):
         self.assertIn("guest_execution_rdtsc(c);", body)
         self.assertNotIn("rdtsc_shim", body)
 
+    def test_pushfd_popfd_can_toggle_id_flag_and_restore_flags(self) -> None:
+        # pushfd; pop ecx; mov eax,ecx; xor eax,0x200000; push eax;
+        # popfd; pushfd; pop eax; xor eax,ecx; push ecx; popfd.
+        code = bytes.fromhex("9c5989c83500002000509d9c5831c8519d")
+        code_base = BASE
+        stack_base = 0x00500000
+        initial_esp = stack_base + 0x800
+        initial_flags = 0x0CD7
+        preserved = {
+            x86_const.UC_X86_REG_EBX: 0x11110001,
+            x86_const.UC_X86_REG_EDX: 0x11110002,
+            x86_const.UC_X86_REG_ESI: 0x11110003,
+            x86_const.UC_X86_REG_EDI: 0x11110004,
+            x86_const.UC_X86_REG_EBP: 0x11110005,
+        }
+
+        engine = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
+        engine.mem_map(code_base, 0x1000, unicorn.UC_PROT_ALL)
+        engine.mem_map(stack_base, 0x1000, unicorn.UC_PROT_ALL)
+        engine.mem_write(code_base, code)
+        engine.reg_write(x86_const.UC_X86_REG_EIP, code_base)
+        engine.reg_write(x86_const.UC_X86_REG_ESP, initial_esp)
+        engine.reg_write(x86_const.UC_X86_REG_EFLAGS, initial_flags)
+        for register, value in preserved.items():
+            engine.reg_write(register, value)
+
+        saved_flags = engine.reg_read(x86_const.UC_X86_REG_EFLAGS)
+        self.assertEqual(saved_flags & (1 << 21), 0)
+        engine.emu_start(code_base, code_base + len(code))
+
+        self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_EAX), 0x00200000)
+        self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_ECX), saved_flags)
+        self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_ESP), initial_esp)
+        self.assertEqual(engine.reg_read(x86_const.UC_X86_REG_EIP),
+                         code_base + len(code))
+        for register, value in preserved.items():
+            self.assertEqual(engine.reg_read(register), value)
+        final_flags = engine.reg_read(x86_const.UC_X86_REG_EFLAGS)
+        self.assertEqual(final_flags, saved_flags)
+        arithmetic_mask = 0x000008D5  # CF, PF, AF, ZF, SF, and OF.
+        self.assertEqual(final_flags & arithmetic_mask,
+                         saved_flags & arithmetic_mask)
+
+    def test_lifted_pushfd_popfd_uses_guest_eflags_helpers(self) -> None:
+        body = self.lift(b"\x9c\x9d\xc3")  # pushfd; popfd; ret
+
+        self.assertIn("PUSH32(eflags_get(c));", body)
+        self.assertIn("eflags_set(c,_f);", body)
+        self.assertNotRegex(
+            body,
+            r"\b(?:_readeflags|_writeeflags|__readeflags|__writeeflags|"
+            r"__geteflags|__seteflags|pushf_shim|popf_shim)\b",
+        )
+
     def test_dynamic_indirect_jump_uses_tail_dispatch_without_push(self) -> None:
         body = self.lift(b"\xff\xe0")  # jmp eax
 

@@ -52,17 +52,21 @@ reference counts and image/TEB/stack/heap/process checks remain mandatory.
 
 ## Extended CPU query and real next boundary
 
-The path queries CPUID80000001 at0072ccc3. This leaf now explicitly returns four
-zero registers, consistent with the existing upstream profile's lack of extended
-features. Other undeclared leaves still stop. The independent hook tests ensure
+The CPU model now stores EFLAGS.ID (bit21), and parity compares the
+0x00200cd5 mask. The oracle's old hardcoded ID-bit clear at007646e5 masked the
+game's early CPUID detection path; that workaround has been removed. The fresh
+reference therefore observes CPUID leaves [1, 0, 1, 0, 1, 0x80000001, 1], including
+the previously hidden early leaf1 query. CPUID80000001 at0072ccc3 still returns
+four zero registers, consistent with the upstream profile's lack of extended
+features. Other undeclared leaves still stop. Independent hook tests ensure
 Unicorn does not execute its own host/default CPUID and preserve GPR/flags/FP/
-XMM state outside the instruction outputs.
+XMM state outside instruction outputs.
 
 ## Explicit deterministic entry clock
 
 The independent original-x86 rerun still reaches the same
-KERNEL32!CreateToolhelp32Snapshot boundary after 191554 architectural
-instructions, 217254 raw hooks, 10482 dispatches and 865 APIs. It contains one
+KERNEL32!CreateToolhelp32Snapshot boundary after 191558 architectural
+instructions, 217258 raw hooks, 10482 dispatches and 865 APIs. It contains one
 RDTSC at 0x006de715 (7202581). Before this fixture, the oracle used host RDTSC
 while native execution correctly stopped at the unsupported instruction; that
 left the two sides with different clock behavior.
@@ -78,7 +82,7 @@ they do not claim to model real game timing or a real CPU clock.
 
 Original x86 execution reaches KERNEL32!CreateToolhelp32Snapshot at0076e9fc,
 targetf000008d, requesting flags2 (process snapshot), processID0. Reference:
-191554 architectural instructions,217254 raw hooks,10482 dispatches,865 APIs,
+191558 architectural instructions,217258 raw hooks,10482 dispatches,865 APIs,
 depth12,14 critical sections and one TLS key. This path has1022 unique observed
 transfer targets; generation allows1200 bounded bodies plus the existing leaf
 regression (1201 registered functions). Every executed target must be lifted.

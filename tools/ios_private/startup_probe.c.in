@@ -114,7 +114,7 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         c->eip != @EXPECTED_IP@ || c->fs_base != GUEST_TEB_BASE || c->gs_base != GUEST_TEB_BASE ||
         !trace_ok ||
         memcmp(c->r, expected_registers, sizeof c->r) ||
-        (eflags_get(c) & 0xcd5u) != @EXPECTED_FLAGS@ ||
+        (eflags_get(c) & 0x200cd5u) != @EXPECTED_FLAGS@ ||
         !img_ok ||
         memory_hash(g_mem + GUEST_TEB_BASE, 0x20000u) != UINT64_C(@EXPECTED_TEB_HASH@) ||
         !guest_memory_pointer(@HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@, 0) ||

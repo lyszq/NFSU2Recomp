@@ -74,7 +74,7 @@ def generate(exe):
     reference = run_startup_reference(exe, imports, diagnostic_directory=ROOT / "gen/ios-private")
     # Registry, CPU capability, cursor and window contracts advance
     # the explicit fixture prefix to its CreateToolhelp32Snapshot query. Native comparisons stay exact.
-    if (reference["import_name"] != "CreateToolhelp32Snapshot" or reference["raw_instructions"] != 217254
+    if (reference["import_name"] != "CreateToolhelp32Snapshot" or reference["raw_instructions"] != 217258
             or reference["calls"] != 10482 or reference["api_call_count"] != 865
             or reference["critical_section_count"] != 14
             or reference["tls_slot_count"] != 1 or reference["tls_thread_count"] != 1):

@@ -25,9 +25,10 @@ enum {
     TEST_EFLAGS_SF = 1u << 7,
     TEST_EFLAGS_DF = 1u << 10,
     TEST_EFLAGS_OF = 1u << 11,
+    TEST_EFLAGS_ID = 1u << 21,
     TEST_EFLAGS_SUPPORTED = TEST_EFLAGS_CF | TEST_EFLAGS_PF | TEST_EFLAGS_AF |
                             TEST_EFLAGS_ZF | TEST_EFLAGS_SF | TEST_EFLAGS_DF |
-                            TEST_EFLAGS_OF,
+                            TEST_EFLAGS_OF | TEST_EFLAGS_ID,
     TEST_EFLAGS_FIXED = 0x00000202u
 };
 
@@ -187,7 +188,8 @@ static uint32_t apply_flags(CPU *c, ArithmeticOp op, unsigned bits,
 }
 
 static int matches_flags(const CPU *c, const Reference *expected,
-                         uint32_t flag_mask, uint32_t initial, uint32_t initial_df) {
+                         uint32_t flag_mask, uint32_t initial,
+                         uint32_t initial_df, uint32_t initial_id) {
     const uint32_t cf = (flag_mask & TEST_F_CF) ? expected->cf : initial;
     const uint32_t pf = (flag_mask & TEST_F_PF) ? expected->pf : initial;
     const uint32_t af = (flag_mask & TEST_F_AF) ? expected->af : initial;
@@ -196,26 +198,29 @@ static int matches_flags(const CPU *c, const Reference *expected,
     const uint32_t of = (flag_mask & TEST_F_OF) ? expected->of : initial;
 
     return c->cf == cf && c->pf == pf && c->af == af && c->zf == zf &&
-           c->sf == sf && c->of == of && c->df == initial_df;
+           c->sf == sf && c->of == of && c->df == initial_df &&
+           c->id_flag == initial_id;
 }
 
 static int fail_arithmetic(char *out, size_t n, const char *phase,
                            ArithmeticOp op, unsigned bits, uint32_t a,
                            uint32_t b, uint32_t carry_in, uint32_t mask,
                            uint32_t expected_result, uint32_t actual_result,
-                           const Reference *expected, const CPU *actual) {
+                           const Reference *expected, const CPU *actual,
+                           uint32_t expected_id) {
     if (n != 0u) {
         (void)snprintf(out, n,
             "FAIL | %s | %s%u a=%08" PRIx32 " b=%08" PRIx32
             " cin=%" PRIu32 " mask=%02" PRIx32
             " result=%08" PRIx32 "/%08" PRIx32
-            " flags CF/PF/AF/ZF/SF/OF expected=%u%u%u%u%u%u got=%u%u%u%u%u%u",
+            " flags CF/PF/AF/ZF/SF/OF expected=%u%u%u%u%u%u got=%u%u%u%u%u%u"
+            " ID expected=%" PRIu32 " got=%" PRIu32,
             phase, op_name(op), bits, a, b, carry_in, mask,
             expected_result, actual_result,
             expected->cf, expected->pf, expected->af, expected->zf,
             expected->sf, expected->of,
             actual->cf, actual->pf, actual->af, actual->zf,
-            actual->sf, actual->of);
+            actual->sf, actual->of, expected_id, actual->id_flag);
     }
     return 1;
 }
@@ -233,10 +238,10 @@ static int check_arithmetic(char *out, size_t n, ArithmeticOp op, unsigned bits,
     const uint32_t actual_result = apply_flags(&actual, op, bits, a, b,
                                                carry_in, TEST_F_ALL);
     if (actual_result != expected.result ||
-        !matches_flags(&actual, &expected, TEST_F_ALL, 0u, 0u)) {
+        !matches_flags(&actual, &expected, TEST_F_ALL, 0u, 0u, 0u)) {
         return fail_arithmetic(out, n, "arithmetic reference", op, bits,
                                a, b, carry_in, TEST_F_ALL, expected.result,
-                               actual_result, &expected, &actual);
+                               actual_result, &expected, &actual, 0u);
     }
     ++*case_count;
     return 0;
@@ -250,6 +255,7 @@ static void set_all_flags(CPU *c, uint32_t value) {
     c->sf = value;
     c->of = value;
     c->df = value;
+    c->id_flag = value;
 }
 
 static int check_flag_masks(char *out, size_t n, uint64_t *mask_count) {
@@ -284,11 +290,12 @@ static int check_flag_masks(char *out, size_t n, uint64_t *mask_count) {
                         flag_mask);
                     if (actual_result != expected.result ||
                         !matches_flags(&actual, &expected, flag_mask,
-                                       sentinel, sentinel)) {
+                                       sentinel, sentinel, sentinel)) {
                         return fail_arithmetic(out, n, "flag-mask preservation",
                                                op, bits, a, b, carry_in,
                                                flag_mask, expected.result,
-                                               actual_result, &expected, &actual);
+                                               actual_result, &expected, &actual,
+                                               sentinel);
                     }
                     ++*mask_count;
                 }
@@ -351,32 +358,52 @@ static uint32_t encode_flag_pattern(uint32_t pattern) {
 }
 
 static int check_eflags_pack_unpack(char *out, size_t n, uint64_t *pattern_count) {
+    CPU toggled = {0};
+    const uint32_t base_flags = TEST_EFLAGS_FIXED | TEST_EFLAGS_CF;
+    eflags_set(&toggled, base_flags);
+    eflags_set(&toggled, eflags_get(&toggled) | TEST_EFLAGS_ID);
+    if (toggled.id_flag != 1u ||
+        eflags_get(&toggled) != (base_flags | TEST_EFLAGS_ID)) {
+        if (n != 0u) (void)snprintf(out, n, "FAIL | EFLAGS ID set toggle");
+        return 1;
+    }
+    eflags_set(&toggled, eflags_get(&toggled) & ~((uint32_t)TEST_EFLAGS_ID));
+    if (toggled.id_flag != 0u || eflags_get(&toggled) != base_flags) {
+        if (n != 0u) (void)snprintf(out, n, "FAIL | EFLAGS ID clear toggle");
+        return 1;
+    }
+
     for (uint32_t pattern = 0; pattern < 128u; ++pattern) {
         const uint32_t encoded = encode_flag_pattern(pattern);
-        /* Set every unsupported/reserved bit too; unpack must ignore them. */
-        const uint32_t input = encoded | ~((uint32_t)TEST_EFLAGS_SUPPORTED);
-        const uint32_t expected = TEST_EFLAGS_FIXED | encoded;
-        CPU c = {0};
-        set_all_flags(&c, 1u);
-        eflags_set(&c, input);
+        for (uint32_t id = 0u; id <= 1u; ++id) {
+            const uint32_t id_bits = id ? TEST_EFLAGS_ID : 0u;
+            /* Set every unsupported/reserved bit too; unpack must ignore them. */
+            const uint32_t input = encoded | id_bits |
+                                   ~((uint32_t)TEST_EFLAGS_SUPPORTED);
+            const uint32_t expected = TEST_EFLAGS_FIXED | encoded | id_bits;
+            CPU c = {0};
+            set_all_flags(&c, 1u);
+            eflags_set(&c, input);
 
-        if (c.cf != ((pattern >> 0) & 1u) ||
-            c.pf != ((pattern >> 1) & 1u) ||
-            c.af != ((pattern >> 2) & 1u) ||
-            c.zf != ((pattern >> 3) & 1u) ||
-            c.sf != ((pattern >> 4) & 1u) ||
-            c.df != ((pattern >> 5) & 1u) ||
-            c.of != ((pattern >> 6) & 1u) || eflags_get(&c) != expected) {
-            if (n != 0u) {
-                (void)snprintf(out, n,
-                    "FAIL | EFLAGS pack/unpack | pattern=%02" PRIx32
-                    " input=%08" PRIx32 " expected=%08" PRIx32
-                    " got=%08" PRIx32,
-                    pattern, input, expected, eflags_get(&c));
+            if (c.cf != ((pattern >> 0) & 1u) ||
+                c.pf != ((pattern >> 1) & 1u) ||
+                c.af != ((pattern >> 2) & 1u) ||
+                c.zf != ((pattern >> 3) & 1u) ||
+                c.sf != ((pattern >> 4) & 1u) ||
+                c.df != ((pattern >> 5) & 1u) ||
+                c.of != ((pattern >> 6) & 1u) || c.id_flag != id ||
+                eflags_get(&c) != expected) {
+                if (n != 0u) {
+                    (void)snprintf(out, n,
+                        "FAIL | EFLAGS pack/unpack | pattern=%02" PRIx32
+                        " id=%" PRIu32 " input=%08" PRIx32
+                        " expected=%08" PRIx32 " got=%08" PRIx32,
+                        pattern, id, input, expected, eflags_get(&c));
+                }
+                return 1;
             }
-            return 1;
+            ++*pattern_count;
         }
-        ++*pattern_count;
     }
     return 0;
 }

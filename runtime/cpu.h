@@ -39,6 +39,8 @@ typedef struct CPU {
     uint64_t mm[8];
     /* SSE */
     union { uint8_t b[16]; float f[4]; double d[2]; uint32_t u32[4]; uint64_t u64[2]; } xmm[8];
+    /* EFLAGS.ID is modeled separately; append to preserve existing offsets. */
+    uint32_t id_flag;
 } CPU;
 
 /* ---- bayrak yardimcilari ---------------------------------------------- */
@@ -174,11 +176,13 @@ static inline void fcompare_bl(struct CPU *c, double a, double b){
 /* ---- EFLAGS birlestirme/ayirma (pushfd/popfd/sahf) -------------------- */
 static inline uint32_t eflags_get(const struct CPU *c){
     return 0x00000202u | (c->cf&1u) | ((c->pf&1u)<<2) | ((c->af&1u)<<4)
-         | ((c->zf&1u)<<6) | ((c->sf&1u)<<7) | ((c->df&1u)<<10) | ((c->of&1u)<<11);
+         | ((c->zf&1u)<<6) | ((c->sf&1u)<<7) | ((c->df&1u)<<10) | ((c->of&1u)<<11)
+         | ((c->id_flag&1u)<<21);
 }
 static inline void eflags_set(struct CPU *c, uint32_t f){
     c->cf=f&1u; c->pf=(f>>2)&1u; c->af=(f>>4)&1u;
     c->zf=(f>>6)&1u; c->sf=(f>>7)&1u; c->df=(f>>10)&1u; c->of=(f>>11)&1u;
+    c->id_flag=(f>>21)&1u;
 }
 
 /* ---- string komutlari ------------------------------------------------- */

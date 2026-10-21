@@ -33,7 +33,7 @@ STACK_SIZE = STACK_HI - STACK_LO
 INITIAL_ESP = STACK_HI - 0x1000
 ENTRY_RETURN = 0xDEADC0DE
 EFLAGS_INITIAL = 0x202
-EFLAGS_MASK = 0xCD5
+EFLAGS_MASK = 0x200CD5
 FCW_INITIAL = 0x037F
 FNV64_OFFSET = 14695981039346656037
 FNV64_PRIME = 1099511628211
@@ -3584,10 +3584,6 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
     def on_code(uc_engine: Any, address: int, size: int, user_data: Any) -> None:
         if stop_at_import(address):
             return
-        if address == 0x007646e5:
-            # Match runtime/cpu.h eflags_get() by clearing bit 21 (ID flag)
-            flags = uc_engine.reg_read(xr.UC_X86_REG_EFLAGS)
-            uc_engine.reg_write(xr.UC_X86_REG_EFLAGS, (flags & EFLAGS_MASK) | 0x202)
         try:
             instruction = next(md.disasm(bytes(uc_engine.mem_read(address, min(size, 15))), address), None)
         except Exception:
