@@ -78,7 +78,8 @@ static int test_measured_arrow(void)
     GuestImport api = { 0u, "uSeR32.dLl", "LoadCursorA" };
     GuestUserObjects objects = {0};
     GuestUserObjects other = {0};
-    GuestUserObject empty = {0};
+    GuestUserObjects empty = {0};
+    _Static_assert(sizeof empty == sizeof objects, "compare entire object tables");
     CPU cpu, before, expected;
     uint32_t fault = 0xabcdef01u;
 
