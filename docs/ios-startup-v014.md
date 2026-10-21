@@ -25,9 +25,9 @@ checks the complete output range. Overlong strings remain explicit stops.
 IsProcessorFeaturePresent argument7 is
 PF_3DNOW_INSTRUCTIONS_AVAILABLE. The portable guest does not advertise 3DNow:
 some upstream translations omit its refinement instructions. This query returns
-FALSE with the documented stdcall ABI and preserves LastError. Arguments6
-and10 return TRUE for SSE/SSE2, consistent with the existing upstream static
-CPUID profile. Other feature numbers remain unsupported.
+FALSE with the documented stdcall ABI and preserves LastError. Argument6 returns
+TRUE for SSE; argument10 returns FALSE for SSE2, consistent with bit25 set
+and bit26 clear in the existing upstream static CPUID profile. Other feature numbers remain unsupported.
 
 CPUID explicitly uses the upstream virtual x86 profile (family/model0x006d8):
 leaf0 returns maximum basic leaf1 and GenuineIntel; leaf1 returns EAX0x006d8,
@@ -35,7 +35,7 @@ EBX/ECX0 and EDX0x0383fbff; extended-maximum leaf0x80000000 returns four
 zeros as the upstream handler did. Other leaves stop without mutation.
 The oracle intercepts CPUID before Unicorn executes it, rather than using
 Unicorn or host CPU defaults. Synthetic actual-instruction tests verify this
-interception and next-instruction execution. Advertising SSE/SSE2 does not
+interception and next-instruction execution. Advertising SSE does not
 claim complete translation coverage: any unsupported instruction still stops.
 
 ## Invalid window query

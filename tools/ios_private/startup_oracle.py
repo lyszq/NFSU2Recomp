@@ -314,8 +314,8 @@ def _is_processor_feature_present(engine, registers, unicorn_module, row, mapped
     ret, feature = struct.unpack("<2I", engine.mem_read(esp, 8))
     if feature not in (6, 7, 10):
         return False
-    # Static guest CPUID EDX25/26 advertise SSE/SSE2; no 3DNow.
-    result = 0 if feature == 7 else 1
+    # Static guest CPUID EDX25 advertises SSE; EDX26 clear means no SSE2.
+    result = 1 if feature == 6 else 0
     state["api_calls"].append({"library": row["library"], "name": row["name"],
         "import_index": row["index"], "tag": IMPORT_BASE + row["index"],
         "call_ip": state["last_ip"], "esp_before": esp, "argument_count": 1,

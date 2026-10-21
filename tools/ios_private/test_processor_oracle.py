@@ -28,7 +28,8 @@ IMPORT_IP = 0xF0000015
 EAX_SENTINEL = 0xAABBCCDD
 FLAGS_SENTINEL = 0xCD5
 KNOWN_FEATURE = 7  # PF_3DNOW_INSTRUCTIONS_AVAILABLE, answered false.
-SUPPORTED_TRUE_FEATURES = (6, 10)  # SSE and SSE2, from CPUID EDX bits 25/26.
+KNOWN_FALSE_FEATURES = (7, 10)  # 3DNow and SSE2 are absent in the profile.
+SUPPORTED_TRUE_FEATURES = (6,)  # SSE is present in CPUID leaf 1 EDX bit 25.
 TEB_BASE = 0x00C00000
 LAST_ERROR_OFFSET = 0x34
 LAST_ERROR_SENTINEL = 0x76543210
@@ -115,30 +116,35 @@ class ProcessorFeatureOracleTests(unittest.TestCase):
         self.assertIsNone(self.state["status"])
         self.assertFalse(self.state["resume"])
 
-    def test_known_feature_seven_returns_false_and_records_profile(self) -> None:
-        frame = self.write_frame(KNOWN_FEATURE)
+    def test_known_false_features_seven_and_ten_record_profile(self) -> None:
+        for feature in KNOWN_FALSE_FEATURES:
+            with self.subTest(feature=feature):
+                self.state["api_calls"] = []
+                self.state["resume"] = False
+                self.state["status"] = None
+                frame = self.write_frame(feature)
 
-        self.assertTrue(self.call_import())
+                self.assertTrue(self.call_import())
 
-        self.assert_success_frame(expected_eax=0)
-        self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, 8)), frame)
-        self.assertNotIn("last_error", self.state)
-        self.assertEqual(len(self.state["api_calls"]), 1)
-        api = self.state["api_calls"][0]
-        self.assertEqual(api["library"], "KERNEL32.dll")
-        self.assertEqual(api["name"], "IsProcessorFeaturePresent")
-        self.assertEqual(api["import_index"], 21)
-        self.assertEqual(api["tag"], IMPORT_IP)
-        self.assertEqual(api["call_ip"], IMPORT_IP)
-        self.assertEqual(api["esp_before"], STACK_BASE)
-        self.assertEqual(api["argument_count"], 1)
-        self.assertEqual(api["return_address"], RETURN_ADDRESS)
-        self.assertEqual(api["arguments"], [KNOWN_FEATURE])
-        self.assertEqual(api["result"], 0)
-        self.assertEqual(api["profile"], "upstream_static_x86_006d8")
-        self.assertEqual(api["esp_after"], STACK_BASE + 8)
+                self.assert_success_frame(expected_eax=0)
+                self.assertEqual(bytes(self.engine.mem_read(STACK_BASE, 8)), frame)
+                self.assertNotIn("last_error", self.state)
+                self.assertEqual(len(self.state["api_calls"]), 1)
+                api = self.state["api_calls"][0]
+                self.assertEqual(api["library"], "KERNEL32.dll")
+                self.assertEqual(api["name"], "IsProcessorFeaturePresent")
+                self.assertEqual(api["import_index"], 21)
+                self.assertEqual(api["tag"], IMPORT_IP)
+                self.assertEqual(api["call_ip"], IMPORT_IP)
+                self.assertEqual(api["esp_before"], STACK_BASE)
+                self.assertEqual(api["argument_count"], 1)
+                self.assertEqual(api["return_address"], RETURN_ADDRESS)
+                self.assertEqual(api["arguments"], [feature])
+                self.assertEqual(api["result"], 0)
+                self.assertEqual(api["profile"], "upstream_static_x86_006d8")
+                self.assertEqual(api["esp_after"], STACK_BASE + 8)
 
-    def test_sse_features_six_and_ten_return_true_without_side_effects(self) -> None:
+    def test_sse_feature_six_returns_true_without_side_effects(self) -> None:
         self.engine.mem_map(TEB_BASE, PAGE_SIZE, unicorn.UC_PROT_ALL)
         last_error_address = TEB_BASE + LAST_ERROR_OFFSET
 

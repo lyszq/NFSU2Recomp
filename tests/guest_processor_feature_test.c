@@ -20,7 +20,9 @@ enum {
     FRAME_CROSS = 0x00053ffcu,
     FRAME_UNMAPPED = 0x00070000u,
     PAGE_SIZE = GUEST_MEMORY_GRANULE,
+    FEATURE_SSE = 6u,
     FEATURE_3DNOW = 7u,
+    FEATURE_SSE2 = 10u,
     RETURN_ADDRESS = 0x00401234u,
     LAST_ERROR_SENTINEL = 0x13579bdfu
 };
@@ -139,14 +141,22 @@ static int test_supported_feature(void) {
     return 0;
 }
 
-static int test_true_sse_features(void) {
-    static const uint32_t features[] = { 6u, 10u };
+static int test_static_processor_features(void) {
+    static const struct {
+        uint32_t feature;
+        uint32_t available;
+    } features[] = {
+        { FEATURE_SSE, 1u },
+        { FEATURE_SSE2, 0u }
+    };
 
     for (size_t i = 0; i < sizeof(features) / sizeof(features[0]); ++i) {
-        /* Upstream static CPUID advertises SSE (6) and SSE2 (10). */
-        CHECK(run_supported(STACK_ADDR, TEB_ADDR, features[i], 1) == 0);
-        /* These constant queries do not need to inspect a guest TEB. */
-        CHECK(run_supported(STACK_ADDR, 0, features[i], 1) == 0);
+        /* EDX 0x0383fbff has bit 25 (SSE) set, but bit 26 (SSE2) clear. */
+        CHECK(run_supported(STACK_ADDR, TEB_ADDR,
+                            features[i].feature, features[i].available) == 0);
+        /* Constant results do not require probing the guest TEB. */
+        CHECK(run_supported(STACK_ADDR, 0,
+                            features[i].feature, features[i].available) == 0);
     }
     return 0;
 }
@@ -238,7 +248,7 @@ int main(void) {
     CHECK(guest_memory_commit(0x00020000u, PAGE_SIZE) == 0);
 
     CHECK(test_supported_feature() == 0);
-    CHECK(test_true_sse_features() == 0);
+    CHECK(test_static_processor_features() == 0);
     CHECK(test_unknown_features_and_imports() == 0);
     CHECK(test_frame_memory_faults() == 0);
     CHECK(guest_memory_shutdown() == 0);

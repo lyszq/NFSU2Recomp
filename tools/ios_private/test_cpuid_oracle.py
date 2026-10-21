@@ -59,6 +59,14 @@ class CpuidOracleTests(unittest.TestCase):
             with self.subTest(leaf=unsupported):
                 self.assertIsNone(cpuid_values(unsupported))
 
+    def test_leaf_one_advertises_sse_but_not_sse2(self) -> None:
+        values = cpuid_values(1)
+        self.assertIsNotNone(values)
+        assert values is not None
+        edx = values[3]
+        self.assertEqual(edx & (1 << 25), 1 << 25)  # SSE / feature 6.
+        self.assertEqual(edx & (1 << 26), 0)  # SSE2 / feature 10.
+
     def make_engine(self, code: bytes, leaf: int) -> tuple[unicorn.Uc,
                                                             dict[str, object]]:
         engine = unicorn.Uc(unicorn.UC_ARCH_X86, unicorn.UC_MODE_32)
