@@ -35,6 +35,9 @@ enum {
 #define OUTPUT_A (OUTPUT_PAGE + 0x123u)
 #define OUTPUT_B (OUTPUT_PAGE + 0x1f9u)
 
+static const uint8_t OUTPUT_GUARD_LEFT[4] = {0x91, 0x82, 0x73, 0x64};
+static const uint8_t OUTPUT_GUARD_RIGHT[4] = {0x4d, 0x3c, 0x2b, 0x1a};
+
 static void put_le32(void *destination, uint32_t value)
 {
     uint8_t *bytes = (uint8_t *)destination;
@@ -75,6 +78,24 @@ static int read_guest(uint32_t address, void *destination, size_t size)
     if (!source) return 1;
     memcpy(destination, source, size);
     return 0;
+}
+
+static int prepare_output_guards(uint32_t address)
+{
+    return write_guest(address - 4u, OUTPUT_GUARD_LEFT,
+                       sizeof OUTPUT_GUARD_LEFT) ||
+           write_guest(address + 8u, OUTPUT_GUARD_RIGHT,
+                       sizeof OUTPUT_GUARD_RIGHT);
+}
+
+static int output_guards_intact(uint32_t address)
+{
+    uint8_t left[sizeof OUTPUT_GUARD_LEFT];
+    uint8_t right[sizeof OUTPUT_GUARD_RIGHT];
+    return read_guest(address - 4u, left, sizeof left) == 0 &&
+           read_guest(address + 8u, right, sizeof right) == 0 &&
+           !memcmp(left, OUTPUT_GUARD_LEFT, sizeof left) &&
+           !memcmp(right, OUTPUT_GUARD_RIGHT, sizeof right);
 }
 
 static int write_frame(uint32_t esp, uint32_t return_ip, uint32_t output,
@@ -156,13 +177,24 @@ static uint32_t expected_tick(uint64_t counter, uint64_t frequency)
 static int call_output(GuestClock *clock, CPU *cpu, const char *name,
                        uint32_t output, uint32_t *fault)
 {
+    if (prepare_output_guards(output) != 0) {
+        fprintf(stderr, "FAIL %s:%d: could not prepare 8-byte output guards\n",
+                __FILE__, __LINE__);
+        return -99;
+    }
     if (write_frame(cpu->esp, RETURN_ADDRESS, output, 8u) != 0) {
         fprintf(stderr, "FAIL %s:%d: could not prepare clock output frame\n",
                 __FILE__, __LINE__);
         return -99;
     }
     GuestImport import = api("kErNeL32.DlL", name);
-    return guest_clock_import(cpu, &import, clock, fault);
+    const int result = guest_clock_import(cpu, &import, clock, fault);
+    if (result == 1 && !output_guards_intact(output)) {
+        fprintf(stderr, "FAIL %s:%d: clock output changed adjacent guard bytes\n",
+                __FILE__, __LINE__);
+        return -99;
+    }
+    return result;
 }
 
 static int call_tick(GuestClock *clock, CPU *cpu, uint32_t *fault)
@@ -202,10 +234,10 @@ static int test_fixture_sequence_and_reset(void)
     uint8_t bytes[8];
     CHECK(read_guest(OUTPUT_A, bytes, sizeof bytes) == 0 &&
           get_le64(bytes) == frequency);
+    uint64_t expected_hash = hash_event(FNV_OFFSET,
+        GUEST_CLOCK_QUERY_PERFORMANCE_FREQUENCY, frequency);
     CHECK(clock.next == initial && clock.query_count == 1u &&
-          clock.sample_count == 0u &&
-          clock.trace_hash == hash_event(FNV_OFFSET,
-              GUEST_CLOCK_QUERY_PERFORMANCE_FREQUENCY, frequency));
+          clock.sample_count == 0u && clock.trace_hash == expected_hash);
 
     init_cpu(&cpu, TEST_STACK);
     before = cpu;
@@ -214,19 +246,19 @@ static int test_fixture_sequence_and_reset(void)
     CHECK(expect_completed_cpu(&cpu, &before, 1u, 8u) == 0);
     CHECK(read_guest(OUTPUT_B, bytes, sizeof bytes) == 0 &&
           get_le64(bytes) == initial);
-    uint64_t hash = hash_event(clock.trace_hash,
-                               GUEST_CLOCK_QUERY_PERFORMANCE_COUNTER, initial);
+    expected_hash = hash_event(expected_hash,
+        GUEST_CLOCK_QUERY_PERFORMANCE_COUNTER, initial);
     CHECK(clock.next == initial + increment && clock.query_count == 2u &&
-          clock.sample_count == 1u && clock.trace_hash == hash);
+          clock.sample_count == 1u && clock.trace_hash == expected_hash);
 
     init_cpu(&cpu, TEST_STACK);
     before = cpu;
     CHECK(call_tick(&clock, &cpu, &fault) == 1);
     uint32_t tick = expected_tick(initial + increment, frequency);
     CHECK(expect_completed_cpu(&cpu, &before, tick, 4u) == 0);
-    hash = hash_event(hash, GUEST_CLOCK_GET_TICK_COUNT, tick);
+    expected_hash = hash_event(expected_hash, GUEST_CLOCK_GET_TICK_COUNT, tick);
     CHECK(clock.next == initial + 2u * increment && clock.query_count == 3u &&
-          clock.sample_count == 2u && clock.trace_hash == hash);
+          clock.sample_count == 2u && clock.trace_hash == expected_hash);
     CHECK(read_guest(TEB_PAGE + LAST_ERROR_OFFSET, last_error,
                      sizeof last_error) == 0 &&
           get_le32(last_error) == LAST_ERROR_SENTINEL);
@@ -383,7 +415,11 @@ static int test_aliasing_and_errors(void)
         OUTPUT_PAGE + GUEST_MEMORY_GRANULE - 4u, UINT32_MAX - 3u
     };
     const uint8_t output_guard[8] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88};
+    const uint32_t crossing_output = OUTPUT_PAGE + GUEST_MEMORY_GRANULE - 4u;
+    const uint8_t crossing_prefix[4] = {0xa1, 0xb2, 0xc3, 0xd4};
     CHECK(write_guest(OUTPUT_PAGE, output_guard, sizeof output_guard) == 0);
+    CHECK(write_guest(crossing_output, crossing_prefix,
+                      sizeof crossing_prefix) == 0);
     for (size_t i = 0; i < sizeof bad_outputs / sizeof bad_outputs[0]; ++i) {
         if (bad_outputs[i] == OUTPUT_PAGE)
             CHECK(guest_memory_protect(OUTPUT_PAGE, GUEST_MEMORY_GRANULE,
@@ -403,6 +439,9 @@ static int test_aliasing_and_errors(void)
     }
     CHECK(read_guest(OUTPUT_PAGE, frame_after, sizeof frame_after) == 0 &&
           !memcmp(output_guard, frame_after, sizeof output_guard));
+    uint8_t crossing_after[sizeof crossing_prefix];
+    CHECK(read_guest(crossing_output, crossing_after, sizeof crossing_after) == 0 &&
+          !memcmp(crossing_prefix, crossing_after, sizeof crossing_prefix));
 
     /* A readonly frame fails before any fixture or CPU state changes. */
     init_cpu(&cpu, TEST_STACK + 0x100u);
