@@ -60,7 +60,7 @@ static int set_cursor_last_error(CPU *c, uint32_t error_code, uint32_t *fault) {
     }
     uint64_t teb_error = (uint64_t)c->fs_base + 0x34ULL;
     if (teb_error + 4ULL > 0x100000000ULL) {
-        *fault = (uint32_t)teb_error;
+        *fault = (teb_error > UINT32_MAX) ? UINT32_MAX : (uint32_t)teb_error;
         return -1;
     }
     uint8_t *error_ptr = guest_memory_pointer((uint32_t)teb_error, 4u, 1);
@@ -203,7 +203,11 @@ GuestCursorCoords guest_cursor_get_coords(void) {
 }
 
 uint32_t guest_cursor_get_flags(void) {
-    return atomic_load_explicit(&g_cursor_flags, memory_order_acquire);
+    uint32_t flags = atomic_load_explicit(&g_cursor_flags, memory_order_acquire);
+    if (flags & GUEST_CURSOR_FLAG_SYNTHETIC) {
+        return flags | atomic_load_explicit(&g_synthetic_flags, memory_order_acquire);
+    }
+    return flags;
 }
 
 int32_t guest_cursor_get_display_count(void) {
@@ -215,6 +219,7 @@ int32_t guest_cursor_get_display_count(void) {
  * Stdcall ABI: 1 arg, pop 4 bytes (frame = return_ip + lpPoint = 8 bytes).
  */
 int guest_user32_get_cursor_pos(CPU *c, const GuestImport *import, uint32_t *fault) {
+    if (!c || !import || !import->name || !fault) return 0;
     if (strcmp(import->name, "GetCursorPos") != 0) return 0;
 
     const uint8_t *frame = guest_memory_pointer(c->esp, 8, 0);
@@ -262,6 +267,7 @@ int guest_user32_get_cursor_pos(CPU *c, const GuestImport *import, uint32_t *fau
  * Stdcall ABI: 2 args, pop 8 bytes (frame = return_ip + x + y = 12 bytes).
  */
 int guest_user32_set_cursor_pos(CPU *c, const GuestImport *import, uint32_t *fault) {
+    if (!c || !import || !import->name || !fault) return 0;
     if (strcmp(import->name, "SetCursorPos") != 0) return 0;
 
     const uint8_t *frame = guest_memory_pointer(c->esp, 12, 0);
@@ -289,6 +295,7 @@ int guest_user32_set_cursor_pos(CPU *c, const GuestImport *import, uint32_t *fau
  * Stdcall ABI: 1 arg, pop 4 bytes (frame = return_ip + bShow = 8 bytes).
  */
 int guest_user32_show_cursor(CPU *c, const GuestImport *import, uint32_t *fault) {
+    if (!c || !import || !import->name || !fault) return 0;
     if (strcmp(import->name, "ShowCursor") != 0) return 0;
 
     const uint8_t *frame = guest_memory_pointer(c->esp, 8, 0);

@@ -131,7 +131,7 @@ jobs:
           test "$(lipo -archs "$APP/NFSU2iOS")" = arm64
           MAP="$RUNNER_TEMP/PrivateDerivedData/Build/Intermediates.noindex/NFSU2iOS.build/Release-iphoneos/NFSU2iOS.build/NFSU2iOS-LinkMap-normal-arm64.txt"
           sed '/^# Dead Stripped Symbols/,$d' "$MAP" > "$RUNNER_TEMP/private-live-symbols.txt"
-          for SYMBOL in sub_0048b1e0 sub_0075bcc7 sub_00760da0 sub_0075c4d0 nfs_private_lifted_probe nfs_private_startup_probe guest_pe_load guest_dispatch_lookup guest_execution_run guest_bootstrap_init guest_windows_import guest_registry_import guest_cpuid guest_locale_import guest_heap_create guest_heap_realloc guest_critical_create guest_critical_cleanup guest_tls_apply guest_process_init; do
+          for SYMBOL in sub_0048b1e0 sub_0075bcc7 sub_00760da0 sub_0075c4d0 nfs_private_lifted_probe nfs_private_startup_probe guest_pe_load guest_dispatch_lookup guest_execution_run guest_bootstrap_init guest_windows_import guest_registry_import guest_cpuid guest_locale_import guest_heap_create guest_heap_realloc guest_critical_create guest_critical_cleanup guest_tls_apply guest_process_init guest_user32_get_cursor_pos; do
             grep -E "[[:space:]]_$SYMBOL$" "$RUNNER_TEMP/private-live-symbols.txt" | tee -a "$RUNNER_TEMP/private-evidence.txt"
           done
           mkdir -p "$RUNNER_TEMP/private-ipa/Payload"

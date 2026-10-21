@@ -20,17 +20,6 @@
  */
 static _Atomic uint8_t g_keys[256];
 
-/*
- * Konuk sanal bellek adresinin geçerli ve ayrılmış (committed) olup olmadığını
- * kilit gerektirmeyen (lock-free) g_cbits bit haritası üzerinden doğrular.
- */
-static inline bool is_guest_addr_committed(uint32_t addr) {
-    if (!g_mem) return false;
-    uint32_t granule = addr >> 14;
-    if (granule >= GUEST_MEMORY_BITMAP_SIZE * 8u) return false;
-    return (g_cbits[granule >> 3] & (uint8_t)(1u << (granule & 7))) != 0;
-}
-
 void nfsu2_input_set_key(uint8_t dik_code, bool is_pressed) {
     atomic_store_explicit(&g_keys[dik_code], is_pressed ? 1 : 0, memory_order_release);
 }
