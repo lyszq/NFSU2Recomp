@@ -872,7 +872,7 @@ public final class NFSU2MetalRenderUIView: UIView {
         stopDisplayLink()
         NotificationCenter.default.removeObserver(self)
     }
-}
+
 
 
     private func setupPointerInteraction() {
@@ -924,7 +924,7 @@ public final class NFSU2MetalRenderUIView: UIView {
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), false)
         nfsu2_input_set_cursor_available(false)
     }
-
+}
 
 public struct NFSU2MetalSurfaceView: UIViewRepresentable {
     public init() {}
