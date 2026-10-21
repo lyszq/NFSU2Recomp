@@ -766,6 +766,7 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
 }
 int guest_windows_cleanup(GuestWindows *windows) {
     if (!windows) return EINVAL;
+    windows->unhandled_exception_filter = 0;
     guest_process_cleanup(&windows->process);
     int rc=guest_critical_cleanup(&windows->critical);
     if (!rc) guest_tls_cleanup(&windows->tls);
