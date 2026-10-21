@@ -51,7 +51,7 @@ def verify(map_text, nm_text):
     unresolved = [line for line in nm_text.splitlines() if "(undefined)" in line]
     # Framework/dylib imports are expected. Guest/runtime undefineds are not.
     for line in unresolved:
-        if re.search(r"_(?:sub_[0-9a-fA-F]+|dispatch_\w+|g_fn_\w+|g_imp_\w+|metal_\w+|nfs_game_\w+)(?:\s|$)", line):
+        if re.search(r"_(?:sub_[0-9a-fA-F]+|dispatch_(?:init|indirect|report|patch)|g_fn_\w+|g_imp_\w+|metal_\w+|nfs_game_\w+)(?:\s|$)", line):
             raise ValueError("unresolved runtime symbol: " + line)
     return {"shard_object_count": len(shard_ids), "strong_symbols": evidence,
             "dynamic_undefined_count": len(unresolved), "dynamic_undefined_symbols": unresolved,

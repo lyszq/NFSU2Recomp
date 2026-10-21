@@ -34,6 +34,10 @@ void nfs_game_session_set_active(int active);
 void nfs_game_session_checkpoint(void);
 int nfs_game_session_get_state(void);
 void nfs_game_session_get_status(char *diagnostic, size_t diagnostic_capacity);
+/* Call on UIKit's thread before Metal initialization to capture shader errors. */
+void nfs_game_session_prepare_log(void);
+/* Returns the app-private Documents log path used for runtime stderr. */
+void nfs_game_session_get_log_path(char *path, size_t path_capacity);
 
 #ifdef __cplusplus
 }

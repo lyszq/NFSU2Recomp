@@ -99,6 +99,7 @@ jobs:
           test "$(gh api "repos/$GH_REPO" --jq .private)" = true
           gh release download private-input-v1 --repo "$GH_REPO" --pattern SPEED2.EXE --dir "$RUNNER_TEMP/private-input"
           "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/generate_shards.py --exe "$RUNNER_TEMP/private-input/SPEED2.EXE" --shards 128
+          cp gen/all/ios-full-manifest.json "$RUNNER_TEMP/full-runtime-provenance.json"
           "$RUNNER_TEMP/guest-tests/full-pe-adapter-test" "$RUNNER_TEMP/private-input/SPEED2.EXE" | tee -a "$RUNNER_TEMP/contract-tests.txt"
           "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/configure_project.py --mode all
       - name: Compile and link the complete ARM64 iOS runtime

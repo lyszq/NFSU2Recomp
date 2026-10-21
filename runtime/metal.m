@@ -3522,13 +3522,21 @@ static _Atomic int g_win_sized = 0;
 static void win_apply_size(unsigned w, unsigned h){
     if (!g_layer) return;
 #if TARGET_OS_IPHONE
-    CGFloat s = [UIScreen mainScreen].scale;
-    if (s < 1.0) s = 1.0;
-    g_layer.contentsScale = s;
-    g_layer.drawableSize  = CGSizeMake((CGFloat)w, (CGFloat)h);
     atomic_store(&g_draw_w, (int)w); atomic_store(&g_draw_h, (int)h);
-    CGRect c = [g_layer bounds];
-    atomic_store(&g_cont_w, (int)c.size.width); atomic_store(&g_cont_h, (int)c.height);
+    /* D3D CreateDevice/Reset can arrive on the guest worker. UIKit and the
+     * drawable surface are owned by the main thread; never wait for it while
+     * holding the guest lock. The queued resize precedes its next presentation. */
+    void (^resize_layer)(void) = ^{
+        CGFloat s = [UIScreen mainScreen].scale;
+        if (s < 1.0) s = 1.0;
+        g_layer.contentsScale = s;
+        g_layer.drawableSize = CGSizeMake((CGFloat)w, (CGFloat)h);
+        CGRect c = g_layer.bounds;
+        atomic_store(&g_cont_w, (int)c.size.width);
+        atomic_store(&g_cont_h, (int)c.size.height);
+    };
+    if ([NSThread isMainThread]) resize_layer();
+    else dispatch_async(dispatch_get_main_queue(), resize_layer);
 #else
     CGFloat s = g_win ? [g_win backingScaleFactor]
                       : [[NSScreen mainScreen] backingScaleFactor];

@@ -2,6 +2,7 @@ import SwiftUI
 import MetalKit
 import GameController
 import QuartzCore
+import UniformTypeIdentifiers
 
 // MARK: - GameController Yöneticisi (DualSense, Xbox, Switch Pro, MFi)
 
@@ -811,6 +812,7 @@ public final class NFSU2MetalRenderUIView: UIView {
 #if NFS_FULL_RUNTIME
         // The strong runtime owns this CAMetalLayer. Attach it on UIKit's
         // thread before the guest creates any renderer resources.
+        nfs_game_session_prepare_log()
         metal_init_ios(Unmanaged.passUnretained(mtl).toOpaque())
 #else
         metal_init()
@@ -905,6 +907,11 @@ public final class NFSU2MetalRenderUIView: UIView {
     }
 
 #if NFS_FULL_RUNTIME
+    private func publishSessionStatus(_ state: Int32, _ message: String) {
+        let handler = sessionStatusHandler
+        DispatchQueue.main.async { handler?(state, message) }
+    }
+
     func configureSession(executablePath: String?, assetRootPath: String?,
                           saveRootPath: String?, startRequested: Bool,
                           statusHandler: ((Int32, String) -> Void)?) {
@@ -921,19 +928,19 @@ public final class NFSU2MetalRenderUIView: UIView {
               bounds.width > 0, bounds.height > 0 else { return }
         guard let executablePath, let assetRootPath, let saveRootPath else {
             sessionStartAttempted = true
-            sessionStatusHandler?(Int32(NFS_GAME_SESSION_FAILED),
+            publishSessionStatus(Int32(NFS_GAME_SESSION_FAILED),
                 "The verified executable or sandbox roots are unavailable.")
             return
         }
         guard metal_available() != 0, metal_window_ready() != 0 else {
             sessionStartAttempted = true
-            sessionStatusHandler?(Int32(NFS_GAME_SESSION_FAILED),
+            publishSessionStatus(Int32(NFS_GAME_SESSION_FAILED),
                 "The real Metal device or CAMetalLayer is not ready; the guest was not started.")
             return
         }
 
         sessionStartAttempted = true
-        sessionStatusHandler?(Int32(NFS_GAME_SESSION_PREPARING),
+        publishSessionStatus(Int32(NFS_GAME_SESSION_PREPARING),
             "Authenticating SPEED2.EXE and preparing the full runtime…")
         let timer = Timer(timeInterval: 0.75, repeats: true) { [weak self] _ in
             self?.refreshSessionStatus()
@@ -957,7 +964,7 @@ public final class NFSU2MetalRenderUIView: UIView {
             DispatchQueue.main.async {
                 guard let self else { return }
                 if result != 0 {
-                    self.sessionStatusHandler?(nfs_game_session_get_state(), immediateMessage)
+                    self.publishSessionStatus(nfs_game_session_get_state(), immediateMessage)
                 }
                 self.refreshSessionStatus()
             }
@@ -971,7 +978,7 @@ public final class NFSU2MetalRenderUIView: UIView {
             nfs_game_session_get_status(ptr.baseAddress, ptr.count)
         }
         let message = String(cString: buffer)
-        sessionStatusHandler?(state, message)
+        publishSessionStatus(state, message)
         if state == Int32(NFS_GAME_SESSION_FAILED) || state == Int32(NFS_GAME_SESSION_EXITED) {
             sessionStatusTimer?.invalidate()
             sessionStatusTimer = nil
@@ -1082,7 +1089,16 @@ public struct GameMetalView: View {
 #if NFS_FULL_RUNTIME
     @State private var startRuntimeRequested = false
     @State private var sessionState = Int32(NFS_GAME_SESSION_IDLE)
+    @State private var chooseGameFolder = false
     @State private var sessionStatus = "Game files imported. Start begins one persistent guest session."
+
+    private var runtimeLogURL: URL? {
+        var path = [CChar](repeating: 0, count: 2048)
+        path.withUnsafeMutableBufferPointer { nfs_game_session_get_log_path($0.baseAddress, $0.count) }
+        let value = String(cString: path)
+        return value.isEmpty || !FileManager.default.fileExists(atPath: value)
+            ? nil : URL(fileURLWithPath: value)
+    }
 #endif
     
     // Kullanıcı kontrolcü bağlı olsa bile dokunmatiği zorla açabilir / kapatabilir
@@ -1121,18 +1137,23 @@ public struct GameMetalView: View {
                         Text(sessionStatus)
                             .font(.system(.caption2, design: .monospaced, weight: .medium))
                             .foregroundStyle(sessionState == Int32(NFS_GAME_SESSION_FAILED) ? .red : .white)
-                            .lineLimit(2)
+                            .lineLimit(3)
                             .textSelection(.enabled)
                             .padding(.horizontal, 10)
                             .padding(.vertical, 7)
                             .background(.black.opacity(0.66), in: RoundedRectangle(cornerRadius: 9))
+                            .allowsHitTesting(false)
                         Spacer()
+                        if let url = runtimeLogURL {
+                            ShareLink(item: url) { Image(systemName: "square.and.arrow.up") }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.mint)
+                        }
                     }
                     Spacer()
                 }
                 .padding(.top, 8)
                 .padding(.horizontal, 12)
-                .allowsHitTesting(false)
             } else {
                 VStack(spacing: 12) {
                     Text("FULL RUNTIME · GAME FILES IMPORTED")
@@ -1153,6 +1174,19 @@ public struct GameMetalView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .tint(.mint)
+                    .disabled(files.assetImportRunning)
+                    Button {
+                        chooseGameFolder = true
+                    } label: {
+                        Label(files.assetImportRunning ? "IMPORTING…" : "IMPORT / RETRY GAME FOLDER", systemImage: "folder.badge.plus")
+                    }
+                    .disabled(files.assetImportRunning)
+                    Text(files.assetImportMessage)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.7))
+                    if let url = runtimeLogURL {
+                        ShareLink(item: url) { Label("Share runtime log", systemImage: "square.and.arrow.up") }
+                    }
                     Text("Starting the guest does not confirm a visible game frame or playable race.")
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.65))
@@ -1180,6 +1214,14 @@ public struct GameMetalView: View {
             ))
 #endif
         }
+#if NFS_FULL_RUNTIME
+        .fileImporter(isPresented: $chooseGameFolder, allowedContentTypes: [.folder]) { result in
+            switch result {
+            case .success(let url): files.importGameAssets(from: url)
+            case .failure(let error): files.assetImportMessage = "Asset import failed: \(error.localizedDescription)"
+            }
+        }
+#endif
         .onAppear {
             controllerManager.checkForExistingControllers()
 #if NFS_FULL_RUNTIME

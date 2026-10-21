@@ -34,3 +34,11 @@ Checked PE adaptörü sonraki kaynak değişikliğinde uygulanmıştır: tam run
 `mem_load_pe` yalnız `guest_pe_load` çağırır; ikinci haritalama/durum yoktur.
 Sentetik malformed/valid/BSS/EBUSY testleri eklendi; özel CI exact EXE metadata
 kontrolünü de yapar. Native sonuç alınmadan bu adım doğrulanmış sayılmaz.
+
+First actual private iOS compile: run 39659578000, source 85a9c8d. The log
+contains 128 distinct shard compilation commands. The sole compiler error is
+the iOS CGRect.height access in metal.m; it is fixed using size.height and the
+UIKit main queue for layer resize. This run did not reach linking or produce
+an IPA. Source 985263b public CI run 39661055407 passed Linux/macOS, including
+the checked PE adapter malformed/BSS/resource/EBUSY tests on native Darwin.
+The actual private EXE adapter test belongs to the next full CI run.

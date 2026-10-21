@@ -15,6 +15,9 @@ static void copy_text(char *destination, size_t capacity, const char *source) {
 #import <pthread.h>
 #import <pthread/qos.h>
 #import <setjmp.h>
+#import <fcntl.h>
+#import <unistd.h>
+#include <sys/stat.h>
 
 #include "cpu.h"
 #include "decls.h"
@@ -53,6 +56,87 @@ static int g_guest_thread_created = 0;
 static char g_session_status[512] = "Full runtime session has not started.";
 static CPU g_primary_cpu;
 
+static NSString *runtime_log_path(void) {
+    NSArray<NSString *> *documents = NSSearchPathForDirectoriesInDomains(
+        NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *directory = documents.firstObject;
+    return directory ? [directory stringByAppendingPathComponent:@"NFSU2Runtime.log"] : nil;
+}
+
+static void copy_plist_field(NSString *key, char *destination, size_t capacity) {
+    if (!destination || capacity == 0) return;
+    destination[0] = '\0';
+    id value = [[NSBundle mainBundle] objectForInfoDictionaryKey:key];
+    if (![value isKindOfClass:[NSString class]]) {
+        snprintf(destination, capacity, "unset");
+        return;
+    }
+
+    const char *utf8 = [(NSString *)value UTF8String];
+    if (!utf8) {
+        snprintf(destination, capacity, "unset");
+        return;
+    }
+    size_t out = 0;
+    for (size_t i = 0; utf8[i] && out + 1 < capacity && out < 128; ++i) {
+        unsigned char c = (unsigned char)utf8[i];
+        destination[out++] = ((c >= 'a' && c <= 'z') ||
+                              (c >= 'A' && c <= 'Z') ||
+                              (c >= '0' && c <= '9') ||
+                              c == '.' || c == '_' || c == '-') ? (char)c : '_';
+    }
+    destination[out] = '\0';
+    if (out == 0) snprintf(destination, capacity, "unset");
+}
+
+static void redirect_runtime_stderr(void) {
+    @autoreleasepool {
+        NSString *path = runtime_log_path();
+        NSError *directory_error = nil;
+        NSString *directory = [path stringByDeletingLastPathComponent];
+        if (!path || ![[NSFileManager defaultManager]
+                createDirectoryAtPath:directory
+          withIntermediateDirectories:YES
+                           attributes:nil
+                                error:&directory_error]) {
+            /* Keep the current stderr descriptor intact if Documents cannot be prepared. */
+            dprintf(STDERR_FILENO, "NFSU2 log unavailable; stderr redirection skipped.\n");
+            return;
+        }
+
+        int log_fd = open(path.fileSystemRepresentation,
+                          O_WRONLY | O_CREAT | O_APPEND, S_IRUSR | S_IWUSR);
+        if (log_fd < 0) {
+            dprintf(STDERR_FILENO,
+                    "NFSU2 log unavailable (open error %d); stderr redirection skipped.\n",
+                    errno);
+            return;
+        }
+        if (dup2(log_fd, STDERR_FILENO) < 0) {
+            int saved_errno = errno;
+            if (log_fd != STDERR_FILENO) close(log_fd);
+            dprintf(STDERR_FILENO,
+                    "NFSU2 log unavailable (descriptor error %d); stderr redirection skipped.\n",
+                    saved_errno);
+            return;
+        }
+        if (log_fd != STDERR_FILENO) close(log_fd);
+
+        char version[129], build[129], source_sha[129];
+        copy_plist_field(@"CFBundleShortVersionString", version, sizeof version);
+        copy_plist_field(@"CFBundleVersion", build, sizeof build);
+        copy_plist_field(@"NFSRuntimeSourceSHA", source_sha, sizeof source_sha);
+        dprintf(STDERR_FILENO,
+                "NFSU2 runtime log started; app_version=%s app_build=%s runtime_source_sha=%s\n",
+                version, build, source_sha);
+    }
+}
+
+void nfs_game_session_prepare_log(void) {
+    static pthread_once_t once = PTHREAD_ONCE_INIT;
+    pthread_once(&once, redirect_runtime_stderr);
+}
+
 static void set_status_locked(int state, const char *message) {
     g_session_state = state;
     snprintf(g_session_status, sizeof g_session_status, "%s", message ? message : "");
@@ -60,6 +144,7 @@ static void set_status_locked(int state, const char *message) {
 
 static int fail_session(int error_code, const char *message,
                         char *diagnostic, size_t diagnostic_capacity) {
+    fprintf(stderr, "runtime session failed: error=%d %s\n", error_code, message ? message : "");
     pthread_mutex_lock(&g_session_lock);
     g_pause_requested = 0;
     set_status_locked(NFS_GAME_SESSION_FAILED, message);
@@ -199,8 +284,26 @@ int nfs_game_session_get_state(void) {
 
 void nfs_game_session_get_status(char *diagnostic, size_t diagnostic_capacity) {
     pthread_mutex_lock(&g_session_lock);
-    copy_text(diagnostic, diagnostic_capacity, g_session_status);
+    long frames = metal_frames(), triangles = metal_tris(), textures = metal_tex_uploaded();
+    if (diagnostic && diagnostic_capacity)
+        snprintf(diagnostic, diagnostic_capacity, "%s\nRenderer: %ld presents / %ld triangles / %ld texture uploads (scene unverified)",
+                 g_session_status, frames, triangles, textures);
+    static long logged_frames = -1, logged_triangles = -1, logged_textures = -1;
+    if (frames != logged_frames || triangles != logged_triangles || textures != logged_textures) {
+        fprintf(stderr, "runtime evidence: presents=%ld triangles=%ld textures_uploaded=%ld; actual scene/device validation pending\n",
+                frames, triangles, textures);
+        logged_frames = frames; logged_triangles = triangles; logged_textures = textures;
+    }
     pthread_mutex_unlock(&g_session_lock);
+}
+
+void nfs_game_session_get_log_path(char *path, size_t path_capacity) {
+    if (!path || path_capacity == 0) return;
+    path[0] = '\0';
+    @autoreleasepool {
+        NSString *log_path = runtime_log_path();
+        if (log_path) copy_text(path, path_capacity, log_path.fileSystemRepresentation);
+    }
 }
 
 static void *guest_entry_thread(void *unused) {
@@ -271,6 +374,9 @@ int nfs_game_session_start(const char *executable_path,
     int rc = verify_executable_and_roots(executable_path, asset_root, save_root,
                                          local_diagnostic, sizeof local_diagnostic);
     if (rc) return fail_session(rc, local_diagnostic, diagnostic, diagnostic_capacity);
+
+    /* Capture subsequent runtime stderr in an append-only, user-accessible file. */
+    nfs_game_session_prepare_log();
 
     if (!metal_available() || !metal_window_ready()) {
         return fail_session(ENODEV,
@@ -371,10 +477,15 @@ int nfs_game_session_start(const char *executable_path,
 
 void nfs_game_session_set_active(int active) { (void)active; }
 void nfs_game_session_checkpoint(void) { }
+void nfs_game_session_prepare_log(void) { }
 int nfs_game_session_get_state(void) { return NFS_GAME_SESSION_IDLE; }
 void nfs_game_session_get_status(char *diagnostic, size_t diagnostic_capacity) {
     copy_text(diagnostic, diagnostic_capacity,
               "This build contains diagnostics only; the full game runtime is not enabled.");
+}
+
+void nfs_game_session_get_log_path(char *path, size_t path_capacity) {
+    copy_text(path, path_capacity, "");
 }
 
 #endif

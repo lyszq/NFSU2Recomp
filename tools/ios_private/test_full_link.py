@@ -44,5 +44,10 @@ class FullLinkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unresolved runtime'):
             verify(map_text, nm + '\n                 (undefined) external _sub_00401000')
 
+    def test_system_dispatch_import_is_allowed(self):
+        map_text, nm = self.fixture()
+        result = verify(map_text, nm + '\n                 (undefined) external _dispatch_async (from libSystem)')
+        self.assertEqual(result['dynamic_undefined_count'], 1)
+
 if __name__ == '__main__':
     unittest.main()
