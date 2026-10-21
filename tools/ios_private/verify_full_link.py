@@ -15,6 +15,7 @@ REQUIRED = {
     "metal_render_frame": "metal.o", "metal_available": "metal.o",
     "metal_present": "metal.o", "nfs_game_session_start": "NFSU2GameSession.o",
     "audio_init": "audio.o", "audio_play": "audio.o",
+    "guest_pe_load": "guest_pe.o",
     "vs_to_msl": "vsemu.o", "fileio_call": "fileio.o",
     "g_fn_count": "fntab.o", "g_fn_ptr": "fntab.o", "g_imp_count": "impargs.o",
     "sub_0075bcc7": None,

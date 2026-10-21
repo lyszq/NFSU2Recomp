@@ -3,6 +3,12 @@
 #include <pthread.h>
 #include "cpu.h"
 #include "guest_memory.h"
+#ifndef NFS_FULL_RUNTIME
+#define NFS_FULL_RUNTIME 0
+#endif
+#if NFS_FULL_RUNTIME
+#include "guest_pe.h"
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -192,6 +198,78 @@ void mem_fault_handler_install(void){
 }
 
 int mem_load_pe(const char *path){
+#if NFS_FULL_RUNTIME
+    FILE *f;
+    long file_size;
+    size_t length;
+    uint8_t *source;
+    int io_error = 0;
+    GuestPEImage image;
+    char diagnostic[192];
+
+    if (!path){ errno = EINVAL; return -1; }
+    f = fopen(path, "rb");
+    if (!f) return -1;
+    errno = 0;
+    if (fseek(f, 0, SEEK_END) != 0){
+        io_error = errno ? errno : EIO;
+    } else {
+        errno = 0;
+        file_size = ftell(f);
+        if (file_size < 0) io_error = errno ? errno : EIO;
+        else if ((uintmax_t)file_size > (uintmax_t)SIZE_MAX) io_error = EFBIG;
+        else {
+            errno = 0;
+            if (fseek(f, 0, SEEK_SET) != 0) io_error = errno ? errno : EIO;
+        }
+    }
+    if (io_error){
+        (void)fclose(f);
+        errno = io_error;
+        return -1;
+    }
+
+    length = (size_t)file_size;
+    source = (uint8_t *)malloc(length ? length : 1u);
+    if (!source){
+        io_error = errno ? errno : ENOMEM;
+        (void)fclose(f);
+        errno = io_error;
+        return -1;
+    }
+    if (length){
+        errno = 0;
+        if (fread(source, 1, length, f) != length)
+            io_error = (ferror(f) && errno) ? errno : EIO;
+    }
+    errno = 0;
+    if (fclose(f) != 0 && !io_error)
+        io_error = errno ? errno : EIO;
+    if (io_error){
+        free(source);
+        errno = io_error;
+        return -1;
+    }
+
+    int rc = guest_pe_load(source, length, &image, diagnostic, sizeof diagnostic);
+    free(source);
+    if (rc){
+        fprintf(stderr, "%s: %s\n", path, diagnostic);
+        errno = rc;
+        return -1;
+    }
+
+    /* Preserve the legacy runtime ABI while sharing the checked VM mapping. */
+    g_image_base = image.image_base;
+    g_image_size = image.image_size;
+    g_image_entry = image.entry_point;
+    g_res_dir_va = image.resource_address;
+    g_res_dir_size = image.resource_size;
+    fprintf(stderr, "  image 0x%08x .. 0x%08x   kaynak dizini 0x%08x (%u bayt), %u bolum\n",
+            g_image_base, g_image_base + g_image_size,
+            g_res_dir_va, g_res_dir_size, image.section_count);
+    return 0;
+#else
     FILE *f = fopen(path, "rb");
     if(!f){ perror(path); return -1; }
     fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
@@ -228,4 +306,5 @@ int mem_load_pe(const char *path){
     fprintf(stderr,"  image 0x%08x .. 0x%08x   kaynak dizini 0x%08x (%u bayt)\n",
             base, base+imgsz, g_res_dir_va, g_res_dir_size);
     return 0;
+#endif
 }

@@ -23,6 +23,7 @@ FULL_RUNTIME_SHARDS = 128
 FULL_RUNTIME_C_SOURCES = (
     "mem",
     "guest_memory",
+    "guest_pe",
     "guest_dispatch",
     "guest_bootstrap",
     "dispatch",
@@ -199,8 +200,9 @@ def _read_version(root: Path) -> str:
 
 
 def _configure_full_mode(root: Path, spec: dict[str, Any]) -> None:
-    _validate_full_generation(root)
+    manifest = _validate_full_generation(root)
     target = spec["targets"]["NFSU2iOS"]
+    target["info"]["properties"]["NFSRuntimeSourceSHA"] = manifest["source_commit"]
     target["sources"] = _full_runtime_sources(root)
     base = target["settings"]["base"]
     _add_values(base, "GCC_PREPROCESSOR_DEFINITIONS", [

@@ -65,6 +65,9 @@ done
   ios/NFSU2iOS/Native/GuestSmoke.c ios/tests/smoke_cli.c -o "$DEST/nfsu2-smoke"
 "$DEST/nfsu2-smoke"
 if [[ "$(uname -s)" == Darwin ]]; then
+  "$CC" "${FLAGS[@]}" -DNFS_FULL_RUNTIME=1 runtime/mem.c runtime/guest_memory.c runtime/guest_pe.c \
+    tests/full_pe_adapter_test.c -o "$DEST/full-pe-adapter-test"
+  "$DEST/full-pe-adapter-test"
   "$CC" "${FLAGS[@]}" runtime/mem.c runtime/guest_memory.c \
     tests/guest_memory_desktop_test.c -o "$DEST/guest-memory-desktop-test"
   "$DEST/guest-memory-desktop-test"
