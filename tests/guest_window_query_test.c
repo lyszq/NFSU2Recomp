@@ -399,12 +399,105 @@ static int test_null_client_rect(void) {
     return 0;
 }
 
+static int write_metrics_frame(uint32_t address, uint32_t ret, uint32_t metric) {
+    const uint32_t frame[2] = { ret, metric };
+    return write_bytes(address, frame, sizeof(frame));
+}
+
+static int expect_completed_metrics_cpu(const CPU *actual, const CPU *before,
+                                        uint32_t ret, uint32_t expected_eax) {
+    CPU expected = *before;
+    expected.eax = expected_eax;
+    expected.eip = ret;
+    expected.esp = before->esp + 8u;
+    if (memcmp(actual, &expected, sizeof(expected)) == 0) return 0;
+    fprintf(stderr,
+            "FAIL %s:%d: completed metrics call changed CPU beyond EAX/EIP/ESP "
+            "(EAX=%08x EIP=%08x ESP=%08x)\n",
+            __FILE__, __LINE__, actual->eax, actual->eip, actual->esp);
+    return 1;
+}
+
+static int test_get_system_metrics(void) {
+    CPU cpu, before;
+    uint32_t fault = 0x12345678u;
+    GuestImport import = get_window_rect_import("USER32.dll", "GetSystemMetrics");
+    GuestImport wrong_lib = get_window_rect_import("KERNEL32.dll", "GetSystemMetrics");
+    GuestImport wrong_name = get_window_rect_import("USER32.dll", "GetSystemMetricsW");
+
+    /* SM_SWAPBUTTON (23): returns 0 (FALSE = normal mouse buttons, left is primary) */
+    CHECK(write_metrics_frame(STACK_ADDR, RETURN_ADDRESS, 23) == 0);
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    CHECK(guest_windows_import(&cpu, &import, NULL, &fault) == 1);
+    CHECK(expect_completed_metrics_cpu(&cpu, &before, RETURN_ADDRESS, 0) == 0);
+
+    /* Direct handler test */
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    CHECK(guest_user32_get_system_metrics(&cpu, &import, &fault) == 1);
+    CHECK(expect_completed_metrics_cpu(&cpu, &before, RETURN_ADDRESS, 0) == 0);
+
+    /* SM_CXSCREEN (0): returns 640 */
+    CHECK(write_metrics_frame(STACK_ADDR, RETURN_ADDRESS, 0) == 0);
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    CHECK(guest_windows_import(&cpu, &import, NULL, &fault) == 1);
+    CHECK(expect_completed_metrics_cpu(&cpu, &before, RETURN_ADDRESS, 640) == 0);
+
+    /* SM_CYSCREEN (1): returns 480 */
+    CHECK(write_metrics_frame(STACK_ADDR, RETURN_ADDRESS, 1) == 0);
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    CHECK(guest_windows_import(&cpu, &import, NULL, &fault) == 1);
+    CHECK(expect_completed_metrics_cpu(&cpu, &before, RETURN_ADDRESS, 480) == 0);
+
+    /* Unknown metric (999): returns 0 */
+    CHECK(write_metrics_frame(STACK_ADDR, RETURN_ADDRESS, 999) == 0);
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    CHECK(guest_windows_import(&cpu, &import, NULL, &fault) == 1);
+    CHECK(expect_completed_metrics_cpu(&cpu, &before, RETURN_ADDRESS, 0) == 0);
+
+    /* Memory fault on unmapped stack frame */
+    init_cpu(&cpu, FRAME_UNMAPPED, TEB_ADDR);
+    before = cpu;
+    fault = 0xabcdef12u;
+    CHECK(guest_windows_import(&cpu, &import, NULL, &fault) == -1);
+    CHECK(fault == FRAME_UNMAPPED);
+    CHECK(expect_unchanged_cpu(&cpu, &before) == 0);
+
+    /* Wrong library must remain unhandled */
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    fault = 0xabcdef12u;
+    CHECK(guest_windows_import(&cpu, &wrong_lib, NULL, &fault) == 0);
+    CHECK(expect_unchanged_cpu(&cpu, &before) == 0);
+    CHECK(fault == 0xabcdef12u);
+
+    /* Wrong export name must remain unhandled */
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    fault = 0xabcdef12u;
+    CHECK(guest_windows_import(&cpu, &wrong_name, NULL, &fault) == 0);
+    CHECK(expect_unchanged_cpu(&cpu, &before) == 0);
+    CHECK(fault == 0xabcdef12u);
+
+    /* NULL guards */
+    CHECK(guest_user32_get_system_metrics(NULL, &import, &fault) == 0);
+    CHECK(guest_user32_get_system_metrics(&cpu, NULL, &fault) == 0);
+    CHECK(guest_user32_get_system_metrics(&cpu, &import, NULL) == 0);
+
+    return 0;
+}
+
 int main(void) {
     CHECK(guest_memory_init() == 0);
     CHECK(guest_memory_commit(STACK_PAGE, PAGE_SIZE) == 0);
 
     CHECK(test_null_window_and_ignored_rect() == 0);
     CHECK(test_null_client_rect() == 0);
+    CHECK(test_get_system_metrics() == 0);
     CHECK(test_teb_faults_are_atomic() == 0);
     CHECK(test_teb_frame_alias_and_top_boundary() == 0);
     CHECK(test_frame_faults() == 0);

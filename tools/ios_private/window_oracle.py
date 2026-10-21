@@ -8,12 +8,16 @@ from typing import Any
 
 WINDOW_IMPORT_LIBRARY = "user32.dll"
 WINDOW_IMPORT_NAME = "GetWindowRect"
-SUPPORTED_WINDOW_QUERIES = frozenset(("GetWindowRect", "GetClientRect"))
+SUPPORTED_WINDOW_QUERIES = frozenset(("GetWindowRect", "GetClientRect", "GetSystemMetrics"))
 WINDOW_PROFILE = "headless_no_guest_window"
 IMPORT_BASE = 0xF0000000
 TEB_BASE = 0x00C00000
 LAST_ERROR_OFFSET = 0x34
 ERROR_INVALID_WINDOW_HANDLE = 1400
+
+SM_CXSCREEN = 0
+SM_CYSCREEN = 1
+SM_SWAPBUTTON = 23
 
 
 def _range_is_mapped(address: int, size: int,
@@ -85,6 +89,48 @@ def _window_query_import(engine: Any, registers: Any, unicorn_module: Any,
         return False
 
     esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+
+    if row.get("name") == "GetSystemMetrics":
+        if not _range_has_permissions(
+                engine, esp, 8, unicorn_module.UC_PROT_READ, mapped_ranges):
+            _memory_fault(state, "read", esp, 8)
+            return False
+
+        frame = bytes(engine.mem_read(esp, 8))
+        return_address, metric = struct.unpack("<II", frame)
+        import_index = int(row["index"])
+
+        if metric == SM_SWAPBUTTON:
+            result = 0
+        elif metric == SM_CXSCREEN:
+            result = 640
+        elif metric == SM_CYSCREEN:
+            result = 480
+        else:
+            result = 0
+
+        api = {
+            "library": library,
+            "name": "GetSystemMetrics",
+            "import_index": import_index,
+            "tag": IMPORT_BASE + import_index,
+            "call_ip": state["last_ip"],
+            "esp_before": esp,
+            "argument_count": 1,
+            "return_address": return_address,
+            "arguments": [metric],
+            "result": result,
+            "outcome": "success",
+            "profile": WINDOW_PROFILE,
+            "esp_after": (esp + 8) & 0xFFFFFFFF,
+        }
+        state.setdefault("api_calls", []).append(api)
+        engine.reg_write(registers.UC_X86_REG_EAX, result)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        engine.reg_write(registers.UC_X86_REG_ESP, (esp + 8) & 0xFFFFFFFF)
+        state["resume"] = True
+        return True
+
     if not _range_has_permissions(
             engine, esp, 12, unicorn_module.UC_PROT_READ, mapped_ranges):
         _memory_fault(state, "read", esp, 12)
@@ -145,6 +191,10 @@ def _window_query_import(engine: Any, registers: Any, unicorn_module: Any,
 __all__ = [
     "WINDOW_IMPORT_LIBRARY",
     "WINDOW_IMPORT_NAME",
+    "SUPPORTED_WINDOW_QUERIES",
     "WINDOW_PROFILE",
+    "SM_SWAPBUTTON",
+    "SM_CXSCREEN",
+    "SM_CYSCREEN",
     "_window_query_import",
 ]

@@ -338,6 +338,80 @@ class WindowOracleTests(unittest.TestCase):
                 self.assertEqual(api["return_address"], RETURN_ADDRESS)
                 self.assertEqual(api["arguments"], [0, 0xDEADBEEF])
 
+    def test_get_system_metrics_swapbutton_returns_zero(self) -> None:
+        row = {"library": "USER32.dll", "name": "GetSystemMetrics", "index": IMPORT_INDEX}
+        frame = struct.pack("<II", RETURN_ADDRESS, 23)
+        self.engine.mem_write(STACK_BASE, frame)
+        self.set_registers(STACK_BASE)
+
+        self.assertTrue(self.call_import(row=row))
+
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX), 0)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), STACK_BASE + 8)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP), RETURN_ADDRESS)
+        self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EFLAGS), self.flags_before)
+        for offset, register in enumerate(OTHER_REGISTERS):
+            self.assertEqual(self.engine.reg_read(register), 0x11110000 + offset)
+        self.assertTrue(self.state["resume"])
+        self.assertIsNone(self.state["status"])
+        self.assertEqual(len(self.state["api_calls"]), 1)
+        api = self.state["api_calls"][0]
+        self.assertEqual(api["name"], "GetSystemMetrics")
+        self.assertEqual(api["arguments"], [23])
+        self.assertEqual(api["result"], 0)
+        self.assertEqual(api["esp_after"], STACK_BASE + 8)
+
+    def test_get_system_metrics_screen_dimensions(self) -> None:
+        row = {"library": "USER32.dll", "name": "GetSystemMetrics", "index": IMPORT_INDEX}
+        metrics_cases = [
+            (0, 640),    # SM_CXSCREEN
+            (1, 480),    # SM_CYSCREEN
+            (23, 0),     # SM_SWAPBUTTON
+            (999, 0),    # unknown
+        ]
+        for metric, expected_result in metrics_cases:
+            with self.subTest(metric=metric):
+                self.state["api_calls"] = []
+                self.state["resume"] = False
+                frame = struct.pack("<II", RETURN_ADDRESS, metric)
+                self.engine.mem_write(STACK_BASE, frame)
+                self.set_registers(STACK_BASE)
+
+                self.assertTrue(self.call_import(row=row))
+
+                self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EAX), expected_result)
+                self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_ESP), STACK_BASE + 8)
+                self.assertEqual(self.engine.reg_read(x86_const.UC_X86_REG_EIP), RETURN_ADDRESS)
+
+    def test_get_system_metrics_unmapped_frame_faults_atomically(self) -> None:
+        row = {"library": "USER32.dll", "name": "GetSystemMetrics", "index": IMPORT_INDEX}
+        self.set_registers(0x00600000)
+        registers_before = self.register_snapshot()
+
+        self.assertFalse(self.call_import(row=row))
+
+        self.assertEqual(self.register_snapshot(), registers_before)
+        self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
+        self.assertEqual(self.state["target"], 0x00600000)
+        self.assertEqual(self.state["memory_fault"], {
+            "access": "read", "address": 0x00600000, "size": 8,
+        })
+        self.assertEqual(self.state["api_calls"], [])
+        self.assertFalse(self.state["resume"])
+
+    def test_get_system_metrics_wrong_library_is_unsupported(self) -> None:
+        row = {"library": "KERNEL32.dll", "name": "GetSystemMetrics", "index": IMPORT_INDEX}
+        frame = struct.pack("<II", RETURN_ADDRESS, 23)
+        self.engine.mem_write(STACK_BASE, frame)
+        self.set_registers(STACK_BASE)
+        registers_before = self.register_snapshot()
+
+        self.assertFalse(self.call_import(row=row))
+
+        self.assertEqual(self.register_snapshot(), registers_before)
+        self.assertEqual(self.state["api_calls"], [])
+        self.assertFalse(self.state["resume"])
+
 
 if __name__ == "__main__":
     unittest.main()
