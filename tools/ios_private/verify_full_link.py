@@ -44,7 +44,7 @@ def verify(map_text, nm_text):
         owner = objects.get(symbols[name], "")
         if expected_object and Path(owner).name != expected_object:
             raise ValueError(f"wrong owner for {name}: {owner}")
-        rows = [line for line in nm_text.splitlines() if re.search(r"_" + re.escape(name) + r"$", line)]
+        rows = [line for line in nm_text.splitlines() if re.search(r"(?:^|\s)_" + re.escape(name) + r"$", line)]
         if len(rows) != 1 or "weak" in rows[0].lower() or "undefined" in rows[0].lower():
             raise ValueError(f"symbol is absent, weak or undefined: {name}")
         evidence[name] = owner

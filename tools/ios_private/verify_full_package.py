@@ -17,6 +17,21 @@ ROOT = Path(__file__).resolve().parents[2]
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
+def validate_compile_jobs(jobs):
+    """Only permit replay of a successful build stopped at its link verifier."""
+    by_name = {j['name']: j for j in jobs}
+    if len(jobs) != 2 or set(by_name) != {'native-reference-linux', 'full-runtime-ios'}:
+        raise ValueError('unexpected original build jobs')
+    native, full = by_name['native-reference-linux'], by_name['full-runtime-ios']
+    if native['conclusion'] != 'success' or full['conclusion'] != 'failure':
+        raise ValueError('original native reference must pass and verifier job must fail')
+    steps = full['steps']
+    failed = [s['name'] for s in steps if s.get('conclusion') == 'failure']
+    compiled = [s for s in steps if s['name'] == 'Compile and link the complete ARM64 iOS runtime']
+    if (failed != ['Verify all shard objects and strong real backend linkage']
+        or len(compiled) != 1 or compiled[0]['conclusion'] != 'success'):
+        raise ValueError('only a verifier failure after successful compile/link can be replayed')
+
 def inspect_binary(binary):
     magic, cpu, _, filetype, count, command_bytes, _, _ = struct.unpack_from('<8I', binary)
     if (magic, cpu, filetype) != (0xfeedfacf, 0x0100000c, 2):
@@ -61,13 +76,46 @@ def main():
     p.add_argument('--source',required=True)
     p.add_argument('--run',type=int,required=True)
     p.add_argument('--public-run',type=int,required=True)
+    p.add_argument('--replay-run',type=int)
+    p.add_argument('--replay-source')
     a=p.parse_args()
     client=GitHub('NFSU2Recomp-ios-private'); client.private()
     base='/repos/'+client.repository
     private=client.api(base+'/actions/runs/'+str(a.run))
     public=client.api('/repos/lyszq/NFSU2Recomp/actions/runs/'+str(a.public_run))
     jobs=client.api(base+'/actions/runs/'+str(a.run)+'/jobs')['jobs']
-    if private['conclusion']!='success' or public['conclusion']!='success' or public['head_sha']!=a.source or not all(j['conclusion']=='success' for j in jobs):
+    replay = None
+    if public['conclusion']!='success' or public['head_sha']!=a.source:
+        raise ValueError('exact public/private CI success is required')
+    if a.replay_run:
+        validate_compile_jobs(jobs)
+        if private['conclusion'] != 'failure' or not a.replay_source:
+            raise ValueError('replay needs an explicit verifier source and original failure')
+        replay = client.api(base+'/actions/runs/'+str(a.replay_run))
+        replay_jobs = client.api(base+'/actions/runs/'+str(a.replay_run)+'/jobs')['jobs']
+        if replay['conclusion'] != 'success' or not replay_jobs or not all(j['conclusion']=='success' for j in replay_jobs):
+            raise ValueError('private independent artifact verification must succeed')
+        replay_workflow = client.api(base+'/contents/.github/workflows/ios-private.yml?ref='+replay['head_sha'])
+        replay_content = base64.b64decode(replay_workflow['content']).decode()
+        receipt = json.loads((a.delivery/'full-runtime-reverification.json').read_text())
+        for line in ['SOURCE_SHA: '+a.source, 'VERIFIER_SHA: '+a.replay_source,
+                     'BUILD_RUN_ID: "'+str(a.run)+'"',
+                     'BUILD_ARTIFACT_ID: "'+str(receipt['build_artifact_id'])+'"',
+                     'BUILD_ARTIFACT_SHA256: '+receipt['build_artifact_sha256']]:
+            if line not in replay_content: raise ValueError('private replay workflow pin mismatch')
+        artifact = client.api(base+'/actions/artifacts/'+str(receipt['build_artifact_id']))
+        original_zip = a.delivery/(str(artifact['id'])+'.zip')
+        if (artifact['workflow_run']['id'] != a.run
+            or artifact['digest'] != 'sha256:'+receipt['build_artifact_sha256']
+            or digest(original_zip.read_bytes()) != receipt['build_artifact_sha256']):
+            raise ValueError('original build artifact hash chain differs')
+        with zipfile.ZipFile(original_zip) as z:
+            original_ipa = z.read('UNVERIFIED-NFSU2iOS-full-runtime-unsigned.ipa')
+        if (receipt['compiled_source'] != a.source or receipt['verifier_source'] != a.replay_source
+            or receipt['build_run'] != a.run or digest(original_ipa) != receipt['ipa_sha256']
+            or digest((a.delivery/'NFSU2iOS-full-runtime-unsigned.ipa').read_bytes()) != receipt['ipa_sha256']):
+            raise ValueError('replayed IPA differs from original compiled artifact')
+    elif private['conclusion']!='success' or not all(j['conclusion']=='success' for j in jobs):
         raise ValueError('exact public/private CI success is required')
     control=private['head_sha']
     workflow=client.api(base+'/contents/.github/workflows/ios-private.yml?ref='+control)
@@ -98,6 +146,11 @@ def main():
     tracked=subprocess.check_output(['git','ls-files','--','gen/*','out/*','*.exe','*.EXE','*.ipa'],cwd=ROOT,text=True)
     if tracked.strip(): raise ValueError('confidential inputs/outputs tracked in public source')
     result={'source_commit':a.source,'private_control_commit':control,'private_ci':private['html_url'],'public_ci':public['html_url'],'private_jobs':[{k:j[k] for k in ['id','name','conclusion']} for j in jobs],'ipa_sha256':digest(ipa.read_bytes()),'ipa_bytes':ipa.stat().st_size,'binary_sha256':digest(binary),'version':info['CFBundleShortVersionString'],'build':info['CFBundleVersion'],'architecture':'ARM64 iOS','unsigned':True,'segments':segments,'shards':128,'generation_summary':report['generation']['summary'],'strong_backend_objects':actual['strong_symbols'],'public_main':main_sha,'device_validation':'pending','game_boot':False,'real_game_frame':False,'gameplay_audio':False,'playable_race':False}
+    if replay:
+        result.update(private_ci_conclusion=private['conclusion'],
+                      private_reverification_ci=replay['html_url'],
+                      private_reverification_conclusion=replay['conclusion'],
+                      reverification=receipt)
     (a.delivery/'BUILD-VERIFICATION.json').write_text(json.dumps(result,indent=2)+'\n',encoding='utf-8')
     print(json.dumps(result,indent=2))
 

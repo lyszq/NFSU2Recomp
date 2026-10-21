@@ -1,0 +1,61 @@
+# PRIVATE ONLY. An immutable linked artifact is verified without recompilation.
+name: Private full runtime immutable IPA verification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  SOURCE_SHA: edf9aff245ed20687bcd67836df0c2c96ac80e28
+  VERIFIER_SHA: VERIFIER_COMMIT_PLACEHOLDER
+  BUILD_RUN_ID: "39666847112"
+  BUILD_ARTIFACT_ID: "12379091228"
+  BUILD_ARTIFACT_SHA256: ee6d0666a7f427ea9ba879479915a40a7b7f225dedfd4f3d4ff74deffb77f373
+jobs:
+  verify-immutable-full-runtime:
+    if: github.event.repository.private == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Require private repository and exact verifier pin
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$VERIFIER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git clone --filter=blob:none --no-checkout https://github.com/lyszq/NFSU2Recomp.git "$RUNNER_TEMP/verifier"
+          cd "$RUNNER_TEMP/verifier"
+          git fetch --depth=1 origin "$VERIFIER_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$VERIFIER_SHA"
+      - name: Verifier regression tests
+        working-directory: ${{ runner.temp }}/verifier
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/ios_private -p 'test_full*.py'
+      - name: Download original private artifact and authenticated job metadata
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          gh api "repos/$GH_REPO/actions/runs/$BUILD_RUN_ID/jobs" > "$RUNNER_TEMP/build-jobs.json"
+          gh api "repos/$GH_REPO/actions/artifacts/$BUILD_ARTIFACT_ID" > "$RUNNER_TEMP/artifact.json"
+          gh api "repos/$GH_REPO/actions/artifacts/$BUILD_ARTIFACT_ID/zip" > "$RUNNER_TEMP/original.zip"
+      - name: Verify original bytes, native package and complete strong linkage
+        working-directory: ${{ runner.temp }}/verifier
+        run: |
+          set -euo pipefail
+          python3 tools/ios_private/reverify_full_artifact.py \
+            --zip "$RUNNER_TEMP/original.zip" --artifact "$RUNNER_TEMP/artifact.json" \
+            --jobs "$RUNNER_TEMP/build-jobs.json" --source "$SOURCE_SHA" \
+            --verifier-source "$VERIFIER_SHA" --build-run "$BUILD_RUN_ID" \
+            --artifact-id "$BUILD_ARTIFACT_ID" --artifact-sha256 "$BUILD_ARTIFACT_SHA256" \
+            --out "$RUNNER_TEMP/verified-full-runtime"
+      - name: Upload verified original IPA and provenance privately
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSU2iOS-full-runtime-private-reverified
+          path: ${{ runner.temp }}/verified-full-runtime/*
+          if-no-files-found: error
+          retention-days: 7

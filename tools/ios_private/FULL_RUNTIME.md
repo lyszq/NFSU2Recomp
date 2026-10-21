@@ -44,3 +44,15 @@ separate runtime/device evidence. Neither a clear frame nor a frame counter alon
 establishes a real game scene. The session retains one coherent guest process;
 it does not mix the bounded Win32 heap/handle/TLS state into the legacy runtime.
 The existing runtime interprets small guest x86 thunks without CPU JIT.
+
+If an app links successfully but a verifier defect rejects it, the private
+`ios-full-reverify.yml` recovery lane checks the immutable original artifact.
+Its original run/artifact IDs, artifact ZIP hash, compiled source and corrected
+verifier source are explicitly pinned. `reverify_full_artifact.py` requires the
+native reference tests and compile/link step to have passed and the sole failed
+step to be the link verifier. It checks the original ZIP against GitHub metadata,
+then repeats package, source and complete linkage checks without recompilation.
+`verify_full_package.py --replay-run ID --replay-source SHA` additionally checks
+successful private replay, its workflow pins, and byte identity with the original
+IPA. Reports retain the original CI failure and separate successful verification;
+they never relabel a failed build run as successful or change the compiled SHA.

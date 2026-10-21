@@ -24,6 +24,12 @@ class FullLinkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '128 shard'):
             verify(map_text.replace('shard_0127.o', 'other.o'), nm)
 
+    def test_distinct_symbol_with_matching_suffix_is_not_a_duplicate(self):
+        map_text, nm = self.fixture()
+        # The actual iOS app contains both legacy and checked dispatchers.
+        result = verify(map_text, nm + '\n000000010002b5ec (__TEXT,__text) non-external (was a private external) _guest_dispatch_init')
+        self.assertIn('dispatch_init', result['strong_symbols'])
+
     def test_weak_backend_is_rejected(self):
         map_text, nm = self.fixture()
         with self.assertRaisesRegex(ValueError, 'weak'):
