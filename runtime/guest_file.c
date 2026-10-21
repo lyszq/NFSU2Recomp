@@ -82,20 +82,42 @@ static int vfs_copy_file(const char *src, const char *dst)
     return 1;
 }
 
+/* --- Root Path Lookup Helper --- */
+static const char *vfs_get_root_path(const GuestVFS *vfs, uint8_t root_id)
+{
+    if (root_id == GUEST_VFS_ROOT_ID_WRITE) {
+        return (vfs->write_root[0] != '\0') ? vfs->write_root : vfs->read_root;
+    }
+    if (root_id < vfs->root_count && vfs->roots[root_id].active) {
+        return vfs->roots[root_id].path;
+    }
+    if (vfs->read_root[0] != '\0') {
+        return vfs->read_root;
+    }
+    return "";
+}
+
 /* --- Path Normalization & Traversal Sandbox Sanitization --- */
 static int vfs_normalize_path(const char *win, char *out_canon, size_t out_sz)
 {
     if (!win || !out_canon || out_sz == 0) return -1;
 
     const char *p = win;
+
     /* Skip drive letter e.g. "C:" or "D:" */
-    if (p[0] && p[1] == ':') {
+    if (isalpha((unsigned char)p[0]) && p[1] == ':') {
         p += 2;
     }
 
     /* Skip leading separators */
     while (*p == '\\' || *p == '/') {
         p++;
+    }
+
+    /* Skip relative "./" or ".\\" prefixes if present */
+    while (p[0] == '.' && (p[1] == '\\' || p[1] == '/')) {
+        p += 2;
+        while (*p == '\\' || *p == '/') p++;
     }
 
     /* Skip virtual "NFSU2" root prefix if present */
@@ -106,8 +128,14 @@ static int vfs_normalize_path(const char *win, char *out_canon, size_t out_sz)
         }
     }
 
+    /* Skip relative "./" or ".\\" prefixes again after virtual root */
+    while (p[0] == '.' && (p[1] == '\\' || p[1] == '/')) {
+        p += 2;
+        while (*p == '\\' || *p == '/') p++;
+    }
+
     /* Component stack for canonical path */
-    char components[32][64];
+    char components[32][GUEST_VFS_PATH_MAX];
     int depth = 0;
 
     char temp[GUEST_VFS_PATH_MAX];
@@ -134,9 +162,18 @@ static int vfs_normalize_path(const char *win, char *out_canon, size_t out_sz)
             if (depth >= 32) {
                 return -1; /* Depth limit exceeded */
             }
-            /* Convert component to lowercase */
+            /* Trim trailing spaces and dots (Win32 filename rules) */
             size_t clen = strlen(tok);
-            if (clen >= 64) clen = 63;
+            while (clen > 0 && (tok[clen - 1] == ' ' || tok[clen - 1] == '.')) {
+                tok[--clen] = '\0';
+            }
+            if (clen == 0) {
+                tok = strtok_r(NULL, "/", &save);
+                continue;
+            }
+            if (clen >= GUEST_VFS_PATH_MAX) {
+                clen = GUEST_VFS_PATH_MAX - 1;
+            }
             for (size_t i = 0; i < clen; i++) {
                 components[depth][i] = (char)tolower((unsigned char)tok[i]);
             }
@@ -168,38 +205,25 @@ static int vfs_normalize_path(const char *win, char *out_canon, size_t out_sz)
 
 /* --- In-Memory Case Map Cache Operations --- */
 static GuestVFSNode *vfs_cache_lookup(GuestVFS *vfs, const char *canon_key,
-                                      uint8_t *out_root, char *out_disk_rel,
-                                      int prefer_write)
+                                      uint8_t *out_root, char *out_disk_rel)
 {
     if (!vfs || !canon_key) return NULL;
 
     uint32_t hash = vfs_hash(canon_key);
     uint32_t idx = hash & (GUEST_VFS_HASH_BUCKETS - 1);
 
-    GuestVFSNode *match = NULL;
     for (GuestVFSNode *n = vfs->buckets[idx]; n; n = n->next) {
         if (n->hash == hash && strcmp(n->canonical_key, canon_key) == 0) {
-            if (prefer_write && n->root_id == GUEST_VFS_ROOT_WRITE) {
-                if (out_root) *out_root = n->root_id;
-                if (out_disk_rel) snprintf(out_disk_rel, GUEST_VFS_PATH_MAX, "%s", n->disk_relpath);
-                return n;
-            }
-            if (!match || n->root_id == GUEST_VFS_ROOT_WRITE) {
-                match = n;
-            }
+            if (out_root) *out_root = n->root_id;
+            if (out_disk_rel) snprintf(out_disk_rel, GUEST_VFS_PATH_MAX, "%s", n->disk_relpath);
+            return n;
         }
-    }
-
-    if (match) {
-        if (out_root) *out_root = match->root_id;
-        if (out_disk_rel) snprintf(out_disk_rel, GUEST_VFS_PATH_MAX, "%s", match->disk_relpath);
-        return match;
     }
 
     return NULL;
 }
 
-static int vfs_cache_insert(GuestVFS *vfs, uint8_t root_id,
+static int vfs_cache_insert(GuestVFS *vfs, uint8_t root_id, uint8_t priority,
                             const char *canon_key, const char *disk_rel,
                             uint8_t is_dir)
 {
@@ -208,11 +232,15 @@ static int vfs_cache_insert(GuestVFS *vfs, uint8_t root_id,
     uint32_t hash = vfs_hash(canon_key);
     uint32_t idx = hash & (GUEST_VFS_HASH_BUCKETS - 1);
 
-    /* Update existing if found */
+    /* Update existing if found and new entry is higher or equal priority */
     for (GuestVFSNode *n = vfs->buckets[idx]; n; n = n->next) {
-        if (n->hash == hash && n->root_id == root_id && strcmp(n->canonical_key, canon_key) == 0) {
-            snprintf(n->disk_relpath, sizeof(n->disk_relpath), "%s", disk_rel);
-            n->is_dir = is_dir;
+        if (n->hash == hash && strcmp(n->canonical_key, canon_key) == 0) {
+            if (priority < n->priority || (priority == n->priority && n->root_id == root_id)) {
+                snprintf(n->disk_relpath, sizeof(n->disk_relpath), "%s", disk_rel);
+                n->root_id = root_id;
+                n->priority = priority;
+                n->is_dir = is_dir;
+            }
             return 0;
         }
     }
@@ -247,6 +275,7 @@ static int vfs_cache_insert(GuestVFS *vfs, uint8_t root_id,
     snprintf(node->canonical_key, sizeof(node->canonical_key), "%s", canon_key);
     snprintf(node->disk_relpath, sizeof(node->disk_relpath), "%s", disk_rel);
     node->root_id = root_id;
+    node->priority = priority;
     node->is_dir = is_dir;
 
     node->next = vfs->buckets[idx];
@@ -257,7 +286,7 @@ static int vfs_cache_insert(GuestVFS *vfs, uint8_t root_id,
 
 /* --- Recursive Directory Indexer --- */
 static void vfs_index_recursive(GuestVFS *vfs, const char *root_abs,
-                                const char *rel_dir, uint8_t root_id)
+                                const char *rel_dir, uint8_t root_id, uint8_t priority)
 {
     char full_dir[1024];
     if (rel_dir && rel_dir[0]) {
@@ -274,6 +303,10 @@ static void vfs_index_recursive(GuestVFS *vfs, const char *root_abs,
         if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) {
             continue;
         }
+        /* Skip macOS metadata and AppleDouble files */
+        if (e->d_name[0] == '.' && (strcmp(e->d_name, ".DS_Store") == 0 || e->d_name[1] == '_')) {
+            continue;
+        }
 
         char item_rel[GUEST_VFS_PATH_MAX];
         if (rel_dir && rel_dir[0]) {
@@ -284,21 +317,34 @@ static void vfs_index_recursive(GuestVFS *vfs, const char *root_abs,
 
         char canon[GUEST_VFS_PATH_MAX];
         if (vfs_normalize_path(item_rel, canon, sizeof(canon)) == 0) {
-            uint8_t is_dir = (e->d_type == DT_DIR) ? 1 : 0;
-            vfs_cache_insert(vfs, root_id, canon, item_rel, is_dir);
+            uint8_t is_dir = 0;
+            if (e->d_type == DT_DIR) {
+                is_dir = 1;
+            } else if (e->d_type == DT_UNKNOWN) {
+                char full_item[1024];
+                snprintf(full_item, sizeof(full_item), "%s/%s", root_abs, item_rel);
+                struct stat st;
+                if (stat(full_item, &st) == 0 && S_ISDIR(st.st_mode)) {
+                    is_dir = 1;
+                }
+            }
+
+            vfs_cache_insert(vfs, root_id, priority, canon, item_rel, is_dir);
 
             if (is_dir) {
-                vfs_index_recursive(vfs, root_abs, item_rel, root_id);
+                vfs_index_recursive(vfs, root_abs, item_rel, root_id, priority);
             }
         }
     }
     closedir(d);
 }
 
-/* --- Lazy On-Disk Case-Insensitive Step Search --- */
+/* --- Lazy On-Disk Case-Insensitive Step Search with Fast Stat Path --- */
 static int vfs_step_resolve(const char *root, const char *canon_path,
                             char *out_disk_rel, size_t out_sz)
 {
+    if (!root || !root[0] || !canon_path) return 0;
+
     char cur[1024];
     snprintf(cur, sizeof(cur), "%s", root);
 
@@ -313,6 +359,23 @@ static int vfs_step_resolve(const char *root, const char *canon_path,
         if (missing) {
             return 0;
         }
+
+        /* Fast-path: Check exact case with stat before opening directory */
+        char direct_cand[1024];
+        snprintf(direct_cand, sizeof(direct_cand), "%s/%s", cur, tok);
+        struct stat st_direct;
+        if (stat(direct_cand, &st_direct) == 0) {
+            snprintf(cur, sizeof(cur), "%s", direct_cand);
+            if (disk_rel[0]) {
+                size_t dlen = strlen(disk_rel);
+                snprintf(disk_rel + dlen, sizeof(disk_rel) - dlen, "/%s", tok);
+            } else {
+                snprintf(disk_rel, sizeof(disk_rel), "%s", tok);
+            }
+            continue;
+        }
+
+        /* Case-insensitive directory enumeration fallback for APFS */
         DIR *d = opendir(cur);
         if (!d) {
             return 0;
@@ -373,42 +436,54 @@ int guest_vfs_resolve(GuestVFS *vfs, const char *win_path, int for_write,
         const char *wroot = (vfs->write_root[0] != '\0') ? vfs->write_root : vfs->read_root;
         uint8_t root_id;
         char disk_rel[GUEST_VFS_PATH_MAX];
-        GuestVFSNode *cached = vfs_cache_lookup(vfs, canon, &root_id, disk_rel, 1);
+        GuestVFSNode *cached = vfs_cache_lookup(vfs, canon, &root_id, disk_rel);
 
-        if (cached && root_id == GUEST_VFS_ROOT_WRITE) {
+        if (cached && root_id == GUEST_VFS_ROOT_ID_WRITE) {
             snprintf(out_host_path, out_host_sz, "%s/%s", wroot, disk_rel);
         } else {
-            /* Create new entry with canonical name or existing relative name */
+            /* Create new entry with canonical name */
             snprintf(out_host_path, out_host_sz, "%s/%s", wroot, canon);
-            vfs_cache_insert(vfs, GUEST_VFS_ROOT_WRITE, canon, canon, 0);
+            vfs_cache_insert(vfs, GUEST_VFS_ROOT_ID_WRITE, GUEST_VFS_PRIORITY_WRITE, canon, canon, 0);
         }
         pthread_mutex_unlock(&vfs->lock);
         return 0;
     }
 
-    /* For read operations: check write_root first, then read_root */
+    /* For read operations: check in-memory cache first (O(1)) */
     uint8_t root_id = 0;
     char disk_rel[GUEST_VFS_PATH_MAX];
-    GuestVFSNode *cached = vfs_cache_lookup(vfs, canon, &root_id, disk_rel, 1);
+    GuestVFSNode *cached = vfs_cache_lookup(vfs, canon, &root_id, disk_rel);
 
     if (cached) {
-        const char *base = (root_id == GUEST_VFS_ROOT_WRITE) ? vfs->write_root : vfs->read_root;
+        const char *base = vfs_get_root_path(vfs, root_id);
         snprintf(out_host_path, out_host_sz, "%s/%s", base, disk_rel);
         pthread_mutex_unlock(&vfs->lock);
         return 0;
     }
 
-    /* Cache miss: check on disk in write_root, then read_root */
+    /* Cache miss: check on disk in write_root (user saves / modifications) */
     if (vfs->write_root[0] && vfs_step_resolve(vfs->write_root, canon, disk_rel, sizeof(disk_rel))) {
         snprintf(out_host_path, out_host_sz, "%s/%s", vfs->write_root, disk_rel);
-        vfs_cache_insert(vfs, GUEST_VFS_ROOT_WRITE, canon, disk_rel, 0);
+        vfs_cache_insert(vfs, GUEST_VFS_ROOT_ID_WRITE, GUEST_VFS_PRIORITY_WRITE, canon, disk_rel, 0);
         pthread_mutex_unlock(&vfs->lock);
         return 0;
     }
 
+    /* Cache miss: check multi-root search paths in priority order */
+    for (size_t r = 0; r < vfs->root_count; r++) {
+        if (!vfs->roots[r].active || !vfs->roots[r].path[0]) continue;
+        if (vfs_step_resolve(vfs->roots[r].path, canon, disk_rel, sizeof(disk_rel))) {
+            snprintf(out_host_path, out_host_sz, "%s/%s", vfs->roots[r].path, disk_rel);
+            vfs_cache_insert(vfs, (uint8_t)r, vfs->roots[r].priority, canon, disk_rel, 0);
+            pthread_mutex_unlock(&vfs->lock);
+            return 0;
+        }
+    }
+
+    /* Cache miss: legacy read_root fallback */
     if (vfs->read_root[0] && vfs_step_resolve(vfs->read_root, canon, disk_rel, sizeof(disk_rel))) {
         snprintf(out_host_path, out_host_sz, "%s/%s", vfs->read_root, disk_rel);
-        vfs_cache_insert(vfs, GUEST_VFS_ROOT_READ, canon, disk_rel, 0);
+        vfs_cache_insert(vfs, 0, GUEST_VFS_PRIORITY_FALLBACK, canon, disk_rel, 0);
         pthread_mutex_unlock(&vfs->lock);
         return 0;
     }
@@ -425,12 +500,22 @@ int guest_vfs_resolve(GuestVFS *vfs, const char *win_path, int for_write,
         for (int q = 0; q < 5; q++) {
             char alt[GUEST_VFS_PATH_MAX];
             snprintf(alt, sizeof(alt), "%.*s%s%s", (int)cut, canon, sfx[q], dot);
-            cached = vfs_cache_lookup(vfs, alt, &root_id, disk_rel, 1);
+            cached = vfs_cache_lookup(vfs, alt, &root_id, disk_rel);
             if (cached) {
-                const char *base = (root_id == GUEST_VFS_ROOT_WRITE) ? vfs->write_root : vfs->read_root;
+                const char *base = vfs_get_root_path(vfs, root_id);
                 snprintf(out_host_path, out_host_sz, "%s/%s", base, disk_rel);
                 pthread_mutex_unlock(&vfs->lock);
                 return 0;
+            }
+            /* Step resolve fallback for video suffixes */
+            for (size_t r = 0; r < vfs->root_count; r++) {
+                if (!vfs->roots[r].active || !vfs->roots[r].path[0]) continue;
+                if (vfs_step_resolve(vfs->roots[r].path, alt, disk_rel, sizeof(disk_rel))) {
+                    snprintf(out_host_path, out_host_sz, "%s/%s", vfs->roots[r].path, disk_rel);
+                    vfs_cache_insert(vfs, (uint8_t)r, vfs->roots[r].priority, alt, disk_rel, 0);
+                    pthread_mutex_unlock(&vfs->lock);
+                    return 0;
+                }
             }
         }
     }
@@ -448,6 +533,11 @@ int guest_file_init(GuestFileTable *table, const char *read_root, const char *wr
     pthread_mutex_init(&table->vfs.lock, NULL);
     pthread_mutex_init(&table->lock, NULL);
 
+    for (size_t i = 0; i < GUEST_FILE_HANDLE_MAX; i++) {
+        pthread_mutex_init(&table->slots[i].slot_lock, NULL);
+        table->slots[i].fd = -1;
+    }
+
     table->vfs.initialized = 1;
     table->initialized = 1;
 
@@ -462,6 +552,20 @@ int guest_file_set_roots(GuestFileTable *table, const char *read_root, const cha
     pthread_mutex_lock(&table->vfs.lock);
     if (read_root && read_root[0]) {
         snprintf(table->vfs.read_root, sizeof(table->vfs.read_root), "%s", read_root);
+        int found = 0;
+        for (size_t i = 0; i < table->vfs.root_count; i++) {
+            if (strcmp(table->vfs.roots[i].path, read_root) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        if (!found && table->vfs.root_count < GUEST_VFS_MAX_SEARCH_ROOTS) {
+            size_t idx = table->vfs.root_count++;
+            snprintf(table->vfs.roots[idx].path, sizeof(table->vfs.roots[idx].path), "%s", read_root);
+            table->vfs.roots[idx].priority = GUEST_VFS_PRIORITY_BUNDLE;
+            table->vfs.roots[idx].is_writable = 0;
+            table->vfs.roots[idx].active = 1;
+        }
     } else {
         table->vfs.read_root[0] = '\0';
     }
@@ -478,19 +582,122 @@ int guest_file_set_roots(GuestFileTable *table, const char *read_root, const cha
     return 0;
 }
 
+int guest_file_add_root(GuestFileTable *table, const char *path, uint8_t priority, int is_writable)
+{
+    if (!table || !table->initialized || !path || !path[0]) return -1;
+
+    pthread_mutex_lock(&table->vfs.lock);
+    if (table->vfs.root_count >= GUEST_VFS_MAX_SEARCH_ROOTS) {
+        pthread_mutex_unlock(&table->vfs.lock);
+        return -2;
+    }
+
+    /* Check if already registered */
+    for (size_t i = 0; i < table->vfs.root_count; i++) {
+        if (strcmp(table->vfs.roots[i].path, path) == 0) {
+            table->vfs.roots[i].priority = priority;
+            table->vfs.roots[i].is_writable = (uint8_t)(is_writable ? 1 : 0);
+            table->vfs.roots[i].active = 1;
+            pthread_mutex_unlock(&table->vfs.lock);
+            return 0;
+        }
+    }
+
+    size_t idx = table->vfs.root_count++;
+    snprintf(table->vfs.roots[idx].path, sizeof(table->vfs.roots[idx].path), "%s", path);
+    table->vfs.roots[idx].priority = priority;
+    table->vfs.roots[idx].is_writable = (uint8_t)(is_writable ? 1 : 0);
+    table->vfs.roots[idx].active = 1;
+
+    /* Sort roots by priority ascending (lower priority value = higher precedence) */
+    for (size_t i = 0; i < table->vfs.root_count; i++) {
+        for (size_t j = i + 1; j < table->vfs.root_count; j++) {
+            if (table->vfs.roots[j].priority < table->vfs.roots[i].priority) {
+                GuestVFSRoot tmp = table->vfs.roots[i];
+                table->vfs.roots[i] = table->vfs.roots[j];
+                table->vfs.roots[j] = tmp;
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&table->vfs.lock);
+    return 0;
+}
+
+int guest_file_setup_ios_roots(GuestFileTable *table,
+                               const char *documents_dir,
+                               const char *bundle_dir,
+                               const char *app_support_dir)
+{
+    if (!table || !table->initialized) return -1;
+
+    /* Priority 1: <Documents>/Game/ (User/mod files) */
+    if (documents_dir && documents_dir[0]) {
+        char doc_game[1024];
+        snprintf(doc_game, sizeof(doc_game), "%s/Game", documents_dir);
+        struct stat st;
+        if (stat(doc_game, &st) == 0 && S_ISDIR(st.st_mode)) {
+            guest_file_add_root(table, doc_game, GUEST_VFS_PRIORITY_DOCUMENTS, 1);
+        } else {
+            guest_file_add_root(table, documents_dir, GUEST_VFS_PRIORITY_DOCUMENTS, 1);
+        }
+        if (!table->vfs.write_root[0]) {
+            guest_file_set_roots(table, NULL, doc_game);
+        }
+    }
+
+    /* Priority 2: <AppBundle>/Game/ or <AppBundle>/ (Embedded assets) */
+    if (bundle_dir && bundle_dir[0]) {
+        char bundle_game[1024];
+        snprintf(bundle_game, sizeof(bundle_game), "%s/Game", bundle_dir);
+        struct stat st;
+        if (stat(bundle_game, &st) == 0 && S_ISDIR(st.st_mode)) {
+            guest_file_add_root(table, bundle_game, GUEST_VFS_PRIORITY_BUNDLE, 0);
+        } else {
+            guest_file_add_root(table, bundle_dir, GUEST_VFS_PRIORITY_BUNDLE, 0);
+        }
+    }
+
+    /* Priority 3: <Application Support>/NFSU2/Game/ (Base installed assets) */
+    if (app_support_dir && app_support_dir[0]) {
+        char app_game[1024];
+        snprintf(app_game, sizeof(app_game), "%s/NFSU2/Game", app_support_dir);
+        struct stat st;
+        if (stat(app_game, &st) == 0 && S_ISDIR(st.st_mode)) {
+            guest_file_add_root(table, app_game, GUEST_VFS_PRIORITY_APP_SUPPORT, 1);
+        } else {
+            guest_file_add_root(table, app_support_dir, GUEST_VFS_PRIORITY_APP_SUPPORT, 1);
+        }
+        if (!table->vfs.write_root[0]) {
+            guest_file_set_roots(table, NULL, app_game);
+        }
+    }
+
+    return 0;
+}
+
 int guest_file_index_roots(GuestFileTable *table)
 {
     if (!table || !table->initialized) return -1;
 
     pthread_mutex_lock(&table->vfs.lock);
-    if (table->vfs.read_root[0]) {
-        vfs_index_recursive(&table->vfs, table->vfs.read_root, "", GUEST_VFS_ROOT_READ);
-    }
-    if (table->vfs.write_root[0]) {
-        vfs_index_recursive(&table->vfs, table->vfs.write_root, "", GUEST_VFS_ROOT_WRITE);
-    }
-    pthread_mutex_unlock(&table->vfs.lock);
 
+    /* Index active asset roots in REVERSE priority order (lowest priority first,
+     * so that higher priority roots will overwrite duplicate entries in the cache). */
+    for (ssize_t i = (ssize_t)table->vfs.root_count - 1; i >= 0; i--) {
+        if (table->vfs.roots[i].active && table->vfs.roots[i].path[0]) {
+            vfs_index_recursive(&table->vfs, table->vfs.roots[i].path, "",
+                                (uint8_t)i, table->vfs.roots[i].priority);
+        }
+    }
+
+    /* Index write_root with highest priority (0) so saved/modified files always take precedence */
+    if (table->vfs.write_root[0]) {
+        vfs_index_recursive(&table->vfs, table->vfs.write_root, "",
+                            GUEST_VFS_ROOT_ID_WRITE, GUEST_VFS_PRIORITY_WRITE);
+    }
+
+    pthread_mutex_unlock(&table->vfs.lock);
     return 0;
 }
 
@@ -505,9 +712,15 @@ int guest_file_cleanup(GuestFileTable *table)
             table->slots[i].fd = -1;
             table->slots[i].in_use = 0;
         }
+        table->slots[i].closing = 0;
+        table->slots[i].refcount = 0;
     }
     table->active_handles = 0;
     pthread_mutex_unlock(&table->lock);
+
+    for (size_t i = 0; i < GUEST_FILE_HANDLE_MAX; i++) {
+        pthread_mutex_destroy(&table->slots[i].slot_lock);
+    }
 
     pthread_mutex_lock(&table->vfs.lock);
     if (table->vfs.node_pool) {
@@ -516,6 +729,8 @@ int guest_file_cleanup(GuestFileTable *table)
     }
     table->vfs.node_count = 0;
     table->vfs.node_capacity = 0;
+    table->vfs.root_count = 0;
+    memset(table->vfs.roots, 0, sizeof(table->vfs.roots));
     memset(table->vfs.buckets, 0, sizeof(table->vfs.buckets));
     pthread_mutex_unlock(&table->vfs.lock);
 
@@ -525,20 +740,24 @@ int guest_file_cleanup(GuestFileTable *table)
     return 0;
 }
 
-/* --- Internal Handle Allocator & Lookup --- */
+/* --- Internal Handle Allocator & Lookup with Refcounting --- */
 static uint32_t alloc_handle(GuestFileTable *table, int fd, int is_empty,
                              uint32_t access, uint32_t disp, const char *rel)
 {
     pthread_mutex_lock(&table->lock);
     for (uint32_t i = 1; i < GUEST_FILE_HANDLE_MAX; i++) {
-        if (!table->slots[i].in_use) {
+        if (!table->slots[i].in_use && !table->slots[i].closing && table->slots[i].refcount == 0) {
             table->slots[i].in_use = 1;
+            table->slots[i].closing = 0;
+            table->slots[i].refcount = 0;
             table->slots[i].fd = fd;
             table->slots[i].is_empty = is_empty;
             table->slots[i].access = access;
             table->slots[i].disposition = disp;
             if (rel) {
                 snprintf(table->slots[i].rel_path, sizeof(table->slots[i].rel_path), "%s", rel);
+            } else {
+                table->slots[i].rel_path[0] = '\0';
             }
             table->active_handles++;
             pthread_mutex_unlock(&table->lock);
@@ -549,37 +768,73 @@ static uint32_t alloc_handle(GuestFileTable *table, int fd, int is_empty,
     return GUEST_INVALID_HANDLE_VALUE;
 }
 
-static GuestFileSlot *get_slot(GuestFileTable *table, uint32_t h)
+static GuestFileSlot *retain_slot(GuestFileTable *table, uint32_t h)
 {
     if (h < GUEST_FILE_HANDLE_BASE + 1 || h >= GUEST_FILE_HANDLE_BASE + GUEST_FILE_HANDLE_MAX) {
         return NULL;
-    }
-    uint32_t idx = h - GUEST_FILE_HANDLE_BASE;
-    if (!table->slots[idx].in_use) {
-        return NULL;
-    }
-    return &table->slots[idx];
-}
-
-static void free_handle(GuestFileTable *table, uint32_t h)
-{
-    if (h < GUEST_FILE_HANDLE_BASE + 1 || h >= GUEST_FILE_HANDLE_BASE + GUEST_FILE_HANDLE_MAX) {
-        return;
     }
     uint32_t idx = h - GUEST_FILE_HANDLE_BASE;
     pthread_mutex_lock(&table->lock);
-    if (table->slots[idx].in_use) {
-        if (table->slots[idx].fd >= 0) {
-            close(table->slots[idx].fd);
-            table->slots[idx].fd = -1;
+    if (!table->slots[idx].in_use || table->slots[idx].closing || table->slots[idx].fd < 0) {
+        pthread_mutex_unlock(&table->lock);
+        return NULL;
+    }
+    table->slots[idx].refcount++;
+    pthread_mutex_unlock(&table->lock);
+    return &table->slots[idx];
+}
+
+static void release_slot(GuestFileTable *table, GuestFileSlot *slot)
+{
+    if (!table || !slot) return;
+    pthread_mutex_lock(&table->lock);
+    if (slot->refcount > 0) {
+        slot->refcount--;
+    }
+    if (slot->refcount == 0 && slot->closing) {
+        if (slot->fd >= 0) {
+            close(slot->fd);
+            slot->fd = -1;
         }
-        table->slots[idx].in_use = 0;
-        table->slots[idx].is_empty = 0;
+        slot->in_use = 0;
+        slot->closing = 0;
+        slot->is_empty = 0;
         if (table->active_handles > 0) {
             table->active_handles--;
         }
     }
     pthread_mutex_unlock(&table->lock);
+}
+
+static int free_handle(GuestFileTable *table, uint32_t h)
+{
+    if (h < GUEST_FILE_HANDLE_BASE + 1 || h >= GUEST_FILE_HANDLE_BASE + GUEST_FILE_HANDLE_MAX) {
+        return 0;
+    }
+    uint32_t idx = h - GUEST_FILE_HANDLE_BASE;
+    pthread_mutex_lock(&table->lock);
+    if (!table->slots[idx].in_use || table->slots[idx].closing) {
+        pthread_mutex_unlock(&table->lock);
+        return 0;
+    }
+
+    if (table->slots[idx].refcount == 0) {
+        if (table->slots[idx].fd >= 0) {
+            close(table->slots[idx].fd);
+            table->slots[idx].fd = -1;
+        }
+        table->slots[idx].in_use = 0;
+        table->slots[idx].closing = 0;
+        table->slots[idx].is_empty = 0;
+        if (table->active_handles > 0) {
+            table->active_handles--;
+        }
+    } else {
+        /* Deferred close: active asynchronous I/O will close fd when refcount drops to 0 */
+        table->slots[idx].closing = 1;
+    }
+    pthread_mutex_unlock(&table->lock);
+    return 1;
 }
 
 /* =========================================================================
@@ -671,12 +926,14 @@ static int handle_create_file_a(CPU *cpu, GuestFileTable *table, uint32_t *fault
     }
 
     /* Copy-up logic for save overlays */
-    if (is_write && !(flags & O_TRUNC) && table->vfs.read_root[0] && table->vfs.write_root[0]) {
+    if (is_write && !(flags & O_TRUNC) && table->vfs.write_root[0]) {
         struct stat st;
         if (stat(host_path, &st) != 0) {
             char src_path[1024];
             if (guest_vfs_resolve(&table->vfs, win_path, 0, src_path, sizeof(src_path), NULL, 0) == 0) {
-                vfs_copy_file(src_path, host_path);
+                if (strcmp(src_path, host_path) != 0) {
+                    vfs_copy_file(src_path, host_path);
+                }
             }
         }
     }
@@ -742,8 +999,8 @@ static int handle_read_file(CPU *cpu, GuestFileTable *table, uint32_t *fault)
     memcpy(&pnr, f + 16, 4);
     memcpy(&ov, f + 20, 4);
 
-    GuestFileSlot *slot = get_slot(table, hfile);
-    if (!slot || slot->fd < 0) {
+    GuestFileSlot *slot = retain_slot(table, hfile);
+    if (!slot) {
         if (pnr) {
             void *pnr_ptr = guest_memory_pointer(pnr, 4ULL, 1);
             if (pnr_ptr) {
@@ -764,6 +1021,7 @@ static int handle_read_file(CPU *cpu, GuestFileTable *table, uint32_t *fault)
     if (len > 0) {
         buf_ptr = guest_memory_pointer(buf, (uint64_t)len, 1);
         if (!buf_ptr) {
+            release_slot(table, slot);
             *fault = buf;
             return -1;
         }
@@ -771,10 +1029,11 @@ static int handle_read_file(CPU *cpu, GuestFileTable *table, uint32_t *fault)
 
     ssize_t got = 0;
 
-    /* Overlapped read branch */
+    /* Overlapped read branch (Stateless & reentrant: pread can run fully concurrently across threads) */
     if (ov != 0) {
         void *ov_ptr = guest_memory_pointer(ov, 20ULL, 1);
         if (!ov_ptr) {
+            release_slot(table, slot);
             *fault = ov;
             return -1;
         }
@@ -796,7 +1055,6 @@ static int handle_read_file(CPU *cpu, GuestFileTable *table, uint32_t *fault)
         memcpy((uint8_t *)ov_ptr + 4, &bytes_read, 4);
 
         if (hev != 0) {
-            /* Signal event if win32 event subsystem is linked */
             #if defined(__APPLE__) || defined(__linux__)
             extern void win32_signal_event(uint32_t) __attribute__((weak));
             if (win32_signal_event) win32_signal_event(hev);
@@ -806,10 +1064,14 @@ static int handle_read_file(CPU *cpu, GuestFileTable *table, uint32_t *fault)
         got = 0; /* Instant EOF */
     } else {
         if (len > 0 && buf_ptr) {
+            pthread_mutex_lock(&slot->slot_lock);
             got = read(slot->fd, buf_ptr, (size_t)len);
+            pthread_mutex_unlock(&slot->slot_lock);
             if (got < 0) got = 0;
         }
     }
+
+    release_slot(table, slot);
 
     if (pnr != 0) {
         void *pnr_ptr = guest_memory_pointer(pnr, 4ULL, 1);
@@ -819,6 +1081,99 @@ static int handle_read_file(CPU *cpu, GuestFileTable *table, uint32_t *fault)
         }
         uint32_t bytes_read = (uint32_t)got;
         memcpy(pnr_ptr, &bytes_read, 4);
+    }
+
+    cpu->eax = 1U;
+    cpu->eip = ret_addr;
+    cpu->esp += 24U;
+    return 1;
+}
+
+/* --- WriteFile (argc 5, frame 24 bytes) --- */
+static int handle_write_file(CPU *cpu, GuestFileTable *table, uint32_t *fault)
+{
+    const void *frame_ptr = guest_memory_pointer(cpu->esp, 24ULL, 0);
+    if (!frame_ptr) {
+        *fault = cpu->esp;
+        return -1;
+    }
+
+    uint32_t ret_addr, hfile, buf, len, pnw, ov;
+    const uint8_t *f = (const uint8_t *)frame_ptr;
+    memcpy(&ret_addr, f, 4);
+    memcpy(&hfile, f + 4, 4);
+    memcpy(&buf, f + 8, 4);
+    memcpy(&len, f + 12, 4);
+    memcpy(&pnw, f + 16, 4);
+    memcpy(&ov, f + 20, 4);
+    (void)ov;
+
+    /* Handle standard console handles 0x10 - 0x13 */
+    if (hfile >= 0x10u && hfile <= 0x13u) {
+        if (len > 0) {
+            const void *buf_ptr = guest_memory_pointer(buf, (uint64_t)len, 0);
+            if (!buf_ptr) {
+                *fault = buf;
+                return -1;
+            }
+            fwrite(buf_ptr, 1, len, stdout);
+            fflush(stdout);
+        }
+        if (pnw != 0) {
+            void *pnw_ptr = guest_memory_pointer(pnw, 4ULL, 1);
+            if (pnw_ptr) memcpy(pnw_ptr, &len, 4);
+        }
+        cpu->eax = 1U;
+        cpu->eip = ret_addr;
+        cpu->esp += 24U;
+        return 1;
+    }
+
+    GuestFileSlot *slot = retain_slot(table, hfile);
+    if (!slot) {
+        if (pnw) {
+            void *pnw_ptr = guest_memory_pointer(pnw, 4ULL, 1);
+            if (pnw_ptr) {
+                uint32_t zero = 0;
+                memcpy(pnw_ptr, &zero, 4);
+            }
+        }
+        int err_rc = set_teb_last_error(cpu, GUEST_ERROR_INVALID_HANDLE, fault);
+        if (err_rc) return err_rc;
+        cpu->eax = 0U;
+        cpu->eip = ret_addr;
+        cpu->esp += 24U;
+        return 1;
+    }
+
+    const void *buf_ptr = NULL;
+    if (len > 0) {
+        buf_ptr = guest_memory_pointer(buf, (uint64_t)len, 0);
+        if (!buf_ptr) {
+            release_slot(table, slot);
+            *fault = buf;
+            return -1;
+        }
+    }
+
+    ssize_t written = 0;
+    if (len > 0 && buf_ptr) {
+        pthread_mutex_lock(&slot->slot_lock);
+        written = write(slot->fd, buf_ptr, (size_t)len);
+        pthread_mutex_unlock(&slot->slot_lock);
+        if (written < 0) written = 0;
+    }
+
+    release_slot(table, slot);
+
+    if (pnw != 0) {
+        void *pnw_ptr = guest_memory_pointer(pnw, 4ULL, 1);
+        if (!pnw_ptr) {
+            *fault = pnw;
+            return -1;
+        }
+        uint32_t bytes_written = (uint32_t)written;
+        memcpy(pnw_ptr, &bytes_written, 4);
     }
 
     cpu->eax = 1U;
@@ -844,8 +1199,8 @@ static int handle_set_file_pointer(CPU *cpu, GuestFileTable *table, uint32_t *fa
     memcpy(&dist_high_ptr, f + 12, 4);
     memcpy(&method, f + 16, 4);
 
-    GuestFileSlot *slot = get_slot(table, hfile);
-    if (!slot || slot->fd < 0) {
+    GuestFileSlot *slot = retain_slot(table, hfile);
+    if (!slot) {
         int err_rc = set_teb_last_error(cpu, GUEST_ERROR_INVALID_HANDLE, fault);
         if (err_rc) return err_rc;
         cpu->eax = GUEST_INVALID_SET_FILE_POINTER;
@@ -859,6 +1214,7 @@ static int handle_set_file_pointer(CPU *cpu, GuestFileTable *table, uint32_t *fa
                  (method == GUEST_FILE_END) ? SEEK_END : -1;
 
     if (whence == -1) {
+        release_slot(table, slot);
         int err_rc = set_teb_last_error(cpu, GUEST_ERROR_INVALID_PARAMETER, fault);
         if (err_rc) return err_rc;
         cpu->eax = GUEST_INVALID_SET_FILE_POINTER;
@@ -871,6 +1227,7 @@ static int handle_set_file_pointer(CPU *cpu, GuestFileTable *table, uint32_t *fa
     if (dist_high_ptr != 0) {
         void *high_ptr = guest_memory_pointer(dist_high_ptr, 4ULL, 1);
         if (!high_ptr) {
+            release_slot(table, slot);
             *fault = dist_high_ptr;
             return -1;
         }
@@ -879,7 +1236,11 @@ static int handle_set_file_pointer(CPU *cpu, GuestFileTable *table, uint32_t *fa
         full_dist = (int64_t)(((uint64_t)(uint32_t)high_val << 32) | (uint64_t)dist_low);
     }
 
+    pthread_mutex_lock(&slot->slot_lock);
     off_t pos = lseek(slot->fd, (off_t)full_dist, whence);
+    pthread_mutex_unlock(&slot->slot_lock);
+    release_slot(table, slot);
+
     if (pos < 0) {
         int err_rc = set_teb_last_error(cpu, GUEST_ERROR_NEGATIVE_SEEK, fault);
         if (err_rc) return err_rc;
@@ -919,13 +1280,12 @@ static int handle_close_handle(CPU *cpu, GuestFileTable *table, uint32_t *fault)
         return 0;
     }
 
-    GuestFileSlot *slot = get_slot(table, hfile);
-    if (!slot) {
+    int freed = free_handle(table, hfile);
+    if (!freed) {
         int err_rc = set_teb_last_error(cpu, GUEST_ERROR_INVALID_HANDLE, fault);
         if (err_rc) return err_rc;
         cpu->eax = 0U;
     } else {
-        free_handle(table, hfile);
         cpu->eax = 1U;
     }
 
@@ -949,8 +1309,8 @@ static int handle_get_file_size(CPU *cpu, GuestFileTable *table, uint32_t *fault
     memcpy(&hfile, f + 4, 4);
     memcpy(&p_high, f + 8, 4);
 
-    GuestFileSlot *slot = get_slot(table, hfile);
-    if (!slot || slot->fd < 0) {
+    GuestFileSlot *slot = retain_slot(table, hfile);
+    if (!slot) {
         int err_rc = set_teb_last_error(cpu, GUEST_ERROR_INVALID_HANDLE, fault);
         if (err_rc) return err_rc;
         cpu->eax = GUEST_INVALID_FILE_SIZE;
@@ -960,6 +1320,7 @@ static int handle_get_file_size(CPU *cpu, GuestFileTable *table, uint32_t *fault
     }
 
     if (slot->is_empty) {
+        release_slot(table, slot);
         cpu->eax = 0U;
         if (p_high != 0) {
             void *high_ptr = guest_memory_pointer(p_high, 4ULL, 1);
@@ -976,7 +1337,10 @@ static int handle_get_file_size(CPU *cpu, GuestFileTable *table, uint32_t *fault
     }
 
     struct stat st;
-    if (fstat(slot->fd, &st) != 0) {
+    int stat_rc = fstat(slot->fd, &st);
+    release_slot(table, slot);
+
+    if (stat_rc != 0) {
         int err_rc = set_teb_last_error(cpu, GUEST_ERROR_INVALID_HANDLE, fault);
         if (err_rc) return err_rc;
         cpu->eax = GUEST_INVALID_FILE_SIZE;
@@ -995,6 +1359,291 @@ static int handle_get_file_size(CPU *cpu, GuestFileTable *table, uint32_t *fault
 
     cpu->eip = ret_addr;
     cpu->esp += 12U;
+    return 1;
+}
+
+/* --- GetFileAttributesA (argc 1, frame 8 bytes) --- */
+static int handle_get_file_attributes_a(CPU *cpu, GuestFileTable *table, uint32_t *fault)
+{
+    const void *frame_ptr = guest_memory_pointer(cpu->esp, 8ULL, 0);
+    if (!frame_ptr) {
+        *fault = cpu->esp;
+        return -1;
+    }
+
+    uint32_t ret_addr, pn;
+    const uint8_t *f = (const uint8_t *)frame_ptr;
+    memcpy(&ret_addr, f, 4);
+    memcpy(&pn, f + 4, 4);
+
+    char win_path[GUEST_VFS_PATH_MAX];
+    size_t k = 0;
+    while (k < sizeof(win_path) - 1) {
+        const char *ch_ptr = (const char *)guest_memory_pointer(pn + (uint32_t)k, 1ULL, 0);
+        if (!ch_ptr) {
+            *fault = pn + (uint32_t)k;
+            return -1;
+        }
+        win_path[k] = *ch_ptr;
+        if (win_path[k] == '\0') break;
+        k++;
+    }
+    win_path[k] = '\0';
+
+    char host_path[1024];
+    int res = guest_vfs_resolve(&table->vfs, win_path, 0,
+                                host_path, sizeof(host_path), NULL, 0);
+
+    if (res != 0) {
+        int err_rc = set_teb_last_error(cpu, GUEST_ERROR_FILE_NOT_FOUND, fault);
+        if (err_rc) return err_rc;
+        cpu->eax = GUEST_INVALID_FILE_ATTRIBUTES;
+    } else {
+        struct stat st;
+        if (stat(host_path, &st) != 0) {
+            int err_rc = set_teb_last_error(cpu, GUEST_ERROR_FILE_NOT_FOUND, fault);
+            if (err_rc) return err_rc;
+            cpu->eax = GUEST_INVALID_FILE_ATTRIBUTES;
+        } else {
+            cpu->eax = S_ISDIR(st.st_mode) ? GUEST_FILE_ATTRIBUTE_DIRECTORY : GUEST_FILE_ATTRIBUTE_NORMAL;
+        }
+    }
+
+    cpu->eip = ret_addr;
+    cpu->esp += 8U;
+    return 1;
+}
+
+/* --- DeleteFileA (argc 1, frame 8 bytes) --- */
+static int handle_delete_file_a(CPU *cpu, GuestFileTable *table, uint32_t *fault)
+{
+    const void *frame_ptr = guest_memory_pointer(cpu->esp, 8ULL, 0);
+    if (!frame_ptr) {
+        *fault = cpu->esp;
+        return -1;
+    }
+
+    uint32_t ret_addr, pn;
+    const uint8_t *f = (const uint8_t *)frame_ptr;
+    memcpy(&ret_addr, f, 4);
+    memcpy(&pn, f + 4, 4);
+
+    char win_path[GUEST_VFS_PATH_MAX];
+    size_t k = 0;
+    while (k < sizeof(win_path) - 1) {
+        const char *ch_ptr = (const char *)guest_memory_pointer(pn + (uint32_t)k, 1ULL, 0);
+        if (!ch_ptr) {
+            *fault = pn + (uint32_t)k;
+            return -1;
+        }
+        win_path[k] = *ch_ptr;
+        if (win_path[k] == '\0') break;
+        k++;
+    }
+    win_path[k] = '\0';
+
+    char host_path[1024];
+    int res = guest_vfs_resolve(&table->vfs, win_path, 1,
+                                host_path, sizeof(host_path), NULL, 0);
+
+    if (res != 0 || unlink(host_path) != 0) {
+        int err_rc = set_teb_last_error(cpu, GUEST_ERROR_FILE_NOT_FOUND, fault);
+        if (err_rc) return err_rc;
+        cpu->eax = 0U; /* FALSE */
+    } else {
+        cpu->eax = 1U; /* TRUE */
+    }
+
+    cpu->eip = ret_addr;
+    cpu->esp += 8U;
+    return 1;
+}
+
+/* --- FlushFileBuffers (argc 1, frame 8 bytes) --- */
+static int handle_flush_file_buffers(CPU *cpu, GuestFileTable *table, uint32_t *fault)
+{
+    const void *frame_ptr = guest_memory_pointer(cpu->esp, 8ULL, 0);
+    if (!frame_ptr) {
+        *fault = cpu->esp;
+        return -1;
+    }
+
+    uint32_t ret_addr, hfile;
+    const uint8_t *f = (const uint8_t *)frame_ptr;
+    memcpy(&ret_addr, f, 4);
+    memcpy(&hfile, f + 4, 4);
+
+    GuestFileSlot *slot = retain_slot(table, hfile);
+    if (!slot) {
+        int err_rc = set_teb_last_error(cpu, GUEST_ERROR_INVALID_HANDLE, fault);
+        if (err_rc) return err_rc;
+        cpu->eax = 0U;
+    } else {
+        fsync(slot->fd);
+        release_slot(table, slot);
+        cpu->eax = 1U;
+    }
+
+    cpu->eip = ret_addr;
+    cpu->esp += 8U;
+    return 1;
+}
+
+/* --- SetEndOfFile (argc 1, frame 8 bytes) --- */
+static int handle_set_end_of_file(CPU *cpu, GuestFileTable *table, uint32_t *fault)
+{
+    const void *frame_ptr = guest_memory_pointer(cpu->esp, 8ULL, 0);
+    if (!frame_ptr) {
+        *fault = cpu->esp;
+        return -1;
+    }
+
+    uint32_t ret_addr, hfile;
+    const uint8_t *f = (const uint8_t *)frame_ptr;
+    memcpy(&ret_addr, f, 4);
+    memcpy(&hfile, f + 4, 4);
+
+    GuestFileSlot *slot = retain_slot(table, hfile);
+    if (!slot) {
+        int err_rc = set_teb_last_error(cpu, GUEST_ERROR_INVALID_HANDLE, fault);
+        if (err_rc) return err_rc;
+        cpu->eax = 0U;
+    } else {
+        pthread_mutex_lock(&slot->slot_lock);
+        off_t cur = lseek(slot->fd, 0, SEEK_CUR);
+        int tr_rc = (cur >= 0 && ftruncate(slot->fd, cur) == 0);
+        pthread_mutex_unlock(&slot->slot_lock);
+        release_slot(table, slot);
+        cpu->eax = tr_rc ? 1U : 0U;
+    }
+
+    cpu->eip = ret_addr;
+    cpu->esp += 8U;
+    return 1;
+}
+
+/* --- CreateDirectoryA (argc 2, frame 12 bytes) --- */
+static int handle_create_directory_a(CPU *cpu, GuestFileTable *table, uint32_t *fault)
+{
+    const void *frame_ptr = guest_memory_pointer(cpu->esp, 12ULL, 0);
+    if (!frame_ptr) {
+        *fault = cpu->esp;
+        return -1;
+    }
+
+    uint32_t ret_addr, pn, sa;
+    const uint8_t *f = (const uint8_t *)frame_ptr;
+    memcpy(&ret_addr, f, 4);
+    memcpy(&pn, f + 4, 4);
+    memcpy(&sa, f + 8, 4);
+    (void)sa;
+
+    char win_path[GUEST_VFS_PATH_MAX];
+    size_t k = 0;
+    while (k < sizeof(win_path) - 1) {
+        const char *ch_ptr = (const char *)guest_memory_pointer(pn + (uint32_t)k, 1ULL, 0);
+        if (!ch_ptr) {
+            *fault = pn + (uint32_t)k;
+            return -1;
+        }
+        win_path[k] = *ch_ptr;
+        if (win_path[k] == '\0') break;
+        k++;
+    }
+    win_path[k] = '\0';
+
+    char host_path[1024];
+    int res = guest_vfs_resolve(&table->vfs, win_path, 1, host_path, sizeof(host_path), NULL, 0);
+    if (res == -2) {
+        set_teb_last_error(cpu, GUEST_ERROR_PATH_NOT_FOUND, fault);
+        cpu->eax = 0U;
+    } else {
+        vfs_mkdir_parents(host_path);
+        int m_rc = mkdir(host_path, 0755);
+        if (m_rc == 0 || errno == EEXIST) {
+            cpu->eax = 1U;
+        } else {
+            set_teb_last_error(cpu, GUEST_ERROR_ACCESS_DENIED, fault);
+            cpu->eax = 0U;
+        }
+    }
+
+    cpu->eip = ret_addr;
+    cpu->esp += 12U;
+    return 1;
+}
+
+/* --- GetOverlappedResult (argc 4, frame 20 bytes) --- */
+static int handle_get_overlapped_result(CPU *cpu, GuestFileTable *table, uint32_t *fault)
+{
+    (void)table;
+    const void *frame_ptr = guest_memory_pointer(cpu->esp, 20ULL, 0);
+    if (!frame_ptr) {
+        *fault = cpu->esp;
+        return -1;
+    }
+
+    uint32_t ret_addr, hfile, ov, pnt, wait;
+    const uint8_t *f = (const uint8_t *)frame_ptr;
+    memcpy(&ret_addr, f, 4);
+    memcpy(&hfile, f + 4, 4);
+    memcpy(&ov, f + 8, 4);
+    memcpy(&pnt, f + 12, 4);
+    memcpy(&wait, f + 16, 4);
+    (void)hfile; (void)wait;
+
+    if (ov != 0 && pnt != 0) {
+        const void *ov_ptr = guest_memory_pointer(ov, 8ULL, 0);
+        if (!ov_ptr) {
+            *fault = ov;
+            return -1;
+        }
+        uint32_t bytes_transferred;
+        memcpy(&bytes_transferred, (const uint8_t *)ov_ptr + 4, 4);
+
+        void *pnt_ptr = guest_memory_pointer(pnt, 4ULL, 1);
+        if (!pnt_ptr) {
+            *fault = pnt;
+            return -1;
+        }
+        memcpy(pnt_ptr, &bytes_transferred, 4);
+    }
+
+    cpu->eax = 1U;
+    cpu->eip = ret_addr;
+    cpu->esp += 20U;
+    return 1;
+}
+
+/* --- HasOverlappedIoCompleted (argc 1, frame 8 bytes) --- */
+static int handle_has_overlapped_io_completed(CPU *cpu, GuestFileTable *table, uint32_t *fault)
+{
+    (void)table;
+    const void *frame_ptr = guest_memory_pointer(cpu->esp, 8ULL, 0);
+    if (!frame_ptr) {
+        *fault = cpu->esp;
+        return -1;
+    }
+
+    uint32_t ret_addr, ov;
+    const uint8_t *f = (const uint8_t *)frame_ptr;
+    memcpy(&ret_addr, f, 4);
+    memcpy(&ov, f + 4, 4);
+
+    uint32_t status = 0;
+    if (ov != 0) {
+        const void *ov_ptr = guest_memory_pointer(ov, 4ULL, 0);
+        if (!ov_ptr) {
+            *fault = ov;
+            return -1;
+        }
+        memcpy(&status, ov_ptr, 4);
+    }
+
+    /* NTSTATUS: STATUS_PENDING is 0x00000103. If not pending, it has completed! */
+    cpu->eax = (status != 0x00000103u) ? 1U : 0U;
+    cpu->eip = ret_addr;
+    cpu->esp += 8U;
     return 1;
 }
 
@@ -1022,6 +1671,9 @@ int guest_file_import(CPU *cpu, const GuestImport *imp, void *context, uint32_t 
     if (strcmp(imp->name, "ReadFile") == 0) {
         return handle_read_file(cpu, table, fault);
     }
+    if (strcmp(imp->name, "WriteFile") == 0) {
+        return handle_write_file(cpu, table, fault);
+    }
     if (strcmp(imp->name, "SetFilePointer") == 0) {
         return handle_set_file_pointer(cpu, table, fault);
     }
@@ -1030,6 +1682,38 @@ int guest_file_import(CPU *cpu, const GuestImport *imp, void *context, uint32_t 
     }
     if (strcmp(imp->name, "GetFileSize") == 0) {
         return handle_get_file_size(cpu, table, fault);
+    }
+    if (strcmp(imp->name, "GetFileAttributesA") == 0) {
+        return handle_get_file_attributes_a(cpu, table, fault);
+    }
+    if (strcmp(imp->name, "SetFileAttributesA") == 0) {
+        /* Win32 SetFileAttributesA stub: argc 2, frame 12 bytes */
+        const void *frame_ptr = guest_memory_pointer(cpu->esp, 12ULL, 0);
+        if (!frame_ptr) { *fault = cpu->esp; return -1; }
+        uint32_t ret_addr;
+        memcpy(&ret_addr, frame_ptr, 4);
+        cpu->eax = 1U;
+        cpu->eip = ret_addr;
+        cpu->esp += 12U;
+        return 1;
+    }
+    if (strcmp(imp->name, "DeleteFileA") == 0) {
+        return handle_delete_file_a(cpu, table, fault);
+    }
+    if (strcmp(imp->name, "FlushFileBuffers") == 0) {
+        return handle_flush_file_buffers(cpu, table, fault);
+    }
+    if (strcmp(imp->name, "SetEndOfFile") == 0) {
+        return handle_set_end_of_file(cpu, table, fault);
+    }
+    if (strcmp(imp->name, "CreateDirectoryA") == 0) {
+        return handle_create_directory_a(cpu, table, fault);
+    }
+    if (strcmp(imp->name, "GetOverlappedResult") == 0) {
+        return handle_get_overlapped_result(cpu, table, fault);
+    }
+    if (strcmp(imp->name, "HasOverlappedIoCompleted") == 0) {
+        return handle_has_overlapped_io_completed(cpu, table, fault);
     }
 
     return 0;

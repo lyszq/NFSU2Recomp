@@ -160,18 +160,20 @@ static int heap_import(CPU *c, const GuestImport *import, GuestWindows *windows,
     unsigned nargs=0;
     int create=!strcmp(import->name,"HeapCreate"), alloc=!strcmp(import->name,"HeapAlloc");
     int release=!strcmp(import->name,"HeapFree"), size=!strcmp(import->name,"HeapSize");
-    int destroy=!strcmp(import->name,"HeapDestroy");
-    if (create || alloc || release || size) nargs=3;
+    int destroy=!strcmp(import->name,"HeapDestroy"), realloc=!strcmp(import->name,"HeapReAlloc");
+    if (realloc) nargs=4;
+    else if (create || alloc || release || size) nargs=3;
     else if (destroy) nargs=1;
     if (!nargs || !windows) return 0;
     const uint8_t *stack=guest_memory_pointer(c->esp,4u*(nargs+1),0);
     if (!stack) { *fault=c->esp; return -1; }
     uint32_t ret=read32(stack), a=read32(stack+4), b=nargs>1 ? read32(stack+8) : 0;
-    uint32_t d=nargs>2 ? read32(stack+12) : 0, result=0;
+    uint32_t d=nargs>2 ? read32(stack+12) : 0, e=nargs>3 ? read32(stack+16) : 0, result=0;
     /* Exception-generating/executable heaps require capabilities we do not
      * provide. Stop before altering state rather than silently drop flags. */
     if ((create && (a & ~1u)) || (alloc && (b & ~9u)) ||
-        ((release || size) && (b & ~1u))) return 0;
+        ((release || size) && (b & ~1u)) ||
+        (realloc && (b & ~(1u | 8u | 0x10u)))) return 0;
     void *error = NULL;
     if (!alloc && !size) {
         if (!c->fs_base) { *fault=0; return -2; }
@@ -187,6 +189,9 @@ static int heap_import(CPU *c, const GuestImport *import, GuestWindows *windows,
     } else if (alloc) {
         rc=guest_heap_alloc(&windows->heaps,a,d,!!(b&8u),&result);
         if (rc) result=0; /* HeapAlloc never sets LastError. */
+    } else if (realloc) {
+        rc=guest_heap_realloc(&windows->heaps,a,b,d,e,&result);
+        if (rc) { result=0; write32(error,rc==EINVAL ? 87 : 8); }
     } else if (release) {
         rc=guest_heap_free(&windows->heaps,a,d); result=!rc;
         if (rc) write32(error,87);

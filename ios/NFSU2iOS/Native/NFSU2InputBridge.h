@@ -48,6 +48,9 @@ extern "C" {
 #define NFSU2_DIK_RIGHT           0xCD  /* Direksiyon Sağ (Steer Right) */
 #define NFSU2_DIK_DOWN            0xD0  /* Fren / Geri Vites (Brake/Reverse) */
 
+/* DirectInput klavye durum dizisinin SPEED2.EXE içindeki sabit sanal bellek adresi */
+#define NFSU2_KEYBOARD_BUFFER_GUEST_ADDR 0x00870990u
+
 /*
  * Swift -> C Köprü Fonksiyonları (Sıfır Gecikme, Atomik Bellek Erişimi)
  */
@@ -68,6 +71,13 @@ uint32_t nfsu2_input_active_count(void);
 void nfsu2_input_fill_keyboard(uint8_t *dst, uint32_t count);
 
 /*
+ * Konuk belleğe (guest memory) doğrudan eşitleme.
+ * Eğer SPEED2.EXE belleğe yüklenmiş ve 0x00870990 adresi ayrılmış (committed) ise,
+ * tuş durumunu doğrudan 0x00870990 adresindeki 256 baytlık diziye yansıtır.
+ */
+void nfsu2_input_sync_guest_memory(void);
+
+/*
  * Analog giriş yardımcıları: Analog tetik, direksiyon kaydırıcı (steer slider)
  * ve çubuk girdilerini dijital DIK_* kodlarına çevirir.
  */
@@ -77,9 +87,10 @@ void nfsu2_input_set_brake(float analog_val);    /* 0.0 .. 1.0 */
 
 /*
  * runtime/com.c ile geriye dönük uyumluluk:
- * com.c metal_fill_keyboard() fonksiyonunu çağırır.
+ * com.c metal_fill_keyboard() fonksiyonunu çağırır ve metal_available() sorgular.
  */
 void metal_fill_keyboard(unsigned char *dst, unsigned int n);
+int  metal_available(void);
 
 #ifdef __cplusplus
 }

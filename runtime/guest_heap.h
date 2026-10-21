@@ -19,6 +19,7 @@ typedef struct GuestHeapSet { GuestHeap heaps[GUEST_HEAP_MAX_HEAPS]; } GuestHeap
  * Destroy revokes all committed pages; mapping owner ultimately shuts down VM. */
 int guest_heap_create(GuestHeapSet *, uint32_t initial, uint32_t maximum, uint32_t *handle);
 int guest_heap_alloc(GuestHeapSet *, uint32_t handle, uint32_t size, int zero, uint32_t *address);
+int guest_heap_realloc(GuestHeapSet *, uint32_t handle, uint32_t flags, uint32_t address, uint32_t size, uint32_t *new_address);
 int guest_heap_free(GuestHeapSet *, uint32_t handle, uint32_t address);
 int guest_heap_size(GuestHeapSet *, uint32_t handle, uint32_t address, uint32_t *size);
 int guest_heap_destroy(GuestHeapSet *, uint32_t handle);

@@ -1,6 +1,7 @@
 import SwiftUI
 import MetalKit
 import GameController
+import QuartzCore
 
 // MARK: - GameController Yöneticisi (DualSense, Xbox, Switch Pro, MFi)
 
@@ -233,6 +234,7 @@ public struct MultiTouchKeyButton: View {
     let size: CGSize
     
     @State private var isPressed: Bool = false
+    @State private var pressStartTime: Double = 0.0
     
     public init(
         icon: String,
@@ -282,6 +284,7 @@ public struct MultiTouchKeyButton: View {
                 .onChanged { _ in
                     if !isPressed {
                         isPressed = true
+                        pressStartTime = CACurrentMediaTime()
                         nfsu2_input_set_key(dikCode, true)
                         if let sec = secondaryDik {
                             nfsu2_input_set_key(sec, true)
@@ -291,9 +294,25 @@ public struct MultiTouchKeyButton: View {
                 }
                 .onEnded { _ in
                     isPressed = false
-                    nfsu2_input_set_key(dikCode, false)
-                    if let sec = secondaryDik {
-                        nfsu2_input_set_key(sec, false)
+                    let elapsed = CACurrentMediaTime() - pressStartTime
+                    let minHoldDuration: Double = 0.050 // 50ms (garantili 3-4 DirectInput polling karesi)
+                    let code = dikCode
+                    let sec = secondaryDik
+                    
+                    if elapsed < minHoldDuration {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + (minHoldDuration - elapsed)) {
+                            if !isPressed {
+                                nfsu2_input_set_key(code, false)
+                                if let s = sec {
+                                    nfsu2_input_set_key(s, false)
+                                }
+                            }
+                        }
+                    } else {
+                        nfsu2_input_set_key(code, false)
+                        if let s = sec {
+                            nfsu2_input_set_key(s, false)
+                        }
                     }
                 }
         )
@@ -311,6 +330,7 @@ public struct RacingPedalView: View {
     let size: CGSize
     
     @State private var isPressed: Bool = false
+    @State private var pressStartTime: Double = 0.0
     
     public init(
         label: String,
@@ -373,6 +393,7 @@ public struct RacingPedalView: View {
                 .onChanged { _ in
                     if !isPressed {
                         isPressed = true
+                        pressStartTime = CACurrentMediaTime()
                         nfsu2_input_set_key(dikCode, true)
                         if let sec = secondaryDik {
                             nfsu2_input_set_key(sec, true)
@@ -382,9 +403,25 @@ public struct RacingPedalView: View {
                 }
                 .onEnded { _ in
                     isPressed = false
-                    nfsu2_input_set_key(dikCode, false)
-                    if let sec = secondaryDik {
-                        nfsu2_input_set_key(sec, false)
+                    let elapsed = CACurrentMediaTime() - pressStartTime
+                    let minHoldDuration: Double = 0.050 // 50ms
+                    let code = dikCode
+                    let sec = secondaryDik
+                    
+                    if elapsed < minHoldDuration {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + (minHoldDuration - elapsed)) {
+                            if !isPressed {
+                                nfsu2_input_set_key(code, false)
+                                if let s = sec {
+                                    nfsu2_input_set_key(s, false)
+                                }
+                            }
+                        }
+                    } else {
+                        nfsu2_input_set_key(code, false)
+                        if let s = sec {
+                            nfsu2_input_set_key(s, false)
+                        }
                     }
                 }
         )
@@ -737,9 +774,114 @@ public struct OnScreenControlsOverlay: View {
     }
 }
 
+// MARK: - NFSU2 Metal Render Yüzeyi (CAMetalLayer + CADisplayLink Köprüsü)
+
+public final class NFSU2MetalRenderUIView: UIView {
+    public override class var layerClass: AnyClass {
+        CAMetalLayer.self
+    }
+    
+    public var metalLayer: CAMetalLayer {
+        layer as! CAMetalLayer
+    }
+    
+    private var displayLink: CADisplayLink?
+    
+    public override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .black
+        isOpaque = true
+        contentScaleFactor = UIScreen.main.scale
+        
+        let mtl = metalLayer
+        mtl.pixelFormat = .bgra8Unorm
+        mtl.framebufferOnly = false
+        mtl.contentsGravity = .resizeAspect
+        mtl.contentsScale = UIScreen.main.scale
+        
+        metal_init()
+        metal_set_layer(Unmanaged.passUnretained(mtl).toOpaque())
+        startDisplayLink()
+        setupNotificationObservers()
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    private func setupNotificationObservers() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+    }
+    
+    @objc private func applicationDidEnterBackground() {
+        stopDisplayLink()
+        nfsu2_input_clear_all()
+    }
+    
+    @objc private func applicationWillEnterForeground() {
+        startDisplayLink()
+    }
+    
+    public override func layoutSubviews() {
+        super.layoutSubviews()
+        let scale = UIScreen.main.scale
+        metalLayer.contentsScale = scale
+        let dw = UInt32(bounds.width * scale)
+        let dh = UInt32(bounds.height * scale)
+        if dw > 0 && dh > 0 {
+            metalLayer.drawableSize = CGSize(width: CGFloat(dw), height: CGFloat(dh))
+            metal_resize(dw, dh)
+        }
+    }
+    
+    private func startDisplayLink() {
+        guard displayLink == nil else { return }
+        let dl = CADisplayLink(target: self, selector: #selector(renderTick))
+        dl.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 60)
+        dl.add(to: .main, forMode: .common)
+        displayLink = dl
+    }
+    
+    private func stopDisplayLink() {
+        displayLink?.invalidate()
+        displayLink = nil
+    }
+    
+    @objc private func renderTick() {
+        _ = metal_render_frame()
+    }
+    
+    deinit {
+        stopDisplayLink()
+        NotificationCenter.default.removeObserver(self)
+    }
+}
+
+public struct NFSU2MetalSurfaceView: UIViewRepresentable {
+    public init() {}
+    
+    public func makeUIView(context: Context) -> NFSU2MetalRenderUIView {
+        NFSU2MetalRenderUIView(frame: .zero)
+    }
+    
+    public func updateUIView(_ uiView: NFSU2MetalRenderUIView, context: Context) {}
+}
+
 // MARK: - GameMetalView (Metal Renderer + Dokunmatik Kontroller + GameController Entegrasyonu)
 
 public struct GameMetalView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var controllerManager = GameControllerManager.shared
     @State private var showTouchOverlay: Bool = true
     
@@ -750,8 +892,8 @@ public struct GameMetalView: View {
     
     public var body: some View {
         ZStack {
-            // Arka plandaki Metal Görünümü (60 FPS Metal render yüzeyi)
-            MetalPreview()
+            // Arka plandaki Metal Görünümü (60-120 FPS native Metal render yüzeyi)
+            NFSU2MetalSurfaceView()
                 .ignoresSafeArea()
             
             // Üstteki Etkileşimli Kontrol Katmanı
@@ -773,6 +915,12 @@ public struct GameMetalView: View {
         }
         .onDisappear {
             nfsu2_input_clear_all()
+        }
+        .onChange(of: scenePhase) { phase in
+            if phase != .active {
+                // Uygulama arka plana geçtiğinde veya kesintiye uğradığında takılı tuşları sıfırla
+                nfsu2_input_clear_all()
+            }
         }
         .onChange(of: controllerManager.isControllerConnected) { connected in
             // Fiziksel kontrolcü bağlandığında veya koptuğunda animasyonla dokunmatik katmanı güncelle

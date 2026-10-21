@@ -38,7 +38,7 @@ FCW_INITIAL = 0x037F
 FNV64_OFFSET = 14695981039346656037
 FNV64_PRIME = 1099511628211
 FNV64_MASK = 0xFFFFFFFFFFFFFFFF
-INSTRUCTION_BUDGET = 100_000
+INSTRUCTION_BUDGET = 250_000
 STACK_WINDOW_BELOW = 0x1000
 STACK_WINDOW_SIZE = 0x2000
 LAST_ERROR_OFFSET = 0x34
@@ -107,6 +107,7 @@ BOUNDARY_ARGUMENT_COUNTS = {
     "TlsSetValue": 2,
     "HeapCreate": 3,
     "HeapAlloc": 3,
+    "HeapReAlloc": 4,
     "HeapFree": 3,
     "HeapSize": 3,
     "HeapDestroy": 1,
@@ -150,6 +151,7 @@ SUPPORTED_IMPORTS = {
     ("kernel32.dll", "GetCurrentThreadId"),
     ("kernel32.dll", "HeapCreate"),
     ("kernel32.dll", "HeapAlloc"),
+    ("kernel32.dll", "HeapReAlloc"),
     *(("kernel32.dll", name) for name in CRITICAL_SECTION_IMPORTS),
     *(("kernel32.dll", name) for name in TLS_IMPORTS),
     ("kernel32.dll", "WideCharToMultiByte"),
@@ -1502,6 +1504,143 @@ def _heap_alloc(engine: Any, registers: Any, unicorn_module: Any,
     engine.reg_write(registers.UC_X86_REG_EAX, result)
     engine.reg_write(registers.UC_X86_REG_ESP, esp + 16)
     engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+    state["resume"] = True
+    return True
+
+
+def _heap_realloc(engine: Any, registers: Any, unicorn_module: Any,
+                  import_row: dict[str, Any],
+                  mapped_ranges: list[tuple[int, int]],
+                  state: dict[str, Any]) -> bool:
+    """Implement bounded HeapReAlloc matching runtime/guest_heap.c."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 4,
+    }
+    if not _range_is_mapped(esp, 20, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 20}
+        return False
+
+    return_address = _read_u32(engine, esp)
+    handle = _read_u32(engine, esp + 4)
+    flags = _read_u32(engine, esp + 8)
+    lp_mem = _read_u32(engine, esp + 12)
+    size = _read_u32(engine, esp + 16)
+    api.update(return_address=return_address, handle=handle, flags=flags,
+               address=lp_mem, size=size)
+
+    if flags & ~(1 | 8 | 0x10):
+        return False
+
+    last_error_addr = TEB_BASE + LAST_ERROR_OFFSET
+    last_error_before = _read_u32(engine, last_error_addr)
+    api["last_error_before"] = last_error_before
+
+    heaps = state.get("heaps", {})
+    heap = next((record for record in heaps.values()
+                 if record.get("handle") == handle), None)
+    result = 0
+    span = _round_up(size if size else 1, 8)
+
+    if heap is None or lp_mem == 0:
+        _write_u32(engine, last_error_addr, ERROR_INVALID_PARAMETER)
+        api["last_error_after"] = ERROR_INVALID_PARAMETER
+    else:
+        blocks = heap.get("blocks", [])
+        block = next((b for b in blocks if int(b.get("address", 0)) == lp_mem), None)
+        if block is None:
+            _write_u32(engine, last_error_addr, ERROR_INVALID_PARAMETER)
+            api["last_error_after"] = ERROR_INVALID_PARAMETER
+        else:
+            old_size = int(block.get("size", 0))
+            old_span = int(block.get("span", 0))
+            fixed = bool(heap.get("fixed", heap.get("maximum_size", 0) != 0))
+            capacity = int(heap["capacity"])
+            if fixed and size >= 0x7FFF8:
+                _write_u32(engine, last_error_addr, ERROR_NOT_ENOUGH_MEMORY)
+                api["last_error_after"] = ERROR_NOT_ENOUGH_MEMORY
+            elif span > capacity:
+                _write_u32(engine, last_error_addr, ERROR_NOT_ENOUGH_MEMORY)
+                api["last_error_after"] = ERROR_NOT_ENOUGH_MEMORY
+            else:
+                can_in_place = (lp_mem + span <= handle + HEAP_HEADER_SIZE + capacity)
+                if can_in_place:
+                    for ob in blocks:
+                        ob_addr = int(ob.get("address", 0))
+                        ob_span = int(ob.get("span", 0))
+                        if ob_addr != lp_mem and ob_addr != 0:
+                            if lp_mem + span > ob_addr and lp_mem < ob_addr + ob_span:
+                                can_in_place = False
+                                break
+                if can_in_place:
+                    if span > old_span:
+                        commit_end = _round_up(lp_mem + span, HEAP_GRANULE)
+                        old_end = handle + int(heap["committed_size"])
+                        if commit_end > old_end:
+                            _commit_heap_pages(engine, unicorn_module, mapped_ranges,
+                                              old_end, commit_end - old_end)
+                            heap["committed_size"] = commit_end - handle
+                    if (flags & 8) and size > old_size:
+                        engine.mem_write(lp_mem + old_size, b"\x00" * (size - old_size))
+                    block["size"] = size
+                    block["span"] = span
+                    result = lp_mem
+                    api["last_error_after"] = last_error_before
+                else:
+                    if flags & 0x10:
+                        _write_u32(engine, last_error_addr, ERROR_NOT_ENOUGH_MEMORY)
+                        api["last_error_after"] = ERROR_NOT_ENOUGH_MEMORY
+                    else:
+                        candidate = handle + HEAP_HEADER_SIZE
+                        while True:
+                            next_cand = candidate
+                            for ob in blocks:
+                                ob_addr = int(ob.get("address", 0))
+                                ob_span = int(ob.get("span", 0))
+                                if (ob_addr and candidate + span > ob_addr and
+                                        candidate < ob_addr + ob_span and
+                                        ob_addr + ob_span > next_cand):
+                                    next_cand = ob_addr + ob_span
+                            if next_cand == candidate:
+                                break
+                            candidate = next_cand
+                        limit = handle + HEAP_HEADER_SIZE + capacity
+                        if candidate + span > limit:
+                            _write_u32(engine, last_error_addr, ERROR_NOT_ENOUGH_MEMORY)
+                            api["last_error_after"] = ERROR_NOT_ENOUGH_MEMORY
+                        else:
+                            commit_end = _round_up(candidate + span, HEAP_GRANULE)
+                            old_end = handle + int(heap["committed_size"])
+                            if commit_end > old_end:
+                                _commit_heap_pages(engine, unicorn_module, mapped_ranges,
+                                                  old_end, commit_end - old_end)
+                                heap["committed_size"] = commit_end - handle
+                            if flags & 8:
+                                engine.mem_write(candidate, b"\x00" * size)
+                            copy_bytes = min(old_size, size)
+                            if copy_bytes > 0:
+                                old_data = engine.mem_read(lp_mem, copy_bytes)
+                                engine.mem_write(candidate, bytes(old_data))
+                            block["address"] = candidate
+                            block["size"] = size
+                            block["span"] = span
+                            result = candidate
+                            api["last_error_after"] = last_error_before
+
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, (esp + 20) & 0xFFFFFFFF)
+    engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+    api["result"] = result
+    api["esp_after"] = (esp + 20) & 0xFFFFFFFF
+    state["api_calls"].append(api)
     state["resume"] = True
     return True
 
@@ -3099,6 +3238,14 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
                         return True
                     _record_unsupported_import(address, index, row, engine, xr,
                                                mapped_ranges, state)
+                elif row["name"] == "HeapReAlloc":
+                    handled = _heap_realloc(engine, xr, uc, row,
+                                            mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
                 elif row["name"] == "HeapFree":
                     handled = _heap_free(engine, xr, uc, row,
                                          mapped_ranges, state)
@@ -3380,6 +3527,7 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
     } or (boundary_key in {
         ("kernel32.dll", "HeapCreate"),
         ("kernel32.dll", "HeapAlloc"),
+        ("kernel32.dll", "HeapReAlloc"),
     } and not state["boundary_call"]):
         raise RuntimeError("startup oracle stopped at a supported import instead of applying its contract")
     if (boundary_key == ("kernel32.dll", "GetStdHandle") and

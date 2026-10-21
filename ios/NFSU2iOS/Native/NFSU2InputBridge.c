@@ -2,10 +2,12 @@
  * NFSU2 iOS Port - DirectInput Klavye ve Kontrolcü Köprüsü Uygulaması
  *
  * C11 atomik bellek modeli ile kilitsiz (lock-free), sıfır gecikmeli (zero-latency)
- * tuş dizisi yönetimi sağlar.
+ * tuş dizisi yönetimi sağlar. DirectInput (cb=256) GetDeviceState çağrılarını
+ * ve SPEED2.EXE içindeki 0x00870990 statik klavye tamponunu doğrudan besler.
  */
 
 #include "NFSU2InputBridge.h"
+#include "guest_memory.h"
 #include <stdatomic.h>
 #include <string.h>
 
@@ -17,13 +19,30 @@
  */
 static _Atomic uint8_t g_keys[256];
 
+/*
+ * Konuk sanal bellek adresinin geçerli ve ayrılmış (committed) olup olmadığını
+ * kilit gerektirmeyen (lock-free) g_cbits bit haritası üzerinden doğrular.
+ */
+static inline bool is_guest_addr_committed(uint32_t addr) {
+    if (!g_mem) return false;
+    uint32_t granule = addr >> 14;
+    if (granule >= GUEST_MEMORY_BITMAP_SIZE * 8u) return false;
+    return (g_cbits[granule >> 3] & (uint8_t)(1u << (granule & 7))) != 0;
+}
+
 void nfsu2_input_set_key(uint8_t dik_code, bool is_pressed) {
     atomic_store_explicit(&g_keys[dik_code], is_pressed ? 1 : 0, memory_order_release);
+    if (is_guest_addr_committed(NFSU2_KEYBOARD_BUFFER_GUEST_ADDR)) {
+        g_mem[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + dik_code] = is_pressed ? 0x80 : 0x00;
+    }
 }
 
 void nfsu2_input_clear_all(void) {
     for (int i = 0; i < 256; i++) {
         atomic_store_explicit(&g_keys[i], 0, memory_order_relaxed);
+    }
+    if (is_guest_addr_committed(NFSU2_KEYBOARD_BUFFER_GUEST_ADDR)) {
+        memset(g_mem + NFSU2_KEYBOARD_BUFFER_GUEST_ADDR, 0, 256);
     }
 }
 
@@ -49,42 +68,50 @@ void nfsu2_input_fill_keyboard(uint8_t *dst, uint32_t count) {
     }
 }
 
+void nfsu2_input_sync_guest_memory(void) {
+    if (!is_guest_addr_committed(NFSU2_KEYBOARD_BUFFER_GUEST_ADDR)) return;
+    for (int i = 0; i < 256; i++) {
+        g_mem[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + i] =
+            atomic_load_explicit(&g_keys[i], memory_order_acquire) ? 0x80 : 0x00;
+    }
+}
+
 void nfsu2_input_set_steering(float analog_x) {
     /* Hassas ölü bölge (deadzone) eşiği */
     const float deadzone = 0.08f;
     if (analog_x < -deadzone) {
         /* Sol yön aktif: hem DIK_LEFT hem de ikincil tuş DIK_A */
-        atomic_store_explicit(&g_keys[NFSU2_DIK_LEFT], 1, memory_order_release);
-        atomic_store_explicit(&g_keys[NFSU2_DIK_A], 1, memory_order_release);
-        atomic_store_explicit(&g_keys[NFSU2_DIK_RIGHT], 0, memory_order_release);
-        atomic_store_explicit(&g_keys[NFSU2_DIK_D], 0, memory_order_release);
+        nfsu2_input_set_key(NFSU2_DIK_LEFT, true);
+        nfsu2_input_set_key(NFSU2_DIK_A, true);
+        nfsu2_input_set_key(NFSU2_DIK_RIGHT, false);
+        nfsu2_input_set_key(NFSU2_DIK_D, false);
     } else if (analog_x > deadzone) {
         /* Sağ yön aktif: hem DIK_RIGHT hem de ikincil tuş DIK_D */
-        atomic_store_explicit(&g_keys[NFSU2_DIK_RIGHT], 1, memory_order_release);
-        atomic_store_explicit(&g_keys[NFSU2_DIK_D], 1, memory_order_release);
-        atomic_store_explicit(&g_keys[NFSU2_DIK_LEFT], 0, memory_order_release);
-        atomic_store_explicit(&g_keys[NFSU2_DIK_A], 0, memory_order_release);
+        nfsu2_input_set_key(NFSU2_DIK_RIGHT, true);
+        nfsu2_input_set_key(NFSU2_DIK_D, true);
+        nfsu2_input_set_key(NFSU2_DIK_LEFT, false);
+        nfsu2_input_set_key(NFSU2_DIK_A, false);
     } else {
         /* Ölü bölge içinde (merkez): direksiyon tuşlarını serbest bırak */
-        atomic_store_explicit(&g_keys[NFSU2_DIK_LEFT], 0, memory_order_release);
-        atomic_store_explicit(&g_keys[NFSU2_DIK_A], 0, memory_order_release);
-        atomic_store_explicit(&g_keys[NFSU2_DIK_RIGHT], 0, memory_order_release);
-        atomic_store_explicit(&g_keys[NFSU2_DIK_D], 0, memory_order_release);
+        nfsu2_input_set_key(NFSU2_DIK_LEFT, false);
+        nfsu2_input_set_key(NFSU2_DIK_A, false);
+        nfsu2_input_set_key(NFSU2_DIK_RIGHT, false);
+        nfsu2_input_set_key(NFSU2_DIK_D, false);
     }
 }
 
 void nfsu2_input_set_throttle(float analog_val) {
     const float threshold = 0.08f;
-    uint8_t state = (analog_val > threshold) ? 1 : 0;
-    atomic_store_explicit(&g_keys[NFSU2_DIK_UP], state, memory_order_release);
-    atomic_store_explicit(&g_keys[NFSU2_DIK_W], state, memory_order_release);
+    bool pressed = (analog_val > threshold);
+    nfsu2_input_set_key(NFSU2_DIK_UP, pressed);
+    nfsu2_input_set_key(NFSU2_DIK_W, pressed);
 }
 
 void nfsu2_input_set_brake(float analog_val) {
     const float threshold = 0.08f;
-    uint8_t state = (analog_val > threshold) ? 1 : 0;
-    atomic_store_explicit(&g_keys[NFSU2_DIK_DOWN], state, memory_order_release);
-    atomic_store_explicit(&g_keys[NFSU2_DIK_S], state, memory_order_release);
+    bool pressed = (analog_val > threshold);
+    nfsu2_input_set_key(NFSU2_DIK_DOWN, pressed);
+    nfsu2_input_set_key(NFSU2_DIK_S, pressed);
 }
 
 /*
@@ -93,4 +120,12 @@ void nfsu2_input_set_brake(float analog_val) {
  */
 void metal_fill_keyboard(unsigned char *dst, unsigned int n) {
     nfsu2_input_fill_keyboard((uint8_t *)dst, (uint32_t)n);
+}
+
+/*
+ * runtime/com.c uyumluluğu: DirectInput hook'larının metal_fill_keyboard()
+ * çağrısını yapabilmesi için metal_available() gereklidir.
+ */
+int metal_available(void) {
+    return 1;
 }

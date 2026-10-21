@@ -56,6 +56,64 @@ int guest_heap_alloc(GuestHeapSet *set, uint32_t handle, uint32_t size, int zero
     heap->blocks[slot]=(GuestHeapBlock){candidate,size,(uint32_t)span};
     *address=candidate; return 0;
 }
+int guest_heap_realloc(GuestHeapSet *set, uint32_t handle, uint32_t flags, uint32_t address, uint32_t size, uint32_t *new_address) {
+    GuestHeap *heap=find(set,handle);
+    if (!heap || !address || !new_address) return EINVAL;
+    if (heap->fixed && size>=0x7fff8u) return ENOMEM;
+    uint64_t span=((uint64_t)(size ? size : 1)+7u)&~UINT64_C(7);
+    if (span>heap->capacity) return ENOMEM;
+    unsigned slot=GUEST_HEAP_MAX_BLOCKS;
+    for (unsigned i=0;i<GUEST_HEAP_MAX_BLOCKS;i++) if (heap->blocks[i].address==address) {
+        slot=i; break;
+    }
+    if (slot==GUEST_HEAP_MAX_BLOCKS) return EINVAL;
+    GuestHeapBlock *b=&heap->blocks[slot];
+    uint32_t old_size=b->size;
+    uint32_t old_span=b->span;
+
+    int can_in_place=((uint64_t)address+span <= (uint64_t)handle+HEADER+heap->capacity);
+    if (can_in_place) {
+        for (unsigned j=0;j<GUEST_HEAP_MAX_BLOCKS;j++) {
+            if (j==slot || !heap->blocks[j].address) continue;
+            const GuestHeapBlock *ob=&heap->blocks[j];
+            if ((uint64_t)address+span>ob->address &&
+                (uint64_t)address<(uint64_t)ob->address+ob->span) {
+                can_in_place=0; break;
+            }
+        }
+    }
+    if (can_in_place) {
+        if (span>old_span) {
+            int rc=guest_memory_commit(address+old_span,span-old_span);
+            if (rc) return rc;
+        }
+        if ((flags & 8u) && size>old_size) memset(g_mem+address+old_size,0,size-old_size);
+        b->size=size; b->span=(uint32_t)span;
+        *new_address=address; return 0;
+    }
+    if (flags & 0x10u) return ENOMEM;
+
+    uint32_t candidate=handle+HEADER;
+    for (;;) {
+        uint32_t next=candidate;
+        for (unsigned i=0;i<GUEST_HEAP_MAX_BLOCKS;i++) {
+            const GuestHeapBlock *ob=&heap->blocks[i];
+            if (ob->address && (uint64_t)candidate+span>ob->address &&
+                candidate<(uint64_t)ob->address+ob->span && ob->address+ob->span>next)
+                next=ob->address+ob->span;
+        }
+        if (next==candidate) break;
+        candidate=next;
+    }
+    if ((uint64_t)candidate+span>(uint64_t)handle+HEADER+heap->capacity) return ENOMEM;
+    int rc=guest_memory_commit(candidate,span);
+    if (rc) return rc;
+    if (flags & 8u) memset(g_mem+candidate,0,size);
+    uint32_t copy_bytes=old_size<size ? old_size : size;
+    if (copy_bytes) memcpy(g_mem+candidate,g_mem+address,copy_bytes);
+    b->address=candidate; b->size=size; b->span=(uint32_t)span;
+    *new_address=candidate; return 0;
+}
 int guest_heap_free(GuestHeapSet *set, uint32_t handle, uint32_t address) {
     GuestHeap *heap=find(set,handle);
     if (!heap) return EINVAL;

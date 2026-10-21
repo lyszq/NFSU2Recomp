@@ -34,8 +34,10 @@ int guest_memory_init(void) {
         rc = ENOTSUP;
         goto done;
     }
-    /* PROT_NONE reserves address space, not 4 GiB of physical memory. */
-    void *region = mmap(NULL, (size_t)GUEST_MEMORY_SIZE, PROT_NONE,
+    /* PROT_NONE reserves address space, not 4 GiB of physical memory.
+     * GUEST_MEMORY_RESERVE adds a trailing guard granule past 4 GiB so multi-byte
+     * reads at 0xFFFFFFFF safely fault instead of spilling into adjacent memory. */
+    void *region = mmap(NULL, (size_t)GUEST_MEMORY_RESERVE, PROT_NONE,
                         MAP_PRIVATE | MAP_ANON, -1, 0);
     if (region == MAP_FAILED) { rc = errno; goto done; }
     g_mem = region;
@@ -121,7 +123,7 @@ size_t guest_memory_host_page_size(void) {
 int guest_memory_shutdown(void) {
     int rc = 0;
     pthread_mutex_lock(&mutex);
-    if (g_mem && munmap(g_mem, (size_t)GUEST_MEMORY_SIZE)) { rc = errno; goto done; }
+    if (g_mem && munmap(g_mem, (size_t)GUEST_MEMORY_RESERVE)) { rc = errno; goto done; }
     g_mem = NULL;
     host_page_size = 0;
     committed = 0;

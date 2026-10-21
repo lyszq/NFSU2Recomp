@@ -6,3 +6,6 @@
 
 // iOS Touch and GameController -> DirectInput (DIK_*) Bridge
 #include "NFSU2InputBridge.h"
+
+// iOS Metal Rendering Bridge
+#include "NFSU2MetalBridge.h"

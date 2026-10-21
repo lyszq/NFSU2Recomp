@@ -45,6 +45,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.lyszq.nfsu2ios
         PRODUCT_NAME: NFSU2iOS
+        CODE_SIGN_ENTITLEMENTS: NFSU2iOS/NFSU2iOS.entitlements
+        GCC_OPTIMIZATION_LEVEL: '2'
         GCC_STRICT_ALIASING: 'NO'
         GCC_C_LANGUAGE_STANDARD: gnu11
         LD_GENERATE_MAP_FILE: 'YES'
@@ -62,8 +64,8 @@ targets:
       path: NFSU2iOS/Info.plist
       properties:
         CFBundleDisplayName: NFSU2 iOS
-        CFBundleShortVersionString: '0.12.0'
-        CFBundleVersion: '18'
+        CFBundleShortVersionString: '0.13.0'
+        CFBundleVersion: '19'
         LSRequiresIPhoneOS: true
         UIRequiresFullScreen: true
         UIFileSharingEnabled: true

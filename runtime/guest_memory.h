@@ -6,6 +6,7 @@
 
 #define GUEST_MEMORY_SIZE UINT64_C(0x100000000)
 #define GUEST_MEMORY_GRANULE 0x4000u
+#define GUEST_MEMORY_RESERVE (GUEST_MEMORY_SIZE + GUEST_MEMORY_GRANULE)
 #define GUEST_MEMORY_BITMAP_SIZE (1u << 15)
 
 /* These symbols preserve cpu.h's generated-code ABI and 16 KiB readability bitmap. */

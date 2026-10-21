@@ -219,7 +219,49 @@ int main(void) {
     CHECK(guest_heap_size(&invalid, 1, 1, &size) == EINVAL);
     CHECK(size == UINT32_C(0xdeadbeef));
 
+    /* Reallocation in-place, relocation, HEAP_ZERO_MEMORY, in-place-only flag, and error preservation */
+    GuestHeapSet rset = {0};
+    uint32_t rheap = 0;
+    CHECK(!guest_heap_create(&rset, 0, 1024, &rheap));
+    uint32_t blk1 = 0, blk2 = 0;
+    CHECK(!guest_heap_alloc(&rset, rheap, 16, 1, &blk1));
+    CHECK(!guest_heap_alloc(&rset, rheap, 16, 1, &blk2));
+    uint8_t *b1_data = guest_memory_pointer(blk1, 16, 1);
+    memset(b1_data, 0x42, 16);
+
+    uint32_t r_addr = UINT32_C(0xdeadbeef);
+    CHECK(guest_heap_realloc(&rset, rheap, 0x10, blk1, 32, &r_addr) == ENOMEM);
+    CHECK(r_addr == UINT32_C(0xdeadbeef));
+
+    CHECK(!guest_heap_realloc(&rset, rheap, 0x8, blk1, 32, &r_addr));
+    CHECK(r_addr != blk1);
+    CHECK(r_addr >= blk2 + 16u);
+    CHECK(all_bytes_are(r_addr, 16, 0x42));
+    CHECK(all_bytes_are(r_addr + 16, 16, 0));
+    CHECK(!guest_heap_size(&rset, rheap, r_addr, &size) && size == 32);
+
+    uint32_t in_place_addr = 0;
+    CHECK(!guest_heap_realloc(&rset, rheap, 0x8, r_addr, 48, &in_place_addr));
+    CHECK(in_place_addr == r_addr);
+    CHECK(all_bytes_are(in_place_addr, 16, 0x42));
+    CHECK(all_bytes_are(in_place_addr + 16, 32, 0));
+    CHECK(!guest_heap_size(&rset, rheap, in_place_addr, &size) && size == 48);
+
+    uint32_t shrink_addr = 0;
+    CHECK(!guest_heap_realloc(&rset, rheap, 0, in_place_addr, 8, &shrink_addr));
+    CHECK(shrink_addr == in_place_addr);
+    CHECK(all_bytes_are(shrink_addr, 8, 0x42));
+    CHECK(!guest_heap_size(&rset, rheap, shrink_addr, &size) && size == 8);
+
+    CHECK(guest_heap_realloc(&rset, rheap, 0, 0, 16, &sentinel) == EINVAL);
+    CHECK(guest_heap_realloc(&rset, rheap, 0, 0x12345678, 16, &sentinel) == EINVAL);
+    CHECK(guest_heap_realloc(&rset, 0, 0, shrink_addr, 16, &sentinel) == EINVAL);
+    CHECK(guest_heap_realloc(NULL, rheap, 0, shrink_addr, 16, &sentinel) == EINVAL);
+    CHECK(guest_heap_realloc(&rset, rheap, 0, shrink_addr, 16, NULL) == EINVAL);
+
+    CHECK(!guest_heap_destroy(&rset, rheap));
+
     CHECK(!guest_memory_shutdown());
-    puts("PASS | guest heap | bounded arenas, zero blocks, reuse/coalescing, atomic failures, metadata cap, lifecycle");
+    puts("PASS | guest heap | bounded arenas, zero blocks, reuse/coalescing, realloc in-place/relocate, atomic failures, metadata cap, lifecycle");
     return 0;
 }

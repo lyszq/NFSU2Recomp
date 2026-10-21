@@ -53,11 +53,11 @@ def generate(exe):
                 "name": entry.name.decode("ascii") if entry.name else f"#{entry.ordinal}"}
                for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
     reference = run_startup_reference(exe, imports)
-    if (reference["import_name"] != "HeapReAlloc" or reference["instructions"] != 40703
-            or reference["calls"] != 1241 or reference["api_call_count"] != 169
+    if (reference["import_name"] != "RegOpenKeyA" or reference["instructions"] != 129062
+            or reference["calls"] != 6781 or reference["api_call_count"] != 558
             or reference["critical_section_count"] != 14
             or reference["tls_slot_count"] != 1 or reference["tls_thread_count"] != 1):
-        raise ValueError("unexpected independent x86 entry boundary")
+        raise ValueError(f"unexpected independent x86 entry boundary: {reference['import_name']} {reference['instructions']}")
     # Prioritize the authentic observed startup path within the bounded static
     # graph. This changes generation order, never the guest instructions or API
     # outcomes. Missing/unliftable executed functions must fail generation.
@@ -66,7 +66,7 @@ def generate(exe):
     seen = set()
     bodies, omitted = {}, []
     lifter = StartupLifter(str(exe), comments=False, trap=False)
-    while queue and len(bodies) < 256:
+    while queue and len(bodies) < 600:
         address = queue.popleft()
         if address in seen or address == LEAF:
             continue

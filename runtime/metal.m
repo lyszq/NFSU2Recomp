@@ -3,7 +3,13 @@
  * macOS'ta pencere ANA thread'de olmali. Guest zaten ayri bir thread'de
  * calistigi icin uygun: ana thread NSApplication dongusunu surer, guest
  * thread'i cizim komutlarini kuyruga yazar.                              */
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#else
 #import <Cocoa/Cocoa.h>
+#import <CoreServices/CoreServices.h>
+#endif
 #import <QuartzCore/CAMetalLayer.h>
 #import <QuartzCore/QuartzCore.h>
 
@@ -18,6 +24,13 @@
 #import <Metal/Metal.h>
 #include "enhance.h"
 #include "perflog.h"
+/* Weak fallbacks if perflog.c is omitted */
+__attribute__((weak)) int g_perflog = 0;
+__attribute__((weak)) char g_pl_dir[900] = {0};
+__attribute__((weak)) uint64_t perflog_now_us(void) { return 0; }
+__attribute__((weak)) void perflog_render_frame(long f, unsigned n, uint64_t d, uint64_t e, unsigned dr, unsigned v) { (void)f;(void)n;(void)d;(void)e;(void)dr;(void)v; }
+__attribute__((weak)) void perflog_gpu(long f, double g) { (void)f;(void)g; }
+__attribute__((weak)) void perflog_event(int k, uint64_t ns, uint64_t bytes) { (void)k;(void)ns;(void)bytes; }
 #include <stdatomic.h>
 #include <math.h>
 #include <string.h>
@@ -25,9 +38,10 @@
 #include <time.h>
 #include <stdlib.h>
 
+#if !TARGET_OS_IPHONE
 static NSWindow        *g_win;
+#endif
 #import <ImageIO/ImageIO.h>
-#import <CoreServices/CoreServices.h>
 
 static CAMetalLayer    *g_layer;
 static long             g_skip_empty;   /* icerigi olmayan kare: sunma */
@@ -126,7 +140,7 @@ void metal_set_ui_aspect(float a){
     if (!(a > 0.05f && a <= 1.0f)) a = 1.0f;
     atomic_store(&g_ui_asp, (int)lroundf(a * 10000.f));
 }
-void com_request_reset(void);
+__attribute__((weak)) void com_request_reset(void) {}
 static _Atomic int g_mouse_dx = 0, g_mouse_dy = 0, g_mouse_dz = 0;
 static _Atomic unsigned g_mouse_btn = 0;
 
@@ -246,12 +260,14 @@ static unsigned char mac_to_dik(unsigned short kc){
     default:   return 0;
     }
 }
+#if !TARGET_OS_IPHONE
 /* Guest tarafi: DirectInput klavye durumunu doldur */
 void metal_fill_keyboard(unsigned char *dst, unsigned n){
     if (n > 256) n = 256;
     for (unsigned i = 0; i < n; i++)
         dst[i] = atomic_load(&g_keys[i]) ? 0x80 : 0x00;
 }
+#endif
 
 /* Dokular pencere acilmadan ONCE yaratiliyor.  Bu yuzden "kullanilabilir"
  * olcutu cihazdir, katman degil; yoksa erken dokular sessizce kayboluyordu. */
@@ -369,6 +385,7 @@ static long g_gpuw_a = -1, g_gpuw_b = -1;
  *    yazmasi, GFX DCS RD/WR = bunun DRAM'e giden kismi.  DVFS'ten bagimsiz
  *    bir IS olcusu: GPU saati ne olursa olsun karenin tasidigi bayt ayni.
  * Ozel kutuphane oldugu icin calisma aninda dlopen ile. */
+#if !TARGET_OS_IPHONE
 #include <dlfcn.h>
 typedef struct { double j, rd, wr, drd, dwr; } IorS;   /* J ve bayt, ilk cagridan beri */
 static int ior_read(IorS *o){                 /* 1 = gecerli */
@@ -427,6 +444,10 @@ static int ior_read(IorS *o){                 /* 1 = gecerli */
     *o = r;
     return r.j >= 0;
 }
+#else
+typedef struct { double j, rd, wr, drd, dwr; } IorS;
+static int ior_read(IorS *o){ (void)o; return 0; }
+#endif
 static IorS g_gS0, g_gS1; static int g_gS0ok = 0, g_gS1ok = 0; static double g_gT0, g_gT1;
 static double gpuE_now_s(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec / 1e9; }
 static int gpuw_in(long f){
@@ -3316,6 +3337,15 @@ static unsigned u_gcd(unsigned a, unsigned b){
 static _Atomic int g_scr_cw = 0, g_scr_ch = 0, g_scr_s100 = 0;
 static void scr_cache(void){
     @autoreleasepool {
+#if TARGET_OS_IPHONE
+        UIScreen *sc = [UIScreen mainScreen];
+        if (!sc) return;
+        CGRect c = [sc bounds];
+        CGFloat s = [sc scale];
+        atomic_store(&g_scr_cw, (int)c.size.width);
+        atomic_store(&g_scr_ch, (int)c.size.height);
+        atomic_store(&g_scr_s100, (int)lround(s * 100.0));
+#else
         NSScreen *sc = [NSScreen mainScreen];
         if (!sc) return;
         NSRect c = [NSWindow contentRectForFrameRect:[sc visibleFrame]
@@ -3323,6 +3353,7 @@ static void scr_cache(void){
         atomic_store(&g_scr_cw, (int)c.size.width);
         atomic_store(&g_scr_ch, (int)c.size.height);
         atomic_store(&g_scr_s100, (int)lround([sc backingScaleFactor] * 100.0));
+#endif
     }
 }
 void metal_native_size(unsigned gw, unsigned gh, unsigned *ow, unsigned *oh){
@@ -3347,6 +3378,12 @@ void metal_native_size(unsigned gw, unsigned gh, unsigned *ow, unsigned *oh){
         /* win_apply_size'in uygulayacagi sinirin birebir aynisi */
         aw = cw; ah = ch; s = s100 / 100.0;
     } else {
+#if TARGET_OS_IPHONE
+        UIScreen *sc = [UIScreen mainScreen];
+        CGRect b = [sc bounds];
+        s = [sc scale];
+        aw = b.size.width; ah = b.size.height;
+#else
         /* Onbellek yoksa CoreGraphics ile tahmin (thread-guvenli). */
         CGDirectDisplayID d = CGMainDisplayID();
         CGRect b = CGDisplayBounds(d);                /* NOKTA cinsinden */
@@ -3357,6 +3394,7 @@ void metal_native_size(unsigned gw, unsigned gh, unsigned *ow, unsigned *oh){
                 CGDisplayModeRelease(m); }
         /* menu cubugu / centik (<=32) + baslik cubugu (<=32) */
         aw = b.size.width; ah = b.size.height - 64.0;
+#endif
     }
     if (s < 1.0) s = 1.0;
     if (aw < 320.0 || ah < 240.0) return;
@@ -3445,6 +3483,15 @@ static id<MTLSamplerState> samp_for(unsigned k){
 static _Atomic int g_win_sized = 0;
 static void win_apply_size(unsigned w, unsigned h){
     if (!g_layer) return;
+#if TARGET_OS_IPHONE
+    CGFloat s = [UIScreen mainScreen].scale;
+    if (s < 1.0) s = 1.0;
+    g_layer.contentsScale = s;
+    g_layer.drawableSize  = CGSizeMake((CGFloat)w, (CGFloat)h);
+    atomic_store(&g_draw_w, (int)w); atomic_store(&g_draw_h, (int)h);
+    CGRect c = [g_layer bounds];
+    atomic_store(&g_cont_w, (int)c.size.width); atomic_store(&g_cont_h, (int)c.height);
+#else
     CGFloat s = g_win ? [g_win backingScaleFactor]
                       : [[NSScreen mainScreen] backingScaleFactor];
     if (s < 1.0) s = 1.0;
@@ -3467,6 +3514,7 @@ static void win_apply_size(unsigned w, unsigned h){
     fprintf(stderr, "metal: %s: cizim %ux%u piksel, icerik %.0fx%.0f nokta (olcek %.2g) -> %s\n",
             fs ? "tam ekran" : "pencere", w, h, (double)c.width, (double)c.height, (double)s,
             exact ? "1:1" : "pencereye olcekleniyor");
+#endif
 }
 /* Ayar menusu satirlarinin dayandigi GORUNUM (piksel): tam ekranda tam
  * ekran icerigi, penceredeyse pencerenin su anki icerigi; pencere henuz
@@ -4144,18 +4192,22 @@ void metal_early_init(void){
     /* Ekran geometrisini konuk thread baslamadan ONCE, ana thread'de olc:
      * konuk CreateDevice'ta cizim boyutunu buna gore seciyor (boot.c bu
      * fonksiyonu pthread_create'ten once cagiriyor). */
+#if !TARGET_OS_IPHONE
     [NSApplication sharedApplication];
+#endif
     scr_cache();
     /* App Nap / zamanlayici birlestirme KAPALI.  Oyun penceresi on
      * planda degilken macOS sureci arka plan QoS'una dusuruyor ve is
      * VERIMLILIK cekirdeklerine kayiyor -- olculdu: ayni ikili, ayni
      * sahne, 10 ms yerine 36 ms/kare (3.4x).  clang ayni kabuktan tam
      * hizda kosuyordu, yani makine degil UYGULAMA kisilyordu. */
+#if !TARGET_OS_IPHONE
     { static id act; if (!act)
         act = [[NSProcessInfo processInfo] beginActivityWithOptions:
                  NSActivityUserInitiated | NSActivityLatencyCritical
                  reason:@"oyun karesi uretimi"];
       (void)act; }
+#endif
     dump_init();
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev){ fprintf(stderr, "metal: cihaz bulunamadi\n"); return; }
@@ -4764,8 +4816,12 @@ static void dump_one_texture(unsigned id_, long frame){
  * oluyor.  Oyun alanindayken sistemin imlecini gizle, cikinca geri getir. */
 static int g_cur_hidden = 0;
 static void cursor_hide_update(int inside){
+#if !TARGET_OS_IPHONE
     if (inside && !g_cur_hidden){ [NSCursor hide];   g_cur_hidden = 1; }
     else if (!inside && g_cur_hidden){ [NSCursor unhide]; g_cur_hidden = 0; }
+#else
+    (void)inside;
+#endif
 }
 /* --- ProMotion: ekran tazeleme hizi -------------------------------------
  * macOS ProMotion ekranin hizini uygulamanin sunum temposuna gore secer;
@@ -4778,6 +4834,7 @@ static void cursor_hide_update(int inside){
  * DLINK=2: tercih yok, yalnizca olcum -- 5 sn'de bir GERCEK tazeleme hizini
  * yazar (tools/oturum.sh bunu acar).  DLINK=1: ayni, ustune azami hizi
  * tercih eder (CADisplayLink, macOS 14+); durum tekrar ederse ilk aday. */
+#if !TARGET_OS_IPHONE
 static _Atomic unsigned long g_dl_ticks = 0;
 @interface NfsuTick : NSObject @end
 @implementation NfsuTick { double t0; unsigned long n0; }
@@ -4887,357 +4944,13 @@ static int fs_pref_load(void){
     (void)s; fprintf(stderr, "app: cikis istegi (Cmd-Q / Dock)\n");
     atomic_store(&g_should_quit, 1); return NSTerminateCancel; }
 @end
+#endif
 
 /* Ana thread'de cagrilmali. Pencereyi acar ve NSApp dongusunu surer;
  * geri donmez (uygulama kapanana kadar).                                */
-void metal_run_main_loop(void){
-    @autoreleasepool {
-        metal_early_init();
-        if (!g_dev) return;
-
-        [NSApplication sharedApplication];
-        /* NOFOCUS=1 (test kosulari): Dock simgesi yok, odak calmaz; pencere
-         * arkada acilir.  Kullanicinin klavyesi test penceresine gitmez. */
-        [NSApp setActivationPolicy:(ENVC("NOFOCUS") && ENVC("NOFOCUS")[0] != '0')
-                                   ? NSApplicationActivationPolicyAccessory
-                                   : NSApplicationActivationPolicyRegular];
-        NfsuDelegate *del = [NfsuDelegate new];
-        [NSApp setDelegate:del];
-        /* [NSApp run] cagirmiyoruz (olay dongusu asagida elle suruluyor).
-         * finishLaunching normalde run'in ilk isi: AppleEvent isleyicilerini
-         * kaydeder.  Onsuz uygulama "Cik" komutuna (Dock > Cik, oturum
-         * kapatma, osascript quit) hic yanit vermiyor -- surec asili kaliyor. */
-        [NSApp finishLaunching];
-
-        /* Menu cubugu.  Olay dongusu asagida elle surdugu icin AppKit
-         * bunu kendiliginden kurmuyor: menusuz bir uygulamada Cmd-Q,
-         * Cmd-H, Cmd-M calismaz ve pencere "takilmis" gibi gorunur. */
-        {   NSMenu *bar = [NSMenu new];
-            NSMenuItem *appItem = [NSMenuItem new];
-            [bar addItem:appItem];
-            NSMenu *appMenu = [NSMenu new];
-            [appMenu addItemWithTitle:@"NFSU2 Hakkinda"
-                               action:@selector(orderFrontStandardAboutPanel:)
-                        keyEquivalent:@""];
-            [appMenu addItem:[NSMenuItem separatorItem]];
-            [appMenu addItemWithTitle:@"Gizle" action:@selector(hide:) keyEquivalent:@"h"];
-            [appMenu addItemWithTitle:@"Kucult" action:@selector(performMiniaturize:)
-                        keyEquivalent:@"m"];
-            [appMenu addItemWithTitle:@"Tam Ekran"
-                               action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
-            /* macOS'un standart kisayolu Ctrl+Cmd+F (menu esi olmadan
-             * hicbir yere baglanmiyordu); menude gizli durur. */
-            { NSMenuItem *fs2 = [appMenu addItemWithTitle:@"Tam Ekran (Ctrl+Cmd+F)"
-                                   action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
-              [fs2 setKeyEquivalentModifierMask:NSEventModifierFlagControl | NSEventModifierFlagCommand];
-              if (@available(macOS 13.0, *)){
-                  [fs2 setHidden:YES]; [fs2 setAllowsKeyEquivalentWhenHidden:YES]; } }
-            [appMenu addItem:[NSMenuItem separatorItem]];
-            [appMenu addItemWithTitle:@"NFSU2'den Cik" action:@selector(terminate:)
-                        keyEquivalent:@"q"];
-            [appItem setSubmenu:appMenu];
-            [NSApp setMainMenu:bar];
-        }
-
-        /* Pencere boyutu SABIT 1280x720 idi: oyun CreateDevice ile baska
-         * bir cozunurluk istese bile (kayit defterindeki g_RacingResolution)
-         * pencere degismiyordu.  Cihaz Metal'den ONCE yaratilabildigi icin
-         * istenen boyutu buradan okuyoruz. */
-        unsigned rw = g_want_w ? g_want_w : 1280u, rh = g_want_h ? g_want_h : 720u;
-        /* Oyun cihazini henuz yaratmadiysa yer tutucu da Retina olcekli
-         * olsun; yoksa pencere once yarim boyutta (640x360 nokta) acilip
-         * CreateDevice gelince buyuyor.  Oyunun kiplerinin neredeyse
-         * tamami 4:3 oldugu icin yer tutucu 1280x960 oraninda: en yaygin
-         * durumda pencere CreateDevice'ta hic ziplamiyor. */
-        if (!g_want_w){ const char *nv = ENVC("NFSNATIVE");
-            if (!(nv && nv[0] == '0')){ rw = 1280u; rh = 960u;
-                                         metal_native_size(1280u, 960u, &rw, &rh); } }
-        NSRect frame = NSMakeRect(0, 0, (CGFloat)rw, (CGFloat)rh);
-        g_win = [[NSWindow alloc] initWithContentRect:frame
-                    styleMask:NFSU_WIN_STYLE
-                      backing:NSBackingStoreBuffered defer:NO];
-        [g_win setTitle:NFS_ENHANCED ? @"Need for Speed Underground 2 HD - native ARM64"
-                                     : @"Need for Speed Underground 2 - native ARM64"];
-        [g_win setDelegate:del];
-
-        NfsuView *view = [[NfsuView alloc] initWithFrame:frame];
-        [view setWantsLayer:YES];
-        [g_win setContentView:view];
-        g_layer = (CAMetalLayer *)view.layer;
-        dlink_start(view);
-        /* StretchRect arka tampondan okuyabilsin diye gerekli. */
-        g_layer.framebufferOnly = NO;
-        /* NOVSYNC=1: vsync'i kapat.  Yalnizca OLCUM icin -- kapaliyken
-         * goruntu yirtilir, 1:1 sadakat bozulur. */
-#if !TARGET_OS_IPHONE
-        if (ENVC("NOVSYNC")) g_layer.displaySyncEnabled = NO;
-#endif
-
-        /* Yesil dugme tam ekrana gecsin.  Cizim yuzeyi oyunun istedigi
-         * boyutta kaliyor; en-boy oranini KORUYARAK buyutulsun, yoksa
-         * 5:4 goruntu genis ekranda yayiliyor. */
-        [g_win setCollectionBehavior:[g_win collectionBehavior] |
-                NSWindowCollectionBehaviorFullScreenPrimary];
-        g_layer.contentsGravity = kCAGravityResizeAspect;
-        g_win.backgroundColor = [NSColor blackColor];
-
-        /* Cizim yuzeyi ile pencereyi birebir eslestir (bkz. win_apply_size). */
-        win_apply_size(rw, rh);
-        [g_win center];
-        [g_win setAcceptsMouseMovedEvents:YES];
-        /* NOFOCUS=1: arka planda ac, kullanicinin calistigi uygulamadan
-         * odagi ALMA (otomatik test/olcum kosulari icin). */
-        if (ENVC("NOFOCUS") && ENVC("NOFOCUS")[0] != '0'){
-            /* NOFOCUS=2: pencere HIC gorunmesin (tam saydam, fareyi yutmaz).
-             * Pencere sunucusu acisindan ekranda kaldigi icin drawable akisi
-             * ve DUMPFRAME aynen calisir; =1'de pencere arkada ama gorunurdu. */
-            if (ENVC("NOFOCUS")[0] == '2'){ [g_win setAlphaValue:0.0];
-                                            [g_win setIgnoresMouseEvents:YES];
-                                            [g_win setHasShadow:NO]; }
-            [g_win orderBack:nil];
-        }
-        else { [g_win makeKeyAndOrderFront:nil];
-               [NSApp activateIgnoringOtherApps:YES]; }
-        if (fs_pref_load()) [g_win toggleFullScreen:nil];
-
-        /* cizim kaynaklari metal_early_init() icinde kuruldu */
-#ifndef NFS_SURUM
-#define NFS_SURUM 0
-#endif
-        fprintf(stderr, "surum: v%d (%s)\n", NFS_SURUM, NFS_ENHANCED ? "HD" : "normal");
-        fprintf(stderr, "metal: pencere acildi (%s), cizim yolu %s\n",
-                [[g_dev name] UTF8String], g_pso ? "HAZIR" : "YOK");
-
-        /* QUITFRAMES=<n>: n kare sunulunca TEMIZ cik.  ALARM yolu
-         * sinyal isleyicisinden _exit ediyor; o yol atexit'i (ve PGO
-         * profil yazimini) atliyor. */
-        long quitat = 0;
-        { const char *e = ENVC("QUITFRAMES"); if (e && *e) quitat = atol(e); }
-
-        /* Cizim dongusu: 60 Hz'de kuyruktaki kareyi sun */
-        while (!atomic_load(&g_should_quit)){
-            if (quitat && atomic_load(&g_frames_drawn) >= quitat){
-                atomic_store(&g_should_quit, 1); break; }
-            rt_free_pending();
-            /* FSFAKE=<kare>[,...]: pencereye dokunmadan tam ekran gecisini
-             * OYUNUN gozunden taklit et (gorunum = ekran boyutu, cihaz kaybi);
-             * arka planda gercek tam ekran guvenilir degil (test). */
-            { static long ff[8]; static int fn = -1, fi = 0;
-              if (fn < 0){ fn = 0; const char *e = ENVC("FSFAKE");
-                  for (const char *p = e; p && *p && fn < 8; ){
-                      ff[fn++] = atol(p); while (*p && *p != ',') p++; if (*p) p++; } }
-              if (fi < fn && atomic_load(&g_frames_drawn) >= ff[fi]){
-                  fi++;
-                  int on = !atomic_load(&g_fs);
-                  if (on){ NSScreen *sc = [NSScreen mainScreen]; CGFloat k = [sc backingScaleFactor];
-                           NSRect fr = [sc frame]; CGFloat top = 0;
-                           if (@available(macOS 12.0, *)) top = [sc safeAreaInsets].top;
-                           atomic_store(&g_fs_pw, (int)lround(fr.size.width * k));
-                           atomic_store(&g_fs_ph, (int)lround((fr.size.height - top) * k)); }
-                  atomic_store(&g_fs, on);
-                  fprintf(stderr, "app: FSFAKE kare %ld -> %s (%dx%d)\n", atomic_load(&g_frames_drawn),
-                          on ? "tam ekran" : "pencere", atomic_load(&g_fs_pw), atomic_load(&g_fs_ph));
-                  com_request_reset(); } }
-            /* FSSIM=<kare>:<k|m|c>[,...]: o karede SENTETIK girdi kuyruga
-             * koy (test): k = fn+F, m = Ctrl+Cmd+F, c = yesil dugmeye tik.
-             * Olaylar gercek girdi gibi asagidaki olay dongusunden gecer. */
-            { static long sf[8]; static char sm[8]; static int sn = -1, si = 0;
-              if (sn < 0){ sn = 0; const char *e = ENVC("FSSIM");
-                  for (const char *p = e; p && *p && sn < 8; ){
-                      sf[sn] = atol(p); while (*p && *p != ':' && *p != ',') p++;
-                      sm[sn] = (*p == ':') ? p[1] : 'k'; sn++;
-                      while (*p && *p != ',') p++; if (*p) p++; } }
-              if (si < sn && atomic_load(&g_frames_drawn) >= sf[si]){
-                  char md = sm[si++]; NSInteger wn = [g_win windowNumber];
-                  fprintf(stderr, "app: FSSIM kare %ld kip %c\n", atomic_load(&g_frames_drawn), md);
-                  if (md == 'k' || md == 'm'){
-                      NSEventModifierFlags fl = md == 'k' ? NSEventModifierFlagFunction
-                          : (NSEventModifierFlagControl | NSEventModifierFlagCommand);
-                      for (int ud = 0; ud < 2; ud++){
-                          NSEvent *ke = [NSEvent keyEventWithType:ud ? NSEventTypeKeyUp : NSEventTypeKeyDown
-                              location:NSZeroPoint modifierFlags:fl timestamp:0 windowNumber:wn
-                              context:nil characters:@"f" charactersIgnoringModifiers:@"f"
-                              isARepeat:NO keyCode:0x03];
-                          [NSApp postEvent:ke atStart:NO]; }
-                  } else {
-                      NSButton *zb = [g_win standardWindowButton:NSWindowZoomButton];
-                      NSPoint cp = zb ? [zb convertPoint:NSMakePoint(NSMidX([zb bounds]), NSMidY([zb bounds])) toView:nil]
-                                      : NSZeroPoint;
-                      for (int ud = 0; ud < 2; ud++){
-                          NSEvent *me = [NSEvent mouseEventWithType:ud ? NSEventTypeLeftMouseUp : NSEventTypeLeftMouseDown
-                              location:cp modifierFlags:0 timestamp:0 windowNumber:wn context:nil
-                              eventNumber:0 clickCount:1 pressure:ud ? 0.f : 1.f];
-                          [NSApp postEvent:me atStart:NO]; }
-                  } } }
-            /* FSTOGGLE=<kare>[,<kare>...]: o karelerde tam ekran gecisi (test) */
-            { static long tg[8]; static int tn = -1, ti = 0;
-              if (tn < 0){ tn = 0; const char *e = ENVC("FSTOGGLE");
-                  for (const char *p = e; p && *p && tn < 8; ){
-                      tg[tn++] = atol(p); while (*p && *p != ',') p++; if (*p) p++; } }
-              if (ti < tn && atomic_load(&g_frames_drawn) >= tg[ti]){
-                  ti++; fprintf(stderr, "app: FSTOGGLE kare %ld\n", atomic_load(&g_frames_drawn));
-                  [g_win toggleFullScreen:nil]; } }
-            @autoreleasepool {
-                NSEvent *ev;
-                while ((ev = [NSApp nextEventMatchingMask:NSEventMaskAny
-                                                untilDate:nil
-                                                   inMode:NSDefaultRunLoopMode
-                                                  dequeue:YES])){
-                    NSEventType et = [ev type];
-                    if (et == NSEventTypeKeyDown || et == NSEventTypeKeyUp){
-                        /* Cmd'li kisayollar OYUNA DEGIL menuye gitmeli:
-                         * aksi halde Cmd-Q calismaz.  Oyunun kendisi Cmd
-                         * kullanmiyor, catisma yok. */
-                        /* macOS'un tam ekran kisayolu fn/Globe+F: Command
-                         * tasimadigi icin oyuna "F" olarak gidiyordu. */
-                        if ([ev keyCode] == 0x03 &&
-                            ([ev modifierFlags] & NSEventModifierFlagFunction)){
-                            if (et == NSEventTypeKeyDown && ![ev isARepeat])
-                                [g_win toggleFullScreen:nil];
-                            continue; }
-                        if ([ev modifierFlags] & NSEventModifierFlagCommand){
-                            [NSApp sendEvent:ev]; continue; }
-                        unsigned char dik = mac_to_dik([ev keyCode]);
-                        if (dik) atomic_store(&g_keys[dik], et == NSEventTypeKeyDown ? 1 : 0);
-                        continue;                    /* oyuna gitsin, sisteme degil */
-                    }
-                    /* Fare olayi oyun alaninin DISINDAysa (baslik cubugu:
-                     * kapat/kucult/tam ekran dugmeleri, pencereyi surukleme,
-                     * kenardan boyutlandirma) AppKit'e gitmeli.  Eskiden
-                     * tum tiklar oyuna yutuluyordu; yesil dugme calismiyordu. */
-                    int m_ev = (et == NSEventTypeMouseMoved || et == NSEventTypeLeftMouseDragged ||
-                                et == NSEventTypeRightMouseDragged || et == NSEventTypeLeftMouseDown ||
-                                et == NSEventTypeLeftMouseUp || et == NSEventTypeRightMouseDown ||
-                                et == NSEventTypeRightMouseUp);
-                    if (m_ev){
-                        int inside = [ev window] == g_win &&
-                            NSPointInRect([ev locationInWindow], [[g_win contentView] frame]);
-                        if (et == NSEventTypeLeftMouseUp)  atomic_fetch_and(&g_mouse_btn, ~1u);
-                        if (et == NSEventTypeRightMouseUp) atomic_fetch_and(&g_mouse_btn, ~2u);
-                        if (!inside){
-                            if (et == NSEventTypeMouseMoved) cursor_hide_update(0);
-                            [NSApp sendEvent:ev]; continue; }
-                    }
-                    if (et == NSEventTypeMouseMoved || et == NSEventTypeLeftMouseDragged ||
-                        et == NSEventTypeRightMouseDragged){
-                        NSPoint pt = [ev locationInWindow];
-                        cursor_hide_update([ev window] == g_win &&
-                            NSPointInRect(pt, [[g_win contentView] frame]) && [g_win isKeyWindow]);
-                        int nx, ny; mouse_from_point(pt.x, pt.y, &nx, &ny);
-                        double msx, msy; mouse_delta_scale(&msx, &msy);
-                        atomic_fetch_add(&g_mouse_dx, (int)([ev deltaX] * msx));
-                        atomic_fetch_add(&g_mouse_dy, (int)([ev deltaY] * msy));
-                        atomic_store(&g_mouse_x, nx);
-                        atomic_store(&g_mouse_y, ny);
-                        continue;
-                    }
-                    if (et == NSEventTypeLeftMouseDown)  { atomic_fetch_or(&g_mouse_btn, 1u); continue; }
-                    if (et == NSEventTypeLeftMouseUp)    { atomic_fetch_and(&g_mouse_btn, ~1u); continue; }
-                    if (et == NSEventTypeRightMouseDown) { atomic_fetch_or(&g_mouse_btn, 2u); continue; }
-                    if (et == NSEventTypeRightMouseUp)   { atomic_fetch_and(&g_mouse_btn, ~2u); continue; }
-                    if (et == NSEventTypeScrollWheel){
-                        atomic_fetch_add(&g_mouse_dz, (int)([ev deltaY] * 120.0));
-                        continue;
-                    }
-                    if (et == NSEventTypeFlagsChanged){
-                        NSEventModifierFlags f = [ev modifierFlags];
-                        atomic_store(&g_keys[0x2A], (f & NSEventModifierFlagShift)   ? 1 : 0);
-                        atomic_store(&g_keys[0x1D], (f & NSEventModifierFlagControl) ? 1 : 0);
-                        atomic_store(&g_keys[0x38], (f & NSEventModifierFlagOption)  ? 1 : 0);
-                        continue;
-                    }
-                    [NSApp sendEvent:ev];
-                }
-
-                /* Olay kuyrugu disindaki run-loop kaynaklarini da isle.
-                 * AppleEvent'ler (Dock > Cik, "quit" komutu, oturum
-                 * kapatma) buradan gelir; yalnizca nextEventMatching...
-                 * cagirilirsa uygulama Cik komutuna hic yanit vermiyor. */
-                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
-                                         beforeDate:[NSDate distantPast]];
-
-                /* AUTOKEY=<dik>[,<dik>...]: oyunun girise tepki verip
-                 * vermedigini olcmek icin donemsel sentetik tus basisi. */
-                /* AUTOCLICK=1: donemsel sentetik sol tik + kucuk fare hareketi.
-                 * Girisin oyuna ulasip ulasmadigini olcmek icin. */
-                if (ENVC("AUTOCLICK")){
-                    long f = atomic_load(&g_frames_drawn);
-                    long ph = f % 120;
-                    if (ph == 0){ atomic_fetch_add(&g_mouse_dx, 3);
-                                  atomic_fetch_add(&g_mouse_dy, 2); }
-                    if (ph == 60) atomic_fetch_or(&g_mouse_btn, 1u);
-                    if (ph == 70) atomic_fetch_and(&g_mouse_btn, ~1u);
-                }
-                /* AUTOSEQ="<kare>:<dik>,<kare>:<dik>,...": belirtilen karede
-                 * bir kez tus bas (10 kare boyunca).  AUTOKEY surekli
-                 * basiyor; menuleri gezip belirli bir sahneye ulasmak icin
-                 * betiklenebilir bir diziye ihtiyac vardi. */
-                /* AUTOSEQ="<kare>:<dik>[:<sure>],...": kareden itibaren
-                 * <sure> kare boyunca tusa bas (varsayilan 8).  Sure
-                 * gerekiyordu: arabayi surmeden farlarin yuzeye vurusunu
-                 * goremiyoruz. */
-                { enum { SQMAX = 64 };
-                  static int sqinit = 0; static long sqf[SQMAX], sqd[SQMAX];
-                  static unsigned char sqk[SQMAX]; static int sqn = 0;
-                  if (!sqinit){ sqinit = 1;
-                    const char *e = ENVC("AUTOSEQ");
-                    const char *q = e;
-                    for (; q && *q && sqn < SQMAX; ){
-                        while (*q==',' || *q==' ') q++;
-                        if (!*q) break;
-                        sqf[sqn] = strtol(q, 0, 0);
-                        const char *c2 = strchr(q, ':');
-                        if (!c2) break;
-                        sqk[sqn] = (unsigned char)strtoul(c2+1, 0, 0);
-                        const char *c3 = strchr(c2+1, ':');
-                        const char *comma = strchr(q, ',');
-                        sqd[sqn] = (c3 && (!comma || c3 < comma)) ? strtol(c3+1, 0, 0) : 8;
-                        if (sqd[sqn] < 1) sqd[sqn] = 8;
-                        sqn++;
-                        while (*q && *q != ',') q++;
-                    }
-                    /* sinir asilirsa SESSIZCE kesilmesin (bir testte sondaki
-                     * Enter'lar kayboldu, oyun "takildi" sanildi) */
-                    while (q && (*q == ',' || *q == ' ')) q++;
-                    if (q && *q) fprintf(stderr, "app: UYARI AUTOSEQ %d girdide kesildi, kalanlar yok sayildi\n", SQMAX);
-                  }
-                  if (sqn){
-                    long f = atomic_load(&g_frames_drawn);
-                    for (int q = 0; q < sqn; q++){
-                        int on = (f >= sqf[q] && f < sqf[q] + sqd[q]);
-                        if (on || f == sqf[q] + sqd[q])
-                            atomic_store(&g_keys[sqk[q]], on ? 1 : 0);
-                    }
-                  }
-                }
-                { static int akinit = 0; static unsigned char akk[64]; static int akn = 0;
-                  if (!akinit){ akinit = 1;
-                    const char *e = ENVC("AUTOKEY");
-                    for (const char *q = e; q && *q && akn < 64; ){
-                        while (*q==',' || *q==' ') q++;
-                        if (!*q) break;
-                        akk[akn++] = (unsigned char)strtoul(q, 0, 0);
-                        while (*q && *q != ',') q++;
-                    }
-                  }
-                  /* AUTOKEYSTOP=<kare>: bu kareden sonra basmayi birak.
-                   * AUTOKEY surekli Enter'a bastigi icin yaris oncesi ARA
-                   * SAHNE atlaniyordu; onu gorebilmek icin gerekliydi. */
-                  { static long akstop = -2;
-                    if (akstop == -2){ const char *e = ENVC("AUTOKEYSTOP");
-                        akstop = (e && *e) ? strtol(e, 0, 0) : -1; }
-                    if (akn){
-                      long f = atomic_load(&g_frames_drawn);
-                      if (akstop >= 0 && f > akstop){
-                          for (int q = 0; q < akn; q++) atomic_store(&g_keys[akk[q]], 0);
-                      } else {
-                          int slot = (int)((f / 30) % akn);
-                          int on = (f % 30) < 10;
-                          for (int q = 0; q < akn; q++)
-                              atomic_store(&g_keys[akk[q]], (on && q == slot) ? 1 : 0);
-                      }
-                    } }
-                }
+/* Render a pending frame if available. Returns 1 if drawn, 0 otherwise. */
+int metal_render_frame(void){
+    if (!g_layer || !g_dev) return 0;
                 int have_new;
                 pthread_mutex_lock(&g_qlock); have_new = (g_ready >= 0);
                 pthread_mutex_unlock(&g_qlock);
@@ -6513,7 +6226,409 @@ void metal_run_main_loop(void){
                         }
                         (void)fno;
                     }
+                    return 1;
+    }
+    return 0;
+}
+
+/* iOS CAMetalLayer attachment and initialization */
+void metal_set_layer(void *layer){
+    if (!layer) return;
+    metal_early_init();
+    CAMetalLayer *metalLayer = (__bridge CAMetalLayer *)layer;
+    g_layer = metalLayer;
+    metalLayer.device = g_dev;
+    metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metalLayer.framebufferOnly = NO;
+    metalLayer.contentsGravity = kCAGravityResizeAspect;
+
+    CGSize size = metalLayer.bounds.size;
+    CGFloat scale = metalLayer.contentsScale;
+#if TARGET_OS_IPHONE
+    if (scale <= 0.0) scale = [UIScreen mainScreen].scale;
+#endif
+    if (scale < 1.0) scale = 1.0;
+    unsigned pw = (unsigned)lround(size.width * scale);
+    unsigned ph = (unsigned)lround(size.height * scale);
+    if (pw > 0 && ph > 0){
+        metalLayer.drawableSize = CGSizeMake((CGFloat)pw, (CGFloat)ph);
+        atomic_store(&g_draw_w, (int)pw);
+        atomic_store(&g_draw_h, (int)ph);
+        atomic_store(&g_cont_w, (int)size.width);
+        atomic_store(&g_cont_h, (int)size.height);
+        atomic_store(&g_game_w, (int)pw);
+        atomic_store(&g_game_h, (int)ph);
+    }
+    fprintf(stderr, "metal: iOS CAMetalLayer attached (bounds %.0fx%.0f, scale %.1f, drawable %ux%u)\n",
+            size.width, size.height, (double)scale, pw, ph);
+}
+
+void metal_init_ios(void *caMetalLayer){
+    metal_set_layer(caMetalLayer);
+}
+
+void metal_init(void){
+    metal_early_init();
+}
+
+void metal_frame_begin(void){
+    metal_begin_frame();
+}
+
+void metal_frame_end(void){
+    metal_present();
+}
+
+#if !TARGET_OS_IPHONE
+void metal_run_main_loop(void){
+    @autoreleasepool {
+        metal_early_init();
+        if (!g_dev) return;
+
+        [NSApplication sharedApplication];
+        /* NOFOCUS=1 (test kosulari): Dock simgesi yok, odak calmaz; pencere
+         * arkada acilir.  Kullanicinin klavyesi test penceresine gitmez. */
+        [NSApp setActivationPolicy:(ENVC("NOFOCUS") && ENVC("NOFOCUS")[0] != '0')
+                                   ? NSApplicationActivationPolicyAccessory
+                                   : NSApplicationActivationPolicyRegular];
+        NfsuDelegate *del = [NfsuDelegate new];
+        [NSApp setDelegate:del];
+        /* [NSApp run] cagirmiyoruz (olay dongusu asagida elle suruluyor).
+         * finishLaunching normalde run'in ilk isi: AppleEvent isleyicilerini
+         * kaydeder.  Onsuz uygulama "Cik" komutuna (Dock > Cik, oturum
+         * kapatma, osascript quit) hic yanit vermiyor -- surec asili kaliyor. */
+        [NSApp finishLaunching];
+
+        /* Menu cubugu.  Olay dongusu asagida elle surdugu icin AppKit
+         * bunu kendiliginden kurmuyor: menusuz bir uygulamada Cmd-Q,
+         * Cmd-H, Cmd-M calismaz ve pencere "takilmis" gibi gorunur. */
+        {   NSMenu *bar = [NSMenu new];
+            NSMenuItem *appItem = [NSMenuItem new];
+            [bar addItem:appItem];
+            NSMenu *appMenu = [NSMenu new];
+            [appMenu addItemWithTitle:@"NFSU2 Hakkinda"
+                               action:@selector(orderFrontStandardAboutPanel:)
+                        keyEquivalent:@""];
+            [appMenu addItem:[NSMenuItem separatorItem]];
+            [appMenu addItemWithTitle:@"Gizle" action:@selector(hide:) keyEquivalent:@"h"];
+            [appMenu addItemWithTitle:@"Kucult" action:@selector(performMiniaturize:)
+                        keyEquivalent:@"m"];
+            [appMenu addItemWithTitle:@"Tam Ekran"
+                               action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
+            /* macOS'un standart kisayolu Ctrl+Cmd+F (menu esi olmadan
+             * hicbir yere baglanmiyordu); menude gizli durur. */
+            { NSMenuItem *fs2 = [appMenu addItemWithTitle:@"Tam Ekran (Ctrl+Cmd+F)"
+                                   action:@selector(toggleFullScreen:) keyEquivalent:@"f"];
+              [fs2 setKeyEquivalentModifierMask:NSEventModifierFlagControl | NSEventModifierFlagCommand];
+              if (@available(macOS 13.0, *)){
+                  [fs2 setHidden:YES]; [fs2 setAllowsKeyEquivalentWhenHidden:YES]; } }
+            [appMenu addItem:[NSMenuItem separatorItem]];
+            [appMenu addItemWithTitle:@"NFSU2'den Cik" action:@selector(terminate:)
+                        keyEquivalent:@"q"];
+            [appItem setSubmenu:appMenu];
+            [NSApp setMainMenu:bar];
+        }
+
+        /* Pencere boyutu SABIT 1280x720 idi: oyun CreateDevice ile baska
+         * bir cozunurluk istese bile (kayit defterindeki g_RacingResolution)
+         * pencere degismiyordu.  Cihaz Metal'den ONCE yaratilabildigi icin
+         * istenen boyutu buradan okuyoruz. */
+        unsigned rw = g_want_w ? g_want_w : 1280u, rh = g_want_h ? g_want_h : 720u;
+        /* Oyun cihazini henuz yaratmadiysa yer tutucu da Retina olcekli
+         * olsun; yoksa pencere once yarim boyutta (640x360 nokta) acilip
+         * CreateDevice gelince buyuyor.  Oyunun kiplerinin neredeyse
+         * tamami 4:3 oldugu icin yer tutucu 1280x960 oraninda: en yaygin
+         * durumda pencere CreateDevice'ta hic ziplamiyor. */
+        if (!g_want_w){ const char *nv = ENVC("NFSNATIVE");
+            if (!(nv && nv[0] == '0')){ rw = 1280u; rh = 960u;
+                                         metal_native_size(1280u, 960u, &rw, &rh); } }
+        NSRect frame = NSMakeRect(0, 0, (CGFloat)rw, (CGFloat)rh);
+        g_win = [[NSWindow alloc] initWithContentRect:frame
+                    styleMask:NFSU_WIN_STYLE
+                      backing:NSBackingStoreBuffered defer:NO];
+        [g_win setTitle:NFS_ENHANCED ? @"Need for Speed Underground 2 HD - native ARM64"
+                                     : @"Need for Speed Underground 2 - native ARM64"];
+        [g_win setDelegate:del];
+
+        NfsuView *view = [[NfsuView alloc] initWithFrame:frame];
+        [view setWantsLayer:YES];
+        [g_win setContentView:view];
+        g_layer = (CAMetalLayer *)view.layer;
+        dlink_start(view);
+        /* StretchRect arka tampondan okuyabilsin diye gerekli. */
+        g_layer.framebufferOnly = NO;
+        /* NOVSYNC=1: vsync'i kapat.  Yalnizca OLCUM icin -- kapaliyken
+         * goruntu yirtilir, 1:1 sadakat bozulur. */
+#if !TARGET_OS_IPHONE
+        if (ENVC("NOVSYNC")) g_layer.displaySyncEnabled = NO;
+#endif
+
+        /* Yesil dugme tam ekrana gecsin.  Cizim yuzeyi oyunun istedigi
+         * boyutta kaliyor; en-boy oranini KORUYARAK buyutulsun, yoksa
+         * 5:4 goruntu genis ekranda yayiliyor. */
+        [g_win setCollectionBehavior:[g_win collectionBehavior] |
+                NSWindowCollectionBehaviorFullScreenPrimary];
+        g_layer.contentsGravity = kCAGravityResizeAspect;
+        g_win.backgroundColor = [NSColor blackColor];
+
+        /* Cizim yuzeyi ile pencereyi birebir eslestir (bkz. win_apply_size). */
+        win_apply_size(rw, rh);
+        [g_win center];
+        [g_win setAcceptsMouseMovedEvents:YES];
+        /* NOFOCUS=1: arka planda ac, kullanicinin calistigi uygulamadan
+         * odagi ALMA (otomatik test/olcum kosulari icin). */
+        if (ENVC("NOFOCUS") && ENVC("NOFOCUS")[0] != '0'){
+            /* NOFOCUS=2: pencere HIC gorunmesin (tam saydam, fareyi yutmaz).
+             * Pencere sunucusu acisindan ekranda kaldigi icin drawable akisi
+             * ve DUMPFRAME aynen calisir; =1'de pencere arkada ama gorunurdu. */
+            if (ENVC("NOFOCUS")[0] == '2'){ [g_win setAlphaValue:0.0];
+                                            [g_win setIgnoresMouseEvents:YES];
+                                            [g_win setHasShadow:NO]; }
+            [g_win orderBack:nil];
+        }
+        else { [g_win makeKeyAndOrderFront:nil];
+               [NSApp activateIgnoringOtherApps:YES]; }
+        if (fs_pref_load()) [g_win toggleFullScreen:nil];
+
+        /* cizim kaynaklari metal_early_init() icinde kuruldu */
+#ifndef NFS_SURUM
+#define NFS_SURUM 0
+#endif
+        fprintf(stderr, "surum: v%d (%s)\n", NFS_SURUM, NFS_ENHANCED ? "HD" : "normal");
+        fprintf(stderr, "metal: pencere acildi (%s), cizim yolu %s\n",
+                [[g_dev name] UTF8String], g_pso ? "HAZIR" : "YOK");
+
+        /* QUITFRAMES=<n>: n kare sunulunca TEMIZ cik.  ALARM yolu
+         * sinyal isleyicisinden _exit ediyor; o yol atexit'i (ve PGO
+         * profil yazimini) atliyor. */
+        long quitat = 0;
+        { const char *e = ENVC("QUITFRAMES"); if (e && *e) quitat = atol(e); }
+
+        /* Cizim dongusu: 60 Hz'de kuyruktaki kareyi sun */
+        while (!atomic_load(&g_should_quit)){
+            if (quitat && atomic_load(&g_frames_drawn) >= quitat){
+                atomic_store(&g_should_quit, 1); break; }
+            rt_free_pending();
+            /* FSFAKE=<kare>[,...]: pencereye dokunmadan tam ekran gecisini
+             * OYUNUN gozunden taklit et (gorunum = ekran boyutu, cihaz kaybi);
+             * arka planda gercek tam ekran guvenilir degil (test). */
+            { static long ff[8]; static int fn = -1, fi = 0;
+              if (fn < 0){ fn = 0; const char *e = ENVC("FSFAKE");
+                  for (const char *p = e; p && *p && fn < 8; ){
+                      ff[fn++] = atol(p); while (*p && *p != ',') p++; if (*p) p++; } }
+              if (fi < fn && atomic_load(&g_frames_drawn) >= ff[fi]){
+                  fi++;
+                  int on = !atomic_load(&g_fs);
+                  if (on){ NSScreen *sc = [NSScreen mainScreen]; CGFloat k = [sc backingScaleFactor];
+                           NSRect fr = [sc frame]; CGFloat top = 0;
+                           if (@available(macOS 12.0, *)) top = [sc safeAreaInsets].top;
+                           atomic_store(&g_fs_pw, (int)lround(fr.size.width * k));
+                           atomic_store(&g_fs_ph, (int)lround((fr.size.height - top) * k)); }
+                  atomic_store(&g_fs, on);
+                  fprintf(stderr, "app: FSFAKE kare %ld -> %s (%dx%d)\n", atomic_load(&g_frames_drawn),
+                          on ? "tam ekran" : "pencere", atomic_load(&g_fs_pw), atomic_load(&g_fs_ph));
+                  com_request_reset(); } }
+            /* FSSIM=<kare>:<k|m|c>[,...]: o karede SENTETIK girdi kuyruga
+             * koy (test): k = fn+F, m = Ctrl+Cmd+F, c = yesil dugmeye tik.
+             * Olaylar gercek girdi gibi asagidaki olay dongusunden gecer. */
+            { static long sf[8]; static char sm[8]; static int sn = -1, si = 0;
+              if (sn < 0){ sn = 0; const char *e = ENVC("FSSIM");
+                  for (const char *p = e; p && *p && sn < 8; ){
+                      sf[sn] = atol(p); while (*p && *p != ':' && *p != ',') p++;
+                      sm[sn] = (*p == ':') ? p[1] : 'k'; sn++;
+                      while (*p && *p != ',') p++; if (*p) p++; } }
+              if (si < sn && atomic_load(&g_frames_drawn) >= sf[si]){
+                  char md = sm[si++]; NSInteger wn = [g_win windowNumber];
+                  fprintf(stderr, "app: FSSIM kare %ld kip %c\n", atomic_load(&g_frames_drawn), md);
+                  if (md == 'k' || md == 'm'){
+                      NSEventModifierFlags fl = md == 'k' ? NSEventModifierFlagFunction
+                          : (NSEventModifierFlagControl | NSEventModifierFlagCommand);
+                      for (int ud = 0; ud < 2; ud++){
+                          NSEvent *ke = [NSEvent keyEventWithType:ud ? NSEventTypeKeyUp : NSEventTypeKeyDown
+                              location:NSZeroPoint modifierFlags:fl timestamp:0 windowNumber:wn
+                              context:nil characters:@"f" charactersIgnoringModifiers:@"f"
+                              isARepeat:NO keyCode:0x03];
+                          [NSApp postEvent:ke atStart:NO]; }
+                  } else {
+                      NSButton *zb = [g_win standardWindowButton:NSWindowZoomButton];
+                      NSPoint cp = zb ? [zb convertPoint:NSMakePoint(NSMidX([zb bounds]), NSMidY([zb bounds])) toView:nil]
+                                      : NSZeroPoint;
+                      for (int ud = 0; ud < 2; ud++){
+                          NSEvent *me = [NSEvent mouseEventWithType:ud ? NSEventTypeLeftMouseUp : NSEventTypeLeftMouseDown
+                              location:cp modifierFlags:0 timestamp:0 windowNumber:wn context:nil
+                              eventNumber:0 clickCount:1 pressure:ud ? 0.f : 1.f];
+                          [NSApp postEvent:me atStart:NO]; }
+                  } } }
+            /* FSTOGGLE=<kare>[,<kare>...]: o karelerde tam ekran gecisi (test) */
+            { static long tg[8]; static int tn = -1, ti = 0;
+              if (tn < 0){ tn = 0; const char *e = ENVC("FSTOGGLE");
+                  for (const char *p = e; p && *p && tn < 8; ){
+                      tg[tn++] = atol(p); while (*p && *p != ',') p++; if (*p) p++; } }
+              if (ti < tn && atomic_load(&g_frames_drawn) >= tg[ti]){
+                  ti++; fprintf(stderr, "app: FSTOGGLE kare %ld\n", atomic_load(&g_frames_drawn));
+                  [g_win toggleFullScreen:nil]; } }
+            @autoreleasepool {
+                NSEvent *ev;
+                while ((ev = [NSApp nextEventMatchingMask:NSEventMaskAny
+                                                untilDate:nil
+                                                   inMode:NSDefaultRunLoopMode
+                                                  dequeue:YES])){
+                    NSEventType et = [ev type];
+                    if (et == NSEventTypeKeyDown || et == NSEventTypeKeyUp){
+                        /* Cmd'li kisayollar OYUNA DEGIL menuye gitmeli:
+                         * aksi halde Cmd-Q calismaz.  Oyunun kendisi Cmd
+                         * kullanmiyor, catisma yok. */
+                        /* macOS'un tam ekran kisayolu fn/Globe+F: Command
+                         * tasimadigi icin oyuna "F" olarak gidiyordu. */
+                        if ([ev keyCode] == 0x03 &&
+                            ([ev modifierFlags] & NSEventModifierFlagFunction)){
+                            if (et == NSEventTypeKeyDown && ![ev isARepeat])
+                                [g_win toggleFullScreen:nil];
+                            continue; }
+                        if ([ev modifierFlags] & NSEventModifierFlagCommand){
+                            [NSApp sendEvent:ev]; continue; }
+                        unsigned char dik = mac_to_dik([ev keyCode]);
+                        if (dik) atomic_store(&g_keys[dik], et == NSEventTypeKeyDown ? 1 : 0);
+                        continue;                    /* oyuna gitsin, sisteme degil */
+                    }
+                    /* Fare olayi oyun alaninin DISINDAysa (baslik cubugu:
+                     * kapat/kucult/tam ekran dugmeleri, pencereyi surukleme,
+                     * kenardan boyutlandirma) AppKit'e gitmeli.  Eskiden
+                     * tum tiklar oyuna yutuluyordu; yesil dugme calismiyordu. */
+                    int m_ev = (et == NSEventTypeMouseMoved || et == NSEventTypeLeftMouseDragged ||
+                                et == NSEventTypeRightMouseDragged || et == NSEventTypeLeftMouseDown ||
+                                et == NSEventTypeLeftMouseUp || et == NSEventTypeRightMouseDown ||
+                                et == NSEventTypeRightMouseUp);
+                    if (m_ev){
+                        int inside = [ev window] == g_win &&
+                            NSPointInRect([ev locationInWindow], [[g_win contentView] frame]);
+                        if (et == NSEventTypeLeftMouseUp)  atomic_fetch_and(&g_mouse_btn, ~1u);
+                        if (et == NSEventTypeRightMouseUp) atomic_fetch_and(&g_mouse_btn, ~2u);
+                        if (!inside){
+                            if (et == NSEventTypeMouseMoved) cursor_hide_update(0);
+                            [NSApp sendEvent:ev]; continue; }
+                    }
+                    if (et == NSEventTypeMouseMoved || et == NSEventTypeLeftMouseDragged ||
+                        et == NSEventTypeRightMouseDragged){
+                        NSPoint pt = [ev locationInWindow];
+                        cursor_hide_update([ev window] == g_win &&
+                            NSPointInRect(pt, [[g_win contentView] frame]) && [g_win isKeyWindow]);
+                        int nx, ny; mouse_from_point(pt.x, pt.y, &nx, &ny);
+                        double msx, msy; mouse_delta_scale(&msx, &msy);
+                        atomic_fetch_add(&g_mouse_dx, (int)([ev deltaX] * msx));
+                        atomic_fetch_add(&g_mouse_dy, (int)([ev deltaY] * msy));
+                        atomic_store(&g_mouse_x, nx);
+                        atomic_store(&g_mouse_y, ny);
+                        continue;
+                    }
+                    if (et == NSEventTypeLeftMouseDown)  { atomic_fetch_or(&g_mouse_btn, 1u); continue; }
+                    if (et == NSEventTypeLeftMouseUp)    { atomic_fetch_and(&g_mouse_btn, ~1u); continue; }
+                    if (et == NSEventTypeRightMouseDown) { atomic_fetch_or(&g_mouse_btn, 2u); continue; }
+                    if (et == NSEventTypeRightMouseUp)   { atomic_fetch_and(&g_mouse_btn, ~2u); continue; }
+                    if (et == NSEventTypeScrollWheel){
+                        atomic_fetch_add(&g_mouse_dz, (int)([ev deltaY] * 120.0));
+                        continue;
+                    }
+                    if (et == NSEventTypeFlagsChanged){
+                        NSEventModifierFlags f = [ev modifierFlags];
+                        atomic_store(&g_keys[0x2A], (f & NSEventModifierFlagShift)   ? 1 : 0);
+                        atomic_store(&g_keys[0x1D], (f & NSEventModifierFlagControl) ? 1 : 0);
+                        atomic_store(&g_keys[0x38], (f & NSEventModifierFlagOption)  ? 1 : 0);
+                        continue;
+                    }
+                    [NSApp sendEvent:ev];
                 }
+
+                /* Olay kuyrugu disindaki run-loop kaynaklarini da isle.
+                 * AppleEvent'ler (Dock > Cik, "quit" komutu, oturum
+                 * kapatma) buradan gelir; yalnizca nextEventMatching...
+                 * cagirilirsa uygulama Cik komutuna hic yanit vermiyor. */
+                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                         beforeDate:[NSDate distantPast]];
+
+                /* AUTOKEY=<dik>[,<dik>...]: oyunun girise tepki verip
+                 * vermedigini olcmek icin donemsel sentetik tus basisi. */
+                /* AUTOCLICK=1: donemsel sentetik sol tik + kucuk fare hareketi.
+                 * Girisin oyuna ulasip ulasmadigini olcmek icin. */
+                if (ENVC("AUTOCLICK")){
+                    long f = atomic_load(&g_frames_drawn);
+                    long ph = f % 120;
+                    if (ph == 0){ atomic_fetch_add(&g_mouse_dx, 3);
+                                  atomic_fetch_add(&g_mouse_dy, 2); }
+                    if (ph == 60) atomic_fetch_or(&g_mouse_btn, 1u);
+                    if (ph == 70) atomic_fetch_and(&g_mouse_btn, ~1u);
+                }
+                /* AUTOSEQ="<kare>:<dik>,<kare>:<dik>,...": belirtilen karede
+                 * bir kez tus bas (10 kare boyunca).  AUTOKEY surekli
+                 * basiyor; menuleri gezip belirli bir sahneye ulasmak icin
+                 * betiklenebilir bir diziye ihtiyac vardi. */
+                /* AUTOSEQ="<kare>:<dik>[:<sure>],...": kareden itibaren
+                 * <sure> kare boyunca tusa bas (varsayilan 8).  Sure
+                 * gerekiyordu: arabayi surmeden farlarin yuzeye vurusunu
+                 * goremiyoruz. */
+                { enum { SQMAX = 64 };
+                  static int sqinit = 0; static long sqf[SQMAX], sqd[SQMAX];
+                  static unsigned char sqk[SQMAX]; static int sqn = 0;
+                  if (!sqinit){ sqinit = 1;
+                    const char *e = ENVC("AUTOSEQ");
+                    const char *q = e;
+                    for (; q && *q && sqn < SQMAX; ){
+                        while (*q==',' || *q==' ') q++;
+                        if (!*q) break;
+                        sqf[sqn] = strtol(q, 0, 0);
+                        const char *c2 = strchr(q, ':');
+                        if (!c2) break;
+                        sqk[sqn] = (unsigned char)strtoul(c2+1, 0, 0);
+                        const char *c3 = strchr(c2+1, ':');
+                        const char *comma = strchr(q, ',');
+                        sqd[sqn] = (c3 && (!comma || c3 < comma)) ? strtol(c3+1, 0, 0) : 8;
+                        if (sqd[sqn] < 1) sqd[sqn] = 8;
+                        sqn++;
+                        while (*q && *q != ',') q++;
+                    }
+                    /* sinir asilirsa SESSIZCE kesilmesin (bir testte sondaki
+                     * Enter'lar kayboldu, oyun "takildi" sanildi) */
+                    while (q && (*q == ',' || *q == ' ')) q++;
+                    if (q && *q) fprintf(stderr, "app: UYARI AUTOSEQ %d girdide kesildi, kalanlar yok sayildi\n", SQMAX);
+                  }
+                  if (sqn){
+                    long f = atomic_load(&g_frames_drawn);
+                    for (int q = 0; q < sqn; q++){
+                        int on = (f >= sqf[q] && f < sqf[q] + sqd[q]);
+                        if (on || f == sqf[q] + sqd[q])
+                            atomic_store(&g_keys[sqk[q]], on ? 1 : 0);
+                    }
+                  }
+                }
+                { static int akinit = 0; static unsigned char akk[64]; static int akn = 0;
+                  if (!akinit){ akinit = 1;
+                    const char *e = ENVC("AUTOKEY");
+                    for (const char *q = e; q && *q && akn < 64; ){
+                        while (*q==',' || *q==' ') q++;
+                        if (!*q) break;
+                        akk[akn++] = (unsigned char)strtoul(q, 0, 0);
+                        while (*q && *q != ',') q++;
+                    }
+                  }
+                  /* AUTOKEYSTOP=<kare>: bu kareden sonra basmayi birak.
+                   * AUTOKEY surekli Enter'a bastigi icin yaris oncesi ARA
+                   * SAHNE atlaniyordu; onu gorebilmek icin gerekliydi. */
+                  { static long akstop = -2;
+                    if (akstop == -2){ const char *e = ENVC("AUTOKEYSTOP");
+                        akstop = (e && *e) ? strtol(e, 0, 0) : -1; }
+                    if (akn){
+                      long f = atomic_load(&g_frames_drawn);
+                      if (akstop >= 0 && f > akstop){
+                          for (int q = 0; q < akn; q++) atomic_store(&g_keys[akk[q]], 0);
+                      } else {
+                          int slot = (int)((f / 30) % akn);
+                          int on = (f % 30) < 10;
+                          for (int q = 0; q < akn; q++)
+                              atomic_store(&g_keys[akk[q]], (on && q == slot) ? 1 : 0);
+                      }
+                    } }
+                }
+                metal_render_frame();
                 /* Kare hazir olana kadar UYU (yoklama degil).  4 ms'lik
                  * ust sinir yalnizca NSEvent kuyrugunu bosaltmak icin:
                  * kare gelince cond_signal aninda uyandiriyor. */
@@ -6555,6 +6670,11 @@ void metal_run_main_loop(void){
                 atomic_load(&g_frames_drawn));
     }
 }
+#else
+void metal_run_main_loop(void){
+    /* On iOS, the main runloop is driven by UIKit / SwiftUI. */
+}
+#endif
 
 /* Kare butcesi raporu: GPU mesgul suresi, CPU kodlama suresi, gecis/cizim
  * sayisi.  "Neye donanim harciyoruz" sorusu ancak bu ucu birlikte gorulunce
