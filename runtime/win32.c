@@ -596,6 +596,10 @@ int win32_call(CPU *c, uint32_t idx){
     else if (fileio_call(c, n, &r)) { /* dosya G/C */ }
     else if (win32_ext_call(c, n, &r)) { /* 2. tur katman */ }
     else { handled = 0; g_win32_unimpl++; stat_[idx].unimpl++;
+#if defined(NFS_FULL_RUNTIME) && NFS_FULL_RUNTIME
+           if (stat_[idx].unimpl == 1)
+               fprintf(stderr, "[compat unsupported import] %s!%s -> 0; legacy fallback, fidelity unverified\n", e->dll, n);
+#endif
            if (unimpl_first==0xffffffffu){ unimpl_first=idx; unimpl_name=n; } }
 
     if (g_bt_on && (!strcmp(n,"GetModuleFileNameA")||!strcmp(n,"ExitProcess")||!strcmp(n,"RaiseException")))

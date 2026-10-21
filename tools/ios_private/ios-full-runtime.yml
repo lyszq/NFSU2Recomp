@@ -122,14 +122,17 @@ jobs:
           MAP="$RUNNER_TEMP/FullDerivedData/Build/Intermediates.noindex/NFSU2iOS.build/Release-iphoneos/NFSU2iOS.build/NFSU2iOS-LinkMap-normal-arm64.txt"
           cp "$MAP" "$RUNNER_TEMP/full-runtime-link-map.txt"
           xcrun nm -m "$APP/NFSU2iOS" > "$RUNNER_TEMP/full-runtime-nm.txt"
+          # Preserve the linked app for independent private inspection even if
+          # a verification gate fails. It is renamed only after all link checks.
+          mkdir -p "$RUNNER_TEMP/full-ipa/Payload"
+          ditto "$APP" "$RUNNER_TEMP/full-ipa/Payload/NFSU2iOS.app"
+          (cd "$RUNNER_TEMP/full-ipa" && zip -qry "$RUNNER_TEMP/UNVERIFIED-NFSU2iOS-full-runtime-unsigned.ipa" Payload)
           "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/verify_full_link.py \
             --map "$MAP" --nm "$RUNNER_TEMP/full-runtime-nm.txt" --binary "$APP/NFSU2iOS" \
             --manifest gen/all/ios-full-manifest.json --source "$SOURCE_SHA" \
             --out "$RUNNER_TEMP/full-runtime-verification.json"
           cp gen/all/ios-full-manifest.json "$RUNNER_TEMP/full-runtime-provenance.json"
-          mkdir -p "$RUNNER_TEMP/full-ipa/Payload"
-          ditto "$APP" "$RUNNER_TEMP/full-ipa/Payload/NFSU2iOS.app"
-          (cd "$RUNNER_TEMP/full-ipa" && zip -qry "$RUNNER_TEMP/NFSU2iOS-full-runtime-unsigned.ipa" Payload)
+          mv "$RUNNER_TEMP/UNVERIFIED-NFSU2iOS-full-runtime-unsigned.ipa" "$RUNNER_TEMP/NFSU2iOS-full-runtime-unsigned.ipa"
           shasum -a 256 "$RUNNER_TEMP/NFSU2iOS-full-runtime-unsigned.ipa" > "$RUNNER_TEMP/full-ipa-sha256.txt"
       - name: Upload private compile diagnostics even on failure
         if: always()
@@ -144,6 +147,7 @@ jobs:
             ${{ runner.temp }}/full-runtime-verification.json
             ${{ runner.temp }}/full-runtime-provenance.json
             ${{ runner.temp }}/full-ipa-sha256.txt
+            ${{ runner.temp }}/UNVERIFIED-NFSU2iOS-full-runtime-unsigned.ipa
           if-no-files-found: warn
           retention-days: 7
       - name: Upload unsigned full runtime IPA privately

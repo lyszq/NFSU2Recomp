@@ -995,7 +995,17 @@ public final class NFSU2MetalRenderUIView: UIView {
         addGestureRecognizer(hover)
     }
 
+    private func refreshInputViewport() {
+#if NFS_FULL_RUNTIME
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        var gameWidth: UInt32 = 0, gameHeight: UInt32 = 0
+        metal_game_size(&gameWidth, &gameHeight)
+        nfsu2_input_set_viewport(UInt32(bounds.width), UInt32(bounds.height), gameWidth, gameHeight)
+#endif
+    }
+
     @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+        refreshInputViewport()
         let loc = recognizer.location(in: self)
         switch recognizer.state {
         case .began, .changed:
@@ -1010,6 +1020,7 @@ public final class NFSU2MetalRenderUIView: UIView {
 
     public override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
+        refreshInputViewport()
         guard let touch = touches.first else { return }
         let loc = touch.location(in: self)
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), true)
@@ -1018,6 +1029,7 @@ public final class NFSU2MetalRenderUIView: UIView {
 
     public override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesMoved(touches, with: event)
+        refreshInputViewport()
         guard let touch = touches.first else { return }
         let loc = touch.location(in: self)
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), true)
@@ -1025,6 +1037,7 @@ public final class NFSU2MetalRenderUIView: UIView {
 
     public override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesEnded(touches, with: event)
+        refreshInputViewport()
         guard let touch = touches.first else { return }
         let loc = touch.location(in: self)
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), false)
@@ -1032,6 +1045,7 @@ public final class NFSU2MetalRenderUIView: UIView {
 
     public override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesCancelled(touches, with: event)
+        refreshInputViewport()
         guard let touch = touches.first else { return }
         let loc = touch.location(in: self)
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), false)

@@ -11,7 +11,7 @@ REQUIRED = {
     "dispatch_init": "dispatch.o", "dispatch_indirect": "dispatch.o",
     "win32_init": "win32.o", "win32_call": "win32.o", "com_call": "com.o",
     "run_generated": "genexec.o", "overrides_install": "overrides.o",
-    "metal_early_init": "metal.o", "metal_set_layer": "metal.o",
+    "metal_early_init": "metal.o", "metal_init_ios": "metal.o",
     "metal_render_frame": "metal.o", "metal_available": "metal.o",
     "metal_present": "metal.o", "nfs_game_session_start": "NFSU2GameSession.o",
     "audio_init": "audio.o", "audio_play": "audio.o",

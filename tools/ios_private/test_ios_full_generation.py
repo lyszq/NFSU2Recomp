@@ -228,6 +228,7 @@ class ConfigureProjectTests(unittest.TestCase):
             self.assertNotIn("../runtime/guest_windows.c", paths)
             self.assertNotIn("../runtime/bundle.m", paths)
             self.assertNotIn("tests/boot.c", paths)
+            self.assertNotIn({"sdk": "AudioUnit.framework"}, target["dependencies"])
             self.assertEqual(len([p for p in paths if re_fullmatch_shard(p)]), 128)
 
             app_group = next(source for source in sources if source.get("path") == "NFSU2iOS")

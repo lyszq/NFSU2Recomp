@@ -42,3 +42,14 @@ UIKit main queue for layer resize. This run did not reach linking or produce
 an IPA. Source 985263b public CI run 39661055407 passed Linux/macOS, including
 the checked PE adapter malformed/BSS/resource/EBUSY tests on native Darwin.
 The actual private EXE adapter test belongs to the next full CI run.
+
+Second private run39663168580 (ab6f742) compiled C/Objective-C/Swift and reached
+linking. Its only linker error was `framework AudioUnit not found`. The iOS
+framework dependency is removed; AudioToolbox remains in the base app project.
+The actual authenticated EXE passed the shared checked PE adapter on Darwin in
+this run (no guest execution). New input ingress refreshes viewport mapping
+from the current D3D game size. Unknown import first-occurrence and the first
+eight unsupported-instruction sites now log the existing legacy continuation
+policy explicitly; diagnostic strict contracts/oracle remain unchanged.
+The link verifier requires the strong `metal_init_ios` entry actually called by
+Swift, rather than relying on retention of an internal helper after optimization.

@@ -140,6 +140,11 @@ void dispatch_indirect(CPU *c, uint32_t addr){
 void unsupported_insn(CPU *c, uint32_t addr, const char *mn){
     (void)c; (void)mn;
     g_stat_unsupported++;
+#if defined(NFS_FULL_RUNTIME) && NFS_FULL_RUNTIME
+    if (g_stat_unsupported <= 8)
+        fprintf(stderr, "[compat unsupported instruction] %08x %s; legacy continuation policy, fidelity unverified\n",
+                addr, mn ? mn : "(unknown)");
+#endif
     if (g_unsup_n < MISS_MAX) g_unsup[g_unsup_n++] = addr;
 }
 

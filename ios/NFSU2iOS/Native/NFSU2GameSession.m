@@ -399,6 +399,7 @@ int nfs_game_session_start(const char *executable_path,
     fileio_set_root(executable_path);
     fileio_set_write_root(save_root);
     dispatch_init();
+    fprintf(stderr, "runtime policy: one legacy Win32/COM process; unknown imports return zero and unsupported instructions may continue. Compatibility fallbacks are logged; full Windows fidelity is unverified.\n");
     win32_init();
     overrides_install();
 

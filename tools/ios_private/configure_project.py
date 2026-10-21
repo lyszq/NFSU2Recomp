@@ -51,7 +51,6 @@ FULL_RUNTIME_EXCLUDED_APP_SOURCES = (
 FULL_RUNTIME_FRAMEWORKS = (
     "CoreGraphics.framework",
     "ImageIO.framework",
-    "AudioUnit.framework",
 )
 
 
