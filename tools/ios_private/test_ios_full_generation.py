@@ -247,8 +247,8 @@ class ConfigureProjectTests(unittest.TestCase):
             self.assertEqual(base["CLANG_ENABLE_OBJC_ARC"], "YES")
             self.assertIn("NFS_FULL_RUNTIME", base["SWIFT_ACTIVE_COMPILATION_CONDITIONS"])
             self.assertEqual(base["PRODUCT_BUNDLE_IDENTIFIER"], "dev.lyszq.nfsu2ios")
-            self.assertEqual(target["info"]["properties"]["CFBundleShortVersionString"], "0.20.0")
-            self.assertEqual(target["info"]["properties"]["CFBundleVersion"], "27")
+            self.assertEqual(target["info"]["properties"]["CFBundleShortVersionString"], "0.21.0")
+            self.assertEqual(target["info"]["properties"]["CFBundleVersion"], "28")
             self.assertEqual(original["targets"]["NFSU2iOS"]["sources"][1]["path"], "../runtime/guest_execution.c")
 
     def test_all_mode_rejects_tampered_shard(self):

@@ -8,6 +8,8 @@ FLAGS=(-O2 -std=gnu11 -Wall -Wextra -Werror -Iruntime -fno-strict-aliasing -pthr
 LIBS=(-lm)
 "$CC" "${FLAGS[@]}" tests/win32_exit_scope_test.c -o "$DEST/win32-exit-scope-test"
 "$DEST/win32-exit-scope-test"
+"$CC" "${FLAGS[@]}" tests/bc_decoder_test.c -o "$DEST/bc-decoder-test"
+"$DEST/bc-decoder-test"
 "$CC" "${FLAGS[@]}" runtime/guest_dispatch.c tests/guest_dispatch_test.c -o "$DEST/guest-dispatch-test"
 "$DEST/guest-dispatch-test"
 "$CC" "${FLAGS[@]}" runtime/guest_dispatch.c runtime/guest_execution.c runtime/guest_bootstrap.c   runtime/guest_memory.c tests/guest_execution_test.c -o "$DEST/guest-execution-test"

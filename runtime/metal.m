@@ -25,6 +25,7 @@
 #import <Metal/Metal.h>
 #include "enhance.h"
 #include "perflog.h"
+#include "bc_decoder.h"
 #ifndef NFS_FULL_RUNTIME
 #define NFS_FULL_RUNTIME 0
 #endif
@@ -104,6 +105,8 @@ static void dump_texture(id<MTLTexture> t, long frame){
 }
 static id<MTLDevice>    g_dev;
 static id<MTLCommandQueue> g_queue;
+static _Atomic int g_metal_core_ready = 0;
+static int g_supports_bc_textures;
 
 /* Guest thread'in yazdigi, ana thread'in okudugu kare durumu */
 static _Atomic float    g_clear_r = 0.f, g_clear_g = 0.f, g_clear_b = 0.f;
@@ -307,9 +310,9 @@ void metal_fill_keyboard(unsigned char *dst, unsigned n){
 }
 #endif
 
-/* Dokular pencere acilmadan ONCE yaratiliyor.  Bu yuzden "kullanilabilir"
- * olcutu cihazdir, katman degil; yoksa erken dokular sessizce kayboluyordu. */
-int  metal_available(void){ return g_dev != nil; }
+/* Device plus the command queue and base draw resources must exist before
+ * guest COM calls are routed into the renderer. The layer is checked apart. */
+int  metal_available(void){ return atomic_load_explicit(&g_metal_core_ready, memory_order_acquire); }
 int  metal_window_ready(void){ return g_layer != nil; }
 
 long metal_frames(void){ return atomic_load(&g_frames_drawn); }
@@ -1060,6 +1063,7 @@ static id<MTLSamplerState>        g_samp;
 static uint8_t g_tex_cube[MAXTEX];          /* 1 = MTLTextureTypeCube */
 static unsigned g_tex_lvlmask[MAXTEX];
 static id<MTLTexture> g_tex[MAXTEX];
+static uint32_t g_tex_bc_fallback[MAXTEX];  /* source DXT format when stored as BGRA8 */
 static unsigned       g_texn = 1;            /* 0 = "doku yok" (beyaz) */
 /* --- Reset'te render hedeflerini birakmak --------------------------------
  * D3D9'da Reset'ten once oyun TUM D3DPOOL_DEFAULT kaynaklarini (render
@@ -1100,6 +1104,31 @@ static MTLPixelFormat d3dfmt_to_mtl(unsigned f, unsigned *blk, unsigned *bpb){
     }
 }
 
+static int d3dfmt_is_bc(unsigned f){
+    return f == NFS_D3DFMT_DXT1 || f == NFS_D3DFMT_DXT3 ||
+           f == NFS_D3DFMT_DXT5;
+}
+
+/* Source pitch stays in DXT block units for D3D LockRect. Only the Metal
+ * allocation layout changes on devices that cannot sample BC textures. */
+static MTLPixelFormat d3dfmt_texture_storage(unsigned f, unsigned *blk,
+                                             unsigned *bpb,
+                                             uint32_t *fallback_fmt){
+    unsigned source_blk, source_bpb;
+    MTLPixelFormat pf = d3dfmt_to_mtl(f, &source_blk, &source_bpb);
+    if (fallback_fmt) *fallback_fmt = 0;
+    if (pf == MTLPixelFormatInvalid) return pf;
+    if (d3dfmt_is_bc(f) && !g_supports_bc_textures){
+        if (blk) *blk = 1;
+        if (bpb) *bpb = 4;
+        if (fallback_fmt) *fallback_fmt = f;
+        return MTLPixelFormatBGRA8Unorm;
+    }
+    if (blk) *blk = source_blk;
+    if (bpb) *bpb = source_bpb;
+    return pf;
+}
+
 unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
                                  unsigned d3dfmt, unsigned is_rt);
 /* Yeni doku icerigi TANIMSIZDIR: TUM mip seviyeleri ve (kupte) TUM yuzler
@@ -1132,7 +1161,9 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
                                  unsigned d3dfmt, unsigned is_rt){
     if (!g_dev || g_texn >= MAXTEX) return 0;
     unsigned blk, bpb;
-    MTLPixelFormat pf = d3dfmt_to_mtl(d3dfmt, &blk, &bpb);
+    uint32_t fallback_fmt = 0;
+    MTLPixelFormat pf = d3dfmt_texture_storage(d3dfmt, &blk, &bpb,
+                                                &fallback_fmt);
     if (pf == MTLPixelFormatInvalid) return 0;
     if (!levels) levels = 1;
     MTLTextureDescriptor *td =
@@ -1142,12 +1173,17 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
     td.usage = MTLTextureUsageShaderRead | (is_rt ? MTLTextureUsageRenderTarget : 0);
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [g_dev newTextureWithDescriptor:td];
-    if (!t) return 0;
+    if (!t){
+        fprintf(stderr, "metal: doku olusturulamadi fmt=%u %ux%u seviye=%u%s\n",
+                d3dfmt, w, h, levels, fallback_fmt ? " (BC->BGRA8)" : "");
+        return 0;
+    }
     /* Yeni doku icerigi tanimsizdir; seffaf siyahla temizle ki yuklenmemis
      * dokular ekranda cop olarak gorunmesin (ornek: render target'lar). */
     tex_zero_all(t, w, h, levels, 1, blk, bpb);
     unsigned id_ = g_texn++;
     g_tex[id_] = t;
+    g_tex_bc_fallback[id_] = fallback_fmt;
     g_tex_isrt[id_] = is_rt ? 1 : 0;
     atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
     return id_;
@@ -3071,7 +3107,9 @@ unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
                                    unsigned d3dfmt, unsigned is_rt){
     if (!g_dev || g_texn >= MAXTEX) return 0;
     unsigned blk, bpb;
-    MTLPixelFormat pf = d3dfmt_to_mtl(d3dfmt, &blk, &bpb);
+    uint32_t fallback_fmt = 0;
+    MTLPixelFormat pf = d3dfmt_texture_storage(d3dfmt, &blk, &bpb,
+                                                &fallback_fmt);
     if (pf == MTLPixelFormatInvalid) return 0;
     if (!levels) levels = 1;
     MTLTextureDescriptor *td =
@@ -3084,10 +3122,15 @@ unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
      * _validateReplaceRegion assert'i, 9. karede cokme). */
     td.storageMode = MTLStorageModeShared;
     id<MTLTexture> t = [g_dev newTextureWithDescriptor:td];
-    if (!t) return 0;
+    if (!t){
+        fprintf(stderr, "metal: kup doku olusturulamadi fmt=%u %ux%u seviye=%u%s\n",
+                d3dfmt, edge, edge, levels, fallback_fmt ? " (BC->BGRA8)" : "");
+        return 0;
+    }
     tex_zero_all(t, edge, edge, levels, 6, blk, bpb);
     unsigned id_ = g_texn++;
     g_tex[id_] = t;
+    g_tex_bc_fallback[id_] = fallback_fmt;
     g_tex_cube[id_] = 1;
     g_tex_isrt[id_] = is_rt ? 1 : 0;
     atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
@@ -3105,25 +3148,75 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
     g_texup_n[id_]++;
     unsigned blk, bpb;
     if (d3dfmt_to_mtl(d3dfmt, &blk, &bpb) == MTLPixelFormatInvalid) return;
+    if (level >= g_tex[id_].mipmapLevelCount){
+        fprintf(stderr, "metal: mip disi doku yuklemesi reddedildi id=%u level=%u\n",
+                id_, level);
+        return;
+    }
     unsigned lw = w >> level, lh = h >> level;
     if (!lw) lw = 1; if (!lh) lh = 1;
+    NSUInteger tex_w = g_tex[id_].width >> level;
+    NSUInteger tex_h = g_tex[id_].height >> level;
+    if (!tex_w) tex_w = 1; if (!tex_h) tex_h = 1;
+    if (lw != tex_w || lh != tex_h){
+        fprintf(stderr, "metal: doku mip boyutu uyusmuyor id=%u level=%u arg=%ux%u tex=%lux%lu\n",
+                id_, level, lw, lh, (unsigned long)tex_w, (unsigned long)tex_h);
+        return;
+    }
+
+    const void *upload_data = data;
+    size_t upload_pitch = pitch;
+    unsigned upload_rows = (blk == 1u) ? lh : (lh + blk - 1u) / blk;
+    uint8_t *decoded = NULL;
+    uint32_t fallback_fmt = g_tex_bc_fallback[id_];
+    if (fallback_fmt){
+        if (fallback_fmt != d3dfmt ||
+            !nfs_bc_decode_bgra(fallback_fmt, data, pitch, lw, lh,
+                                &decoded, &upload_pitch)){
+            static _Atomic unsigned decode_failures;
+            unsigned n = atomic_fetch_add_explicit(&decode_failures, 1u,
+                                                    memory_order_relaxed);
+            if (n < 8u)
+                fprintf(stderr, "metal: DXT->BGRA8 cozme basarisiz id=%u fmt=%u level=%u %ux%u pitch=%u\n",
+                        id_, d3dfmt, level, lw, lh, pitch);
+            return;
+        }
+        upload_data = decoded;
+        upload_rows = lh;
+    }
+    size_t min_pitch = fallback_fmt ? (size_t)lw * 4u
+                                    : ((blk == 1u) ? (size_t)lw * bpb
+                                                   : ((size_t)lw + blk - 1u) / blk * bpb);
+    if (upload_pitch < min_pitch || !upload_rows ||
+        upload_pitch > UINT_MAX || upload_pitch > SIZE_MAX / upload_rows){
+        static _Atomic unsigned bad_pitch_reports;
+        unsigned n = atomic_fetch_add_explicit(&bad_pitch_reports, 1u,
+                                                memory_order_relaxed);
+        if (n < 8u)
+            fprintf(stderr, "metal: doku satir adimi gecersiz id=%u fmt=%u level=%u pitch=%lu min=%lu rows=%u\n",
+                    id_, d3dfmt, level, (unsigned long)upload_pitch,
+                    (unsigned long)min_pitch, upload_rows);
+        free(decoded);
+        return;
+    }
+    size_t upload_size = upload_pitch * upload_rows;
     MTLRegion rg = MTLRegionMake2D(0, 0, lw, lh);
     struct timespec _u0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_u0);
     /* bkz. SIRALI DOKU YUKLEME: ikinci ve sonraki yuklemeler cizim listesine */
     int queued = 0;
     if (texord_on() && g_texup_n[id_] >= 2 && g_upbuf[0]){
-        unsigned rows = (blk == 1) ? lh : (lh + blk - 1) / blk, sz = pitch * rows;
         if (g_tex_cube[id_] && face > 5u) face = 0u;
         pthread_mutex_lock(&g_qlock);
         int b = g_cur;
         unsigned off = (g_upn[b] + 255u) & ~255u;
-        if (off + sz <= MAXUP && g_dn[b] < MAXD){
-            memcpy(g_upbuf[b] + off, data, sz); g_upn[b] = off + sz;
+        if (upload_size <= MAXUP && off <= MAXUP - upload_size && g_dn[b] < MAXD){
+            memcpy(g_upbuf[b] + off, upload_data, upload_size);
+            g_upn[b] = off + (unsigned)upload_size;
             MDraw *D = &g_dbuf[b][g_dn[b]];
             memset(D, 0, sizeof *D);
             D->is_up = 1; D->tex = id_; D->target = 0xFFFFFFFFu;     /* hicbir hedefle eslesmesin */
             D->up_level = level; D->up_face = g_tex_cube[id_] ? face : 0u;
-            D->up_w = lw; D->up_h = lh; D->up_pitch = pitch; D->rawoff = off;
+            D->up_w = lw; D->up_h = lh; D->up_pitch = (unsigned)upload_pitch; D->rawoff = off;
             g_dn[b]++; queued = 1;
             atomic_fetch_add(&g_up_ord, 1ull);
         } else atomic_fetch_add(&g_up_ovf, 1ull);
@@ -3133,13 +3226,14 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
     else if (g_tex_cube[id_]){
         if (face > 5u) face = 0u;
         [g_tex[id_] replaceRegion:rg mipmapLevel:level slice:face
-                        withBytes:data bytesPerRow:pitch bytesPerImage:0];
+                        withBytes:upload_data bytesPerRow:upload_pitch bytesPerImage:0];
     } else {
-        [g_tex[id_] replaceRegion:rg mipmapLevel:level withBytes:data bytesPerRow:pitch];
+        [g_tex[id_] replaceRegion:rg mipmapLevel:level withBytes:upload_data bytesPerRow:upload_pitch];
     }
+    free(decoded);
     if (g_perflog){ struct timespec _u1; clock_gettime(CLOCK_MONOTONIC, &_u1);
         perflog_event(PL_TEXUP, (uint64_t)(_u1.tv_sec - _u0.tv_sec) * 1000000000ull + (uint64_t)_u1.tv_nsec - (uint64_t)_u0.tv_nsec,
-                      (uint64_t)pitch * (blk == 1 ? lh : (lh + blk - 1) / blk)); }
+                      (uint64_t)upload_size); }
     if (level < 16u) g_tex_lvlmask[id_] |= 1u << level;
     atomic_fetch_add(&g_tex_uploaded, 1);
 }
@@ -3581,7 +3675,11 @@ void metal_view_size(unsigned *ow, unsigned *oh){
 }
 void metal_resize(unsigned w, unsigned h){
     if (!w || !h || w > 8192u || h > 8192u) return;
-    dispatch_async(dispatch_get_main_queue(), ^{ win_apply_size(w, h); });
+#if TARGET_OS_IPHONE
+    if ([NSThread isMainThread]) win_apply_size(w, h);
+    else
+#endif
+        dispatch_async(dispatch_get_main_queue(), ^{ win_apply_size(w, h); });
 }
 void metal_set_stage_tex(unsigned t1, unsigned t2, unsigned t3){
     g_cur_tex1 = t1; g_cur_tex2 = t2; g_cur_tex3 = t3;
@@ -4260,6 +4358,17 @@ void metal_early_init(void){
     dump_init();
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev){ fprintf(stderr, "metal: cihaz bulunamadi\n"); return; }
+    g_supports_bc_textures = !TARGET_OS_IPHONE;
+    if (@available(iOS 16.4, macOS 11.0, *)){
+        g_supports_bc_textures = g_dev.supportsBCTextureCompression;
+    }
+#if TARGET_OS_IPHONE
+    else {
+        g_supports_bc_textures = 0;
+    }
+#endif
+    fprintf(stderr, "metal: BC doku sikistirmasi %s\n",
+            g_supports_bc_textures ? "destekleniyor" : "desteklenmiyor; DXT->BGRA8 yazilim cozme etkin");
     g_queue = [g_dev newCommandQueue];
     @autoreleasepool {
         g_vbuf[0] = malloc(sizeof(MVert)*MAXV); g_vbuf[1] = malloc(sizeof(MVert)*MAXV);
@@ -4384,8 +4493,27 @@ void metal_early_init(void){
         [g_white replaceRegion:MTLRegionMake2D(0,0,1,1) mipmapLevel:0
                      withBytes:&px bytesPerRow:4];
     }
+    if (!g_queue) fprintf(stderr, "metal: komut kuyrugu olusturulamadi\n");
+    if (!g_samp) fprintf(stderr, "metal: varsayilan ornekleyici olusturulamadi\n");
+    if (!g_white) fprintf(stderr, "metal: varsayilan beyaz doku olusturulamadi\n");
+    if (!g_blitvb) fprintf(stderr, "metal: StretchRect koseleri olusturulamadi\n");
+    if (!g_vbuf[0] || !g_vbuf[1] || !g_dbuf[0] || !g_dbuf[1] ||
+        !g_pscb[0] || !g_pscb[1])
+        fprintf(stderr, "metal: konuk/kare CPU cizim tamponu olusturulamadi\n");
+    if (!g_fb_sem) fprintf(stderr, "metal: kare tamponu semaforu olusturulamadi\n");
+    int buffers_ready = g_blitvb && g_vbuf[0] && g_vbuf[1] &&
+                        g_dbuf[0] && g_dbuf[1] && g_pscb[0] && g_pscb[1] && g_fb_sem;
+    for (int i = 0; i < NFB; ++i){
+        if (!g_fb_vb[i] || !g_fb_rvb[i] || !g_fb_kb[i]){
+            fprintf(stderr, "metal: kare %d icin GPU cizim tamponu eksik (VB=%d RV=%d KB=%d)\n",
+                    i, g_fb_vb[i] != nil, g_fb_rvb[i] != nil, g_fb_kb[i] != nil);
+            buffers_ready = 0;
+        }
+    }
+    int core_ready = g_queue && g_lib && g_pso && g_samp && g_white && buffers_ready;
+    atomic_store_explicit(&g_metal_core_ready, core_ready, memory_order_release);
     fprintf(stderr, "metal: cihaz hazir (%s), cizim yolu %s\n",
-            [[g_dev name] UTF8String], g_pso ? "HAZIR" : "YOK");
+            [[g_dev name] UTF8String], core_ready ? "HAZIR" : "YOK");
 }
 
 /* --- karisim durumuna gore pipeline onbellegi -------------------------
@@ -4999,7 +5127,7 @@ static int fs_pref_load(void){
  * geri donmez (uygulama kapanana kadar).                                */
 /* Render a pending frame if available. Returns 1 if drawn, 0 otherwise. */
 int metal_render_frame(void){
-    if (!g_layer || !g_dev) return 0;
+    if (!g_layer || !atomic_load_explicit(&g_metal_core_ready, memory_order_acquire)) return 0;
                 int have_new;
                 pthread_mutex_lock(&g_qlock); have_new = (g_ready >= 0);
                 pthread_mutex_unlock(&g_qlock);

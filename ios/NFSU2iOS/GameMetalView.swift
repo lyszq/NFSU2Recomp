@@ -787,6 +787,9 @@ public final class NFSU2MetalRenderUIView: UIView {
     }
     
     private var displayLink: CADisplayLink?
+    // Mouse emulation uses one pointer. Keep its identity stable across UIKit
+    // touch batches so a second finger cannot steal movement or release it.
+    private var primaryPointerTouch: UITouch?
 #if NFS_FULL_RUNTIME
     private var executablePath: String?
     private var assetRootPath: String?
@@ -830,20 +833,27 @@ public final class NFSU2MetalRenderUIView: UIView {
     private func setupNotificationObservers() {
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(applicationDidEnterBackground),
+            selector: #selector(applicationWillResignActive(_:)),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidEnterBackground(_:)),
             name: UIApplication.didEnterBackgroundNotification,
             object: nil
         )
         NotificationCenter.default.addObserver(
             self,
-            selector: #selector(applicationWillEnterForeground),
-            name: UIApplication.willEnterForegroundNotification,
+            selector: #selector(applicationDidBecomeActive(_:)),
+            name: UIApplication.didBecomeActiveNotification,
             object: nil
         )
     }
-    
-    @objc private func applicationDidEnterBackground() {
+
+    @objc private func applicationWillResignActive(_ notification: Notification) {
         stopDisplayLink()
+        primaryPointerTouch = nil
         nfsu2_input_clear_all()
         nfsu2_input_set_cursor_available(false)
 #if NFS_FULL_RUNTIME
@@ -851,7 +861,17 @@ public final class NFSU2MetalRenderUIView: UIView {
 #endif
     }
     
-    @objc private func applicationWillEnterForeground() {
+    @objc private func applicationDidEnterBackground(_ notification: Notification) {
+        stopDisplayLink()
+        primaryPointerTouch = nil
+        nfsu2_input_clear_all()
+        nfsu2_input_set_cursor_available(false)
+#if NFS_FULL_RUNTIME
+        nfs_game_session_set_active(0)
+#endif
+    }
+    
+    @objc private func applicationDidBecomeActive(_ notification: Notification) {
         startDisplayLink()
 #if NFS_FULL_RUNTIME
         nfs_game_session_set_active(1)
@@ -900,6 +920,7 @@ public final class NFSU2MetalRenderUIView: UIView {
         sessionStatusTimer?.invalidate()
         // The guest/runtime is process-lifetime state. View teardown only
         // releases input and presentation; it never unmaps live guest memory.
+        primaryPointerTouch = nil
         nfsu2_input_clear_all()
         nfs_game_session_set_active(0)
 #endif
@@ -1020,8 +1041,9 @@ public final class NFSU2MetalRenderUIView: UIView {
 
     public override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesBegan(touches, with: event)
+        guard primaryPointerTouch == nil, let touch = touches.first else { return }
+        primaryPointerTouch = touch
         refreshInputViewport()
-        guard let touch = touches.first else { return }
         let loc = touch.location(in: self)
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), true)
         nfsu2_input_set_cursor_available(true)
@@ -1029,27 +1051,29 @@ public final class NFSU2MetalRenderUIView: UIView {
 
     public override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesMoved(touches, with: event)
+        guard let touch = primaryPointerTouch, touches.contains(touch) else { return }
         refreshInputViewport()
-        guard let touch = touches.first else { return }
         let loc = touch.location(in: self)
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), true)
     }
 
     public override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesEnded(touches, with: event)
+        guard let touch = primaryPointerTouch, touches.contains(touch) else { return }
         refreshInputViewport()
-        guard let touch = touches.first else { return }
         let loc = touch.location(in: self)
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), false)
+        primaryPointerTouch = nil
     }
 
     public override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
         super.touchesCancelled(touches, with: event)
+        guard let touch = primaryPointerTouch, touches.contains(touch) else { return }
         refreshInputViewport()
-        guard let touch = touches.first else { return }
         let loc = touch.location(in: self)
         nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), false)
         nfsu2_input_set_cursor_available(false)
+        primaryPointerTouch = nil
     }
 }
 
@@ -1153,6 +1177,7 @@ public struct GameMetalView: View {
                             .foregroundStyle(sessionState == Int32(NFS_GAME_SESSION_FAILED) ? .red : .white)
                             .lineLimit(3)
                             .textSelection(.enabled)
+                            .accessibilityIdentifier("full-runtime-status")
                             .padding(.horizontal, 10)
                             .padding(.vertical, 7)
                             .background(.black.opacity(0.66), in: RoundedRectangle(cornerRadius: 9))
@@ -1189,6 +1214,7 @@ public struct GameMetalView: View {
                     .buttonStyle(.borderedProminent)
                     .tint(.mint)
                     .disabled(files.assetImportRunning)
+                    .accessibilityIdentifier("full-runtime-start")
                     Button {
                         chooseGameFolder = true
                     } label: {

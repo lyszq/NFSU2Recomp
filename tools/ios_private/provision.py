@@ -79,7 +79,7 @@ def main():
     parser.add_argument("--create", action="store_true", help="create a new PRIVATE control repository if absent")
     parser.add_argument("--exe", type=Path, help="upload only the authenticated EXE as a PRIVATE release asset")
     parser.add_argument("--dispatch", action="store_true", help="start the configured private workflow")
-    parser.add_argument("--mode", choices=["startup", "full"], default="startup",
+    parser.add_argument("--mode", choices=["startup", "full", "full-simulator"], default="startup",
                         help="Explicit build lane; full links the complete legacy game runtime")
     parser.add_argument("--macos-runner", choices=["macos-15", "macos-26", "macos-15-intel"], default="macos-15",
                         help="standard macOS build host; the iOS output remains ARM64 on every host")
@@ -105,7 +105,8 @@ def main():
             "has_projects": False, "has_wiki": False})
         if not created["private"]: raise ValueError("private creation was not confirmed")
         client.private()
-    template_name = "ios-full-runtime.yml" if args.mode == "full" else "ios-private.yml"
+    template_name = {"full": "ios-full-runtime.yml", "full-simulator": "ios-full-simulator.yml",
+                     "startup": "ios-private.yml"}[args.mode]
     template = (ROOT / "tools/ios_private" / template_name).read_text(encoding="utf-8")
     if template.count("SOURCE_COMMIT_PLACEHOLDER") != 1:
         raise ValueError("invalid workflow template")
@@ -120,6 +121,8 @@ def main():
         "Unsigned IPA still requires signing. " +
         ("Full-runtime build lane: all generated shards and the real Metal/audio backends. "
          "Compile/link evidence does not establish game boot or gameplay.\n" if args.mode == "full" else
+         "Full-runtime iOS Simulator lane: actual production Start and scene resume with "
+         "the authenticated EXE but game assets intentionally absent. No device/gameplay claim.\n" if args.mode == "full-simulator" else
          "Startup diagnostic lane: actual lifted functions and a bounded entry prefix with "
          "implemented guest API contracts; no game boot or gameplay.\n"))
     if blob is not None:

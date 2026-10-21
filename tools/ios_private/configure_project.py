@@ -269,7 +269,7 @@ def configure_project(mode: str = "auto", out: str | Path | None = None,
         extra_hsp.append("$(SRCROOT)/../gen/all")
     base["HEADER_SEARCH_PATHS"] = list(dict.fromkeys(list(current_hsp) + extra_hsp))
 
-    version, build = ("0.20.0", "27") if mode == "all" else ("0.19.0", "26")
+    version, build = ("0.21.0", "28") if mode == "all" else ("0.19.0", "26")
     spec["targets"]["NFSU2iOS"]["info"]["properties"]["CFBundleShortVersionString"] = version
     spec["targets"]["NFSU2iOS"]["info"]["properties"]["CFBundleVersion"] = build
     out_path = Path(out) if out is not None else root / "ios" / "project-private.yml"

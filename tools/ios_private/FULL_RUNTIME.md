@@ -56,3 +56,24 @@ then repeats package, source and complete linkage checks without recompilation.
 successful private replay, its workflow pins, and byte identity with the original
 IPA. Reports retain the original CI failure and separate successful verification;
 they never relabel a failed build run as successful or change the compiled SHA.
+
+The v0.21/build28 continuation adds thread-local legacy exit scopes, lifecycle
+publication after successful worker creation, and preservation of an existing
+verified executable when an invalid new selection fails. The renderer requires
+usable base resources before readiness and decodes BC1/BC2/BC3 to BGRA8 only when
+the device lacks native BC support. The capability selector is guarded at its
+[iOS16.4 availability](https://developer.apple.com/documentation/metal/mtldevice/supportsbctexturecompression).
+Compressed guest pitches stay unchanged; synthetic native vectors cover color,
+alpha, row padding, edge and mip decoding independently of game assets.
+
+`provision.py --mode full-simulator --dispatch --macos-runner macos-15-intel`
+selects a separate PRIVATE all-shard simulator lane. It builds production app
+sources and a separate XCUITest bundle; no autostart/test bypass enters the app.
+The runner stages the same authenticated EXE and one explicitly named
+missing-assets sentinel solely to expose the existing Start UI. Actual game
+assets are intentionally absent. The test taps production Start, backgrounds and
+reactivates the app, and checks UIKit responsiveness. A source-pinned native
+log marker must be present at the actual generated-entry call site. XCUITest
+execution has a 240-second external bound and the disposable app is terminated
+after private log/screenshot capture. This is negative-input Simulator evidence,
+not physical-device ARM64 validation, successful game boot or gameplay.

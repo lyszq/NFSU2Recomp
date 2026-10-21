@@ -31,6 +31,10 @@ on:
       - 'runtime/metal.*'
       - 'runtime/dispatch.c'
       - 'runtime/mem.c'
+      - 'runtime/win32*'
+      - 'runtime/bc_decoder.h'
+      - 'tests/win32_exit_scope*'
+      - 'tests/bc_decoder*'
       - 'tests/guest_memory*'
       - 'tests/guest_pe*'
       - 'tests/guest_dispatch*'
@@ -62,6 +66,8 @@ on:
       - 'tests/ios_startup_probe*'
       - 'tests/fixtures/windows_nls_cp1252.json'
       - 'tools/ios_private/startup_probe.c.in'
+      - 'tools/ios_private/*.py'
+      - 'tools/ios_private/requirements.txt'
       - '.github/workflows/ios-bootstrap.yml'
 
 permissions:
@@ -73,6 +79,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - name: Authored generation and private-verifier contract tests (no game input)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/contract-python"
+          "$RUNNER_TEMP/contract-python/bin/pip" install -r tools/ios_private/requirements.txt
+          "$RUNNER_TEMP/contract-python/bin/python" -m unittest discover -s tools/ios_private -p 'test_*.py'
       - run: bash tests/run_guest_tests.sh "$RUNNER_TEMP/guest-tests"
 
   build-ios:

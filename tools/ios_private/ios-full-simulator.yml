@@ -1,0 +1,87 @@
+# TEMPLATE ONLY. Authenticated input and all evidence must remain PRIVATE.
+name: Private full runtime iOS Simulator missing-assets smoke
+on:
+  workflow_dispatch:
+    inputs:
+      macos_runner:
+        type: choice
+        default: macos-15-intel
+        options: [macos-15-intel, macos-15, macos-26]
+permissions:
+  contents: read
+env:
+  GH_TOKEN: ${{ github.token }}
+  GH_REPO: ${{ github.repository }}
+  SOURCE_SHA: SOURCE_COMMIT_PLACEHOLDER
+jobs:
+  full-runtime-simulator:
+    if: github.event.repository.private == true
+    runs-on: ${{ inputs.macos_runner || 'macos-15-intel' }}
+    timeout-minutes: 90
+    steps:
+      - name: Require private repository and exact source pin
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git clone --filter=blob:none --no-checkout https://github.com/lyszq/NFSU2Recomp.git "$RUNNER_TEMP/source"
+          cd "$RUNNER_TEMP/source"
+          git fetch --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Configure host and select available iPad Simulator
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun simctl list runtimes
+          python3 -m venv "$RUNNER_TEMP/private-python"
+          "$RUNNER_TEMP/private-python/bin/pip" install -r tools/ios_private/requirements.txt
+          "$RUNNER_TEMP/private-python/bin/python" -m unittest discover -s tools/ios_private -p 'test_*.py'
+          brew install xcodegen
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/simulator_smoke.py select --out "$RUNNER_TEMP/simulator-device.json"
+      - name: Authenticate exact EXE and generate complete runtime privately
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/$GH_REPO" --jq .private)" = true
+          gh release download private-input-v1 --repo "$GH_REPO" --pattern SPEED2.EXE --dir "$RUNNER_TEMP/private-input"
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/generate_shards.py --exe "$RUNNER_TEMP/private-input/SPEED2.EXE" --shards 128
+          cp gen/all/ios-full-manifest.json "$RUNNER_TEMP/simulator-provenance.json"
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/configure_project.py --mode all
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/configure_simulator.py
+      - name: Build all shards and production UI for the Simulator
+        working-directory: ${{ runner.temp }}/source/ios
+        run: |
+          set -euo pipefail
+          xcodegen generate --spec project-full-simulator.yml
+          xcodebuild -project NFSU2iOS.xcodeproj -scheme FullRuntimeSmoke -configuration Release \
+            -sdk iphonesimulator -destination "id=$NFS_SIMULATOR_UDID" -jobs 3 \
+            -derivedDataPath "$RUNNER_TEMP/FullSimulatorDerivedData" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build-for-testing \
+            > "$RUNNER_TEMP/simulator-build.log" 2>&1 || { tail -n 120 "$RUNNER_TEMP/simulator-build.log"; exit 1; }
+      - name: Run actual Start and foreground-resume with assets intentionally absent
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/simulator_smoke.py run \
+            --device "$NFS_SIMULATOR_UDID" --exe "$RUNNER_TEMP/private-input/SPEED2.EXE" \
+            --source "$SOURCE_SHA" --derived "$RUNNER_TEMP/FullSimulatorDerivedData" \
+            --out "$RUNNER_TEMP/simulator-evidence"
+      - name: Upload private Simulator evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSU2-full-runtime-private-simulator-evidence
+          path: |
+            ${{ runner.temp }}/simulator-build.log
+            ${{ runner.temp }}/simulator-device.json
+            ${{ runner.temp }}/simulator-provenance.json
+            ${{ runner.temp }}/simulator-evidence/
+          if-no-files-found: warn
+          retention-days: 7
+      - name: Remove confidential input and generated source
+        if: always()
+        run: |
+          rm -f "$RUNNER_TEMP/private-input/SPEED2.EXE"
+          rm -rf "$RUNNER_TEMP/source/gen/all"

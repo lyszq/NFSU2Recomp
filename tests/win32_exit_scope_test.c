@@ -2,6 +2,7 @@
 #include <assert.h>
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 
 int g_exit_code;
 #include "../runtime/win32_exit_scope.inc"
@@ -67,5 +68,6 @@ int main(void){
     assert(reached_primary_checkpoint);
     assert(g_exit_code == EXPECTED_PROCESS_EXIT_CODE);
     win32_exit_scope_leave((void *)previous);
+    puts("PASS | legacy Win32 exit scopes | child-local ExitThread/ExitProcess, retained code, primary checkpoint");
     return 0;
 }

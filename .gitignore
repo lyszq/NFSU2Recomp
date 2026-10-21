@@ -30,6 +30,7 @@ __pycache__/
 /SPEED2.EXE
 /private-input/
 /ios/project-private.yml
+/ios/project-full-simulator.yml
 /ios/NFSU2iOS.xcodeproj/
 /ios/NFSU2iOS/Info.plist
 *.ipa

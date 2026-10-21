@@ -57,13 +57,13 @@ def inspect_binary(binary):
         raise ValueError('expected iOS load commands')
     return segments
 
-def inspect_package(ipa, source):
+def inspect_package(ipa, source, version='0.20.0', build='27'):
     with zipfile.ZipFile(ipa) as z:
         for name in z.namelist():
             if Path(name).suffix.lower() in {'.exe','.c','.h','.py','.bin'} or any(x in name.lower() for x in ['unicorn','_codesignature','embedded.mobileprovision']):
                 raise ValueError('unexpected confidential source, reference engine or signing payload: '+name)
         info=plistlib.loads(z.read('Payload/NFSU2iOS.app/Info.plist'))
-        if info['CFBundleIdentifier'] != 'dev.lyszq.nfsu2ios' or (info['CFBundleShortVersionString'],info['CFBundleVersion']) != ('0.20.0','27'):
+        if info['CFBundleIdentifier'] != 'dev.lyszq.nfsu2ios' or (info['CFBundleShortVersionString'],info['CFBundleVersion']) != (version,build):
             raise ValueError('unexpected app identity/version')
         if info.get('NFSRuntimeSourceSHA') != source:
             raise ValueError('app source pin differs from compiled source')
@@ -78,6 +78,8 @@ def main():
     p.add_argument('--public-run',type=int,required=True)
     p.add_argument('--replay-run',type=int)
     p.add_argument('--replay-source')
+    p.add_argument('--version', default='0.21.0')
+    p.add_argument('--build', default='28')
     a=p.parse_args()
     client=GitHub('NFSU2Recomp-ios-private'); client.private()
     base='/repos/'+client.repository
@@ -129,7 +131,7 @@ def main():
     if len(assets)!=1 or assets[0]['name']!='SPEED2.EXE' or assets[0]['size']!=4788224 or assets[0]['digest']!='sha256:'+EXPECTED_SHA:
         raise ValueError('private input identity differs')
     ipa=a.delivery/'NFSU2iOS-full-runtime-unsigned.ipa'
-    info,binary,segments=inspect_package(ipa,a.source)
+    info,binary,segments=inspect_package(ipa,a.source,a.version,a.build)
     report=json.loads((a.delivery/'full-runtime-verification.json').read_text())
     manifest_bytes=(a.delivery/'full-runtime-provenance.json').read_bytes()
     if report['source_sha']!=a.source or report['binary_sha256']!=digest(binary) or report['generation_manifest_sha256']!=digest(manifest_bytes):

@@ -10,6 +10,8 @@ import re
 REQUIRED = {
     "dispatch_init": "dispatch.o", "dispatch_indirect": "dispatch.o",
     "win32_init": "win32.o", "win32_call": "win32.o", "com_call": "com.o",
+    "win32_exit_scope_enter": "win32.o", "win32_exit_scope_leave": "win32.o",
+    "win32_exit_checkpoint": "win32.o",
     "run_generated": "genexec.o", "overrides_install": "overrides.o",
     "metal_early_init": "metal.o", "metal_init_ios": "metal.o",
     "metal_render_frame": "metal.o", "metal_available": "metal.o",
