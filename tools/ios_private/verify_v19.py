@@ -176,7 +176,7 @@ report = dict(version='0.19.0', build='26', source_commit=a.source,
               artifacts=[{k:x.get(k) for k in ('id','name','size_in_bytes','digest')} for x in client.api(f'/repos/{client.repository}/actions/runs/{a.run}/artifacts')['artifacts']],
               physical_device_test='pending', previous_confirmed_device_version='0.17.0',
               previous_confirmed_device='iPad / iPadOS 26.3 / 16 KiB pages',
-              live_input_device_test='latest confirmed v0.17; v0.19 pending', game_boot=False, gameplay=False,
+              live_input_device_test='v0.16 hover PASS; touch not separately reported; v0.18/v0.19 live input not reported', game_boot=False, gameplay=False,
               public_main=client.api('/repos/lyszq/NFSU2Recomp/git/ref/heads/main')['object']['sha'],
               working_tree_clean=not subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip())
 (a.delivery / 'BUILD-VERIFICATION.json').write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8')
