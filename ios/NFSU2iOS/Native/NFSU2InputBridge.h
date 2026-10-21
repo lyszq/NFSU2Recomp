@@ -48,9 +48,6 @@ extern "C" {
 #define NFSU2_DIK_RIGHT           0xCD  /* Direksiyon Sağ (Steer Right) */
 #define NFSU2_DIK_DOWN            0xD0  /* Fren / Geri Vites (Brake/Reverse) */
 
-/* DirectInput klavye durum dizisinin SPEED2.EXE içindeki sabit sanal bellek adresi */
-#define NFSU2_KEYBOARD_BUFFER_GUEST_ADDR 0x00870990u
-
 /*
  * Swift -> C Köprü Fonksiyonları (Sıfır Gecikme, Atomik Bellek Erişimi)
  */
@@ -84,6 +81,15 @@ void nfsu2_input_sync_guest_memory(void);
 void nfsu2_input_set_steering(float analog_x);  /* -1.0 (tam sol) .. +1.0 (tam sağ) */
 void nfsu2_input_set_throttle(float analog_val); /* 0.0 .. 1.0 */
 void nfsu2_input_set_brake(float analog_val);    /* 0.0 .. 1.0 */
+
+/*
+ * Fare / İmleç ve Dokunmatik Giriş Köprüsü (SwiftUI / UIKit -> C Çalışma Zamanı)
+ */
+void nfsu2_input_set_cursor(float host_x, float host_y, bool is_down);
+void nfsu2_input_set_cursor_available(bool available);
+bool nfsu2_input_get_cursor(int *x, int *y);
+void nfsu2_input_set_viewport(uint32_t viewport_w, uint32_t viewport_h,
+                               uint32_t game_w, uint32_t game_h);
 
 /*
  * runtime/com.c ile geriye dönük uyumluluk:

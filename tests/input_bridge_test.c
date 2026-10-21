@@ -126,52 +126,31 @@ static void test_metal_available(void) {
     printf("PASS: test_metal_available\n");
 }
 
-static void test_guest_memory_sync(void) {
-    size_t test_size = NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + 512;
-    uint8_t *sim_vm = (uint8_t *)calloc(1, test_size);
-    assert(sim_vm != NULL);
+static void test_cursor_bridge(void) {
+    nfsu2_input_set_viewport(1280, 720, 1280, 720);
+    nfsu2_input_set_cursor(640.0f, 360.0f, false);
 
-    g_mem = sim_vm;
-    uint32_t granule = NFSU2_KEYBOARD_BUFFER_GUEST_ADDR >> 14;
-    g_cbits[granule >> 3] |= (uint8_t)(1u << (granule & 7));
+    int cx = 0, cy = 0;
+    bool avail = nfsu2_input_get_cursor(&cx, &cy);
+    assert(avail == true);
+    assert(cx == 640);
+    assert(cy == 360);
 
-    nfsu2_input_clear_all();
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_UP] == 0x00);
+    /* Test viewport aspect scaling with letterboxing: 1920x1080 viewport, 640x480 (4:3) game */
+    nfsu2_input_set_viewport(1920, 1080, 640, 480);
+    /* Center of viewport: 960, 540 should map to game center: 320, 240 */
+    nfsu2_input_set_cursor(960.0f, 540.0f, true);
+    avail = nfsu2_input_get_cursor(&cx, &cy);
+    assert(avail == true);
+    assert(cx == 320);
+    assert(cy == 240);
 
-    /* Press UP (Gas) and SPACE (Handbrake) */
-    nfsu2_input_set_key(NFSU2_DIK_UP, true);
-    nfsu2_input_set_key(NFSU2_DIK_SPACE, true);
+    /* Test availability toggle */
+    nfsu2_input_set_cursor_available(false);
+    avail = nfsu2_input_get_cursor(&cx, &cy);
+    assert(avail == false);
 
-    /* Verify immediate mirror in guest memory at 0x00870990 */
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_UP] == 0x80);
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_SPACE] == 0x80);
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_DOWN] == 0x00);
-
-    /* Test steering updates mirror in guest memory */
-    nfsu2_input_set_steering(-1.0f);
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_LEFT] == 0x80);
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_A] == 0x80);
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_RIGHT] == 0x00);
-
-    /* Test clear all clears guest memory */
-    nfsu2_input_clear_all();
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_UP] == 0x00);
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_SPACE] == 0x00);
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_LEFT] == 0x00);
-
-    /* Test nfsu2_input_sync_guest_memory */
-    nfsu2_input_set_key(NFSU2_DIK_ESCAPE, true);
-    /* Invalidate guest byte to verify sync flushes it */
-    sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_ESCAPE] = 0x00;
-    nfsu2_input_sync_guest_memory();
-    assert(sim_vm[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + NFSU2_DIK_ESCAPE] == 0x80);
-
-    nfsu2_input_clear_all();
-    free(sim_vm);
-    g_mem = NULL;
-    memset(g_cbits, 0, sizeof(g_cbits));
-
-    printf("PASS: test_guest_memory_sync\n");
+    printf("PASS: test_cursor_bridge\n");
 }
 
 int main(void) {
@@ -182,7 +161,7 @@ int main(void) {
     test_pedals_analog();
     test_metal_fill_keyboard_compat();
     test_metal_available();
-    test_guest_memory_sync();
+    test_cursor_bridge();
     printf("=== All NFSU2InputBridge Tests PASSED ===\n");
     return 0;
 }

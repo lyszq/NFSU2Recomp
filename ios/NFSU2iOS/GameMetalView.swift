@@ -803,6 +803,7 @@ public final class NFSU2MetalRenderUIView: UIView {
         metal_set_layer(Unmanaged.passUnretained(mtl).toOpaque())
         startDisplayLink()
         setupNotificationObservers()
+        setupPointerInteraction()
     }
     
     required init?(coder: NSCoder) {
@@ -827,6 +828,7 @@ public final class NFSU2MetalRenderUIView: UIView {
     @objc private func applicationDidEnterBackground() {
         stopDisplayLink()
         nfsu2_input_clear_all()
+        nfsu2_input_set_cursor_available(false)
     }
     
     @objc private func applicationWillEnterForeground() {
@@ -842,6 +844,10 @@ public final class NFSU2MetalRenderUIView: UIView {
         if dw > 0 && dh > 0 {
             metalLayer.drawableSize = CGSize(width: CGFloat(dw), height: CGFloat(dh))
             metal_resize(dw, dh)
+            var gw: UInt32 = 1280
+            var gh: UInt32 = 720
+            metal_game_size(&gw, &gh)
+            nfsu2_input_set_viewport(UInt32(bounds.width), UInt32(bounds.height), gw, gh)
         }
     }
     
@@ -867,6 +873,58 @@ public final class NFSU2MetalRenderUIView: UIView {
         NotificationCenter.default.removeObserver(self)
     }
 }
+
+
+    private func setupPointerInteraction() {
+        isUserInteractionEnabled = true
+        isMultipleTouchEnabled = true
+        let hover = UIHoverGestureRecognizer(target: self, action: #selector(handleHover(_:)))
+        addGestureRecognizer(hover)
+    }
+
+    @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+        let loc = recognizer.location(in: self)
+        switch recognizer.state {
+        case .began, .changed:
+            nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), false)
+            nfsu2_input_set_cursor_available(true)
+        case .ended, .cancelled:
+            nfsu2_input_set_cursor_available(false)
+        default:
+            break
+        }
+    }
+
+    public override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesBegan(touches, with: event)
+        guard let touch = touches.first else { return }
+        let loc = touch.location(in: self)
+        nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), true)
+        nfsu2_input_set_cursor_available(true)
+    }
+
+    public override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesMoved(touches, with: event)
+        guard let touch = touches.first else { return }
+        let loc = touch.location(in: self)
+        nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), true)
+    }
+
+    public override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesEnded(touches, with: event)
+        guard let touch = touches.first else { return }
+        let loc = touch.location(in: self)
+        nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), false)
+    }
+
+    public override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        super.touchesCancelled(touches, with: event)
+        guard let touch = touches.first else { return }
+        let loc = touch.location(in: self)
+        nfsu2_input_set_cursor(Float(loc.x), Float(loc.y), false)
+        nfsu2_input_set_cursor_available(false)
+    }
+
 
 public struct NFSU2MetalSurfaceView: UIViewRepresentable {
     public init() {}

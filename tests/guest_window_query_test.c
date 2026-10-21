@@ -371,11 +371,40 @@ static int test_nonnull_window_and_unknown_imports(void) {
     return 0;
 }
 
+static int test_null_client_rect(void) {
+    CPU cpu, before;
+    uint32_t fault = 0x12345678u, last_error = 0;
+    GuestImport import = get_window_rect_import("USER32.dll", "GetClientRect");
+
+    CHECK(guest_memory_commit(TEB_ADDR, PAGE_SIZE) == 0);
+    CHECK(write_u32(TEB_ADDR + LAST_ERROR_OFFSET, INITIAL_LAST_ERROR) == 0);
+
+    /* NULL HWND with unmapped rect */
+    CHECK(write_frame(STACK_ADDR, RETURN_ADDRESS, 0, RECT_UNMAPPED) == 0);
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    CHECK(guest_windows_import(&cpu, &import, NULL, &fault) == 1);
+    CHECK(expect_completed_cpu(&cpu, &before, RETURN_ADDRESS) == 0);
+    CHECK(read_u32(TEB_ADDR + LAST_ERROR_OFFSET, &last_error) == 0);
+    CHECK(last_error == LAST_ERROR_VALUE);
+
+    /* Non-null HWND must remain unsupported */
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    before = cpu;
+    CHECK(write_frame(STACK_ADDR, RETURN_ADDRESS, 1, RECT_UNMAPPED) == 0);
+    CHECK(guest_windows_import(&cpu, &import, NULL, &fault) == 0);
+    CHECK(expect_unchanged_cpu(&cpu, &before) == 0);
+
+    CHECK(guest_memory_protect(TEB_ADDR, PAGE_SIZE, GUEST_MEMORY_NONE) == 0);
+    return 0;
+}
+
 int main(void) {
     CHECK(guest_memory_init() == 0);
     CHECK(guest_memory_commit(STACK_PAGE, PAGE_SIZE) == 0);
 
     CHECK(test_null_window_and_ignored_rect() == 0);
+    CHECK(test_null_client_rect() == 0);
     CHECK(test_teb_faults_are_atomic() == 0);
     CHECK(test_teb_frame_alias_and_top_boundary() == 0);
     CHECK(test_frame_faults() == 0);

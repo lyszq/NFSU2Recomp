@@ -92,7 +92,9 @@ BOUNDARY_ARGUMENT_COUNTS = {
     "RegOpenKeyA": 3,
     "IsProcessorFeaturePresent": 1,
     "GetWindowRect": 2,
+    "GetClientRect": 2,
     "GetCursorPos": 1,
+    "GetSystemMetrics": 1,
     "GetStartupInfoA": 1,
     "GetStdHandle": 1,
     "GetFileType": 1,
@@ -145,6 +147,8 @@ SUPPORTED_IMPORTS = {
     ("advapi32.dll", "RegOpenKeyA"),
     ("kernel32.dll", "IsProcessorFeaturePresent"),
     ("user32.dll", "GetWindowRect"),
+    ("user32.dll", "GetClientRect"),
+    ("user32.dll", "GetCursorPos"),
     ("kernel32.dll", "GetVersionExA"),
     ("kernel32.dll", "GetModuleHandleA"),
     ("kernel32.dll", "GetStartupInfoA"),
@@ -3268,9 +3272,16 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
                         engine.emu_stop()
                         return True
                     _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
-                elif row["name"] == "GetWindowRect":
+                elif row["name"] in ("GetWindowRect", "GetClientRect"):
                     from window_oracle import _window_query_import
                     handled = _window_query_import(engine, xr, uc, row, mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
+                elif row["name"] == "GetCursorPos":
+                    from cursor_oracle import _cursor_query_import
+                    handled = _cursor_query_import(engine, xr, uc, row, mapped_ranges, state)
                     if handled or state["status"] is not None:
                         engine.emu_stop()
                         return True

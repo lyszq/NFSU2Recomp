@@ -65,13 +65,13 @@ def main():
     target["settings"]["base"]["HEADER_SEARCH_PATHS"] = list(dict.fromkeys(current_hsp + extra_hsp))
 
     # Version metadata
-    target["info"]["properties"]["CFBundleShortVersionString"] = "0.14.0"
-    target["info"]["properties"]["CFBundleVersion"] = "21"
+    target["info"]["properties"]["CFBundleShortVersionString"] = "0.15.0"
+    target["info"]["properties"]["CFBundleVersion"] = "22"
 
     # Destination output file
     out_path = Path(args.out) if args.out else (root / "ios/project-private.yml")
     out_path.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8", newline="\n")
-    print(f"Configured {out_path.name} in '{mode}' mode (v0.14.0, build 21)")
+    print(f"Configured {out_path.name} in '{mode}' mode (v0.15.0, build 22)")
 
 if __name__ == "__main__":
     main()

@@ -7,6 +7,7 @@
  */
 
 #include "NFSU2InputBridge.h"
+#include "guest_cursor.h"
 #include "guest_memory.h"
 #include <stdatomic.h>
 #include <string.h>
@@ -32,17 +33,11 @@ static inline bool is_guest_addr_committed(uint32_t addr) {
 
 void nfsu2_input_set_key(uint8_t dik_code, bool is_pressed) {
     atomic_store_explicit(&g_keys[dik_code], is_pressed ? 1 : 0, memory_order_release);
-    if (is_guest_addr_committed(NFSU2_KEYBOARD_BUFFER_GUEST_ADDR)) {
-        g_mem[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + dik_code] = is_pressed ? 0x80 : 0x00;
-    }
 }
 
 void nfsu2_input_clear_all(void) {
     for (int i = 0; i < 256; i++) {
         atomic_store_explicit(&g_keys[i], 0, memory_order_relaxed);
-    }
-    if (is_guest_addr_committed(NFSU2_KEYBOARD_BUFFER_GUEST_ADDR)) {
-        memset(g_mem + NFSU2_KEYBOARD_BUFFER_GUEST_ADDR, 0, 256);
     }
 }
 
@@ -69,11 +64,8 @@ void nfsu2_input_fill_keyboard(uint8_t *dst, uint32_t count) {
 }
 
 void nfsu2_input_sync_guest_memory(void) {
-    if (!is_guest_addr_committed(NFSU2_KEYBOARD_BUFFER_GUEST_ADDR)) return;
-    for (int i = 0; i < 256; i++) {
-        g_mem[NFSU2_KEYBOARD_BUFFER_GUEST_ADDR + i] =
-            atomic_load_explicit(&g_keys[i], memory_order_acquire) ? 0x80 : 0x00;
-    }
+    /* Documented no-op: SPEED2.EXE reads DirectInput keyboard states through
+     * IDirectInputDevice8::GetDeviceState, which calls metal_fill_keyboard. */
 }
 
 void nfsu2_input_set_steering(float analog_x) {
@@ -128,4 +120,24 @@ void metal_fill_keyboard(unsigned char *dst, unsigned int n) {
  */
 int metal_available(void) {
     return 1;
+}
+
+void nfsu2_input_set_cursor(float host_x, float host_y, bool is_down) {
+    guest_cursor_set_host_pos(host_x, host_y, is_down);
+}
+
+void nfsu2_input_set_cursor_available(bool available) {
+    guest_cursor_set_available(available);
+}
+
+bool nfsu2_input_get_cursor(int *x, int *y) {
+    GuestCursorCoords coords = guest_cursor_get_coords();
+    if (x) *x = coords.x;
+    if (y) *y = coords.y;
+    return (guest_cursor_get_flags() & GUEST_CURSOR_FLAG_AVAILABLE) != 0;
+}
+
+void nfsu2_input_set_viewport(uint32_t viewport_w, uint32_t viewport_h,
+                               uint32_t game_w, uint32_t game_h) {
+    guest_cursor_set_viewport(viewport_w, viewport_h, game_w, game_h, GUEST_CURSOR_SCALE_FIT);
 }

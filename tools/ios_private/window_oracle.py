@@ -8,6 +8,7 @@ from typing import Any
 
 WINDOW_IMPORT_LIBRARY = "user32.dll"
 WINDOW_IMPORT_NAME = "GetWindowRect"
+SUPPORTED_WINDOW_QUERIES = frozenset(("GetWindowRect", "GetClientRect"))
 WINDOW_PROFILE = "headless_no_guest_window"
 IMPORT_BASE = 0xF0000000
 TEB_BASE = 0x00C00000
@@ -80,7 +81,7 @@ def _window_query_import(engine: Any, registers: Any, unicorn_module: Any,
     """
     library = str(row.get("library", ""))
     if (library.casefold() != WINDOW_IMPORT_LIBRARY or
-            row.get("name") != WINDOW_IMPORT_NAME):
+            row.get("name") not in SUPPORTED_WINDOW_QUERIES):
         return False
 
     esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
@@ -119,7 +120,7 @@ def _window_query_import(engine: Any, registers: Any, unicorn_module: Any,
 
     api = {
         "library": library,
-        "name": WINDOW_IMPORT_NAME,
+        "name": row["name"],
         "import_index": import_index,
         "tag": IMPORT_BASE + import_index,
         "call_ip": state["last_ip"],

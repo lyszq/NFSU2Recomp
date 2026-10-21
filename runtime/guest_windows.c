@@ -6,6 +6,7 @@
 #include "guest_process.h"
 #include "guest_locale.h"
 #include "guest_registry.h"
+#include "guest_cursor.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -278,7 +279,7 @@ static int set_guest_last_error(CPU *c, uint32_t error_code, uint32_t *fault) {
 }
 
 static int window_query_import(CPU *c, const GuestImport *import, uint32_t *fault) {
-    if (strcmp(import->name, "GetWindowRect")) return 0;
+    if (strcmp(import->name, "GetWindowRect") && strcmp(import->name, "GetClientRect")) return 0;
     const uint8_t *frame = guest_memory_pointer(c->esp, 12, 0);
     if (!frame) { *fault = c->esp; return -1; }
     uint32_t ret = read32(frame), window = read32(frame + 4);
@@ -771,8 +772,17 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
     if (!c || !import || !import->name || !import->library || !fault) return 0;
     if (!strcasecmp(import->library, "ADVAPI32.dll"))
         return guest_registry_import(c, import, fault);
-    if (!strcasecmp(import->library, "USER32.dll"))
-        return window_query_import(c, import, fault);
+    if (!strcasecmp(import->library, "USER32.dll")) {
+        int handled = window_query_import(c, import, fault);
+        if (handled) return handled;
+        handled = guest_user32_get_cursor_pos(c, import, fault);
+        if (handled) return handled;
+        handled = guest_user32_set_cursor_pos(c, import, fault);
+        if (handled) return handled;
+        handled = guest_user32_show_cursor(c, import, fault);
+        if (handled) return handled;
+        return 0;
+    }
     int version = !strcmp(import->name, "GetVersionExA");
     int module = !strcmp(import->name, "GetModuleHandleA");
     if (strcasecmp(import->library, "KERNEL32.dll")) return 0;
