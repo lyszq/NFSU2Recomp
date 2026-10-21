@@ -126,8 +126,9 @@ void guest_cursor_host_to_game(float host_x, float host_y, int32_t *game_x, int3
     if (gy < 0.0f) gy = 0.0f;
     if (gy > gh - 1.0f) gy = gh - 1.0f;
 
-    if (game_x) *game_x = (int32_t)lroundf(gx);
-    if (game_y) *game_y = (int32_t)lroundf(gy);
+    /* Positive coordinate rounding without requiring libm (e.g. lroundf) */
+    if (game_x) *game_x = (int32_t)(gx + 0.5f);
+    if (game_y) *game_y = (int32_t)(gy + 0.5f);
 }
 
 void guest_cursor_game_to_host(int32_t game_x, int32_t game_y, float *host_x, float *host_y) {
