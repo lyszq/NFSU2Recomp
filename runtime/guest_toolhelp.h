@@ -38,13 +38,16 @@ extern "C" {
 
 typedef struct GuestToolhelpSnapshot {
     uint32_t handle;
+    /* The current profile exposes only its single guest process (PID 100). */
     uint32_t process_id;
+    /* 0 before the row is returned; 1 after it has been returned. */
     uint32_t iter_index;
     uint32_t active;
 } GuestToolhelpSnapshot;
 
 typedef struct GuestToolhelpSet {
     GuestToolhelpSnapshot snapshots[GUEST_TOOLHELP_SNAPSHOT_LIMIT];
+    /* Must equal the number of canonical active slots. */
     uint32_t count;
 } GuestToolhelpSet;
 

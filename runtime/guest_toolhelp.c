@@ -53,6 +53,41 @@ void guest_toolhelp_cleanup(GuestToolhelpSet *set)
     }
 }
 
+/* Validate host-owned bookkeeping before trusting handles or changing it.
+ * A valid active row is tied to its fixed slot, the single guest process, and
+ * the two reachable enumeration states (before/after its one process row). */
+static int toolhelp_state_is_valid(const GuestToolhelpSet *toolhelp)
+{
+    if (!toolhelp || toolhelp->count > GUEST_TOOLHELP_SNAPSHOT_LIMIT) {
+        return 0;
+    }
+
+    uint32_t active_count = 0u;
+    for (uint32_t i = 0; i < GUEST_TOOLHELP_SNAPSHOT_LIMIT; ++i) {
+        const GuestToolhelpSnapshot *snap = &toolhelp->snapshots[i];
+        if (snap->active == 0u) {
+            if (snap->handle != 0u || snap->process_id != 0u || snap->iter_index != 0u) {
+                return 0;
+            }
+            continue;
+        }
+        if (snap->active != 1u ||
+            snap->handle != GUEST_TOOLHELP_HANDLE_BASE + i + 1u ||
+            snap->process_id != GUEST_TOOLHELP_DEFAULT_PID ||
+            snap->iter_index > 1u) {
+            return 0;
+        }
+        active_count++;
+    }
+    return active_count == toolhelp->count;
+}
+
+static int toolhelp_state_fault(uint32_t *fault)
+{
+    if (fault) *fault = 0u;
+    return -2;
+}
+
 int guest_toolhelp_close_handle(CPU *cpu, GuestToolhelpSet *toolhelp, uint32_t handle, uint32_t *fault)
 {
     if (!cpu || !toolhelp || !fault) {
@@ -62,6 +97,10 @@ int guest_toolhelp_close_handle(CPU *cpu, GuestToolhelpSet *toolhelp, uint32_t h
     if (handle < GUEST_TOOLHELP_HANDLE_BASE + 1u ||
         handle > GUEST_TOOLHELP_HANDLE_BASE + GUEST_TOOLHELP_SNAPSHOT_LIMIT) {
         return 0;
+    }
+
+    if (!toolhelp_state_is_valid(toolhelp)) {
+        return toolhelp_state_fault(fault);
     }
 
     uint32_t slot = (handle - GUEST_TOOLHELP_HANDLE_BASE) - 1u;
@@ -102,16 +141,18 @@ static int handle_create_toolhelp32_snapshot(CPU *cpu, GuestToolhelpSet *toolhel
     memcpy(frame, frame_ptr, sizeof(frame));
     uint32_t ret_ip = frame[0];
     uint32_t dwFlags = frame[1];
-    /* uint32_t th32ProcessID = frame[2]; */
+    /* th32ProcessID is ignored for a process-only snapshot. */
 
-    /* Only GUEST_TH32CS_SNAPPROCESS (or with INHERIT) allowed */
-    if ((dwFlags & ~GUEST_TH32CS_INHERIT) != GUEST_TH32CS_SNAPPROCESS) {
-        int err_rc = set_teb_last_error(cpu, GUEST_ERROR_INVALID_PARAMETER, fault);
-        if (err_rc) return err_rc;
-        cpu->eax = GUEST_INVALID_HANDLE_VALUE;
-        cpu->eip = ret_ip;
-        cpu->esp += 12u;
-        return 1;
+    /* This bounded implementation supports only process snapshots, optionally
+     * inheritable. Other flags may be valid Win32 requests, so leave them
+     * unsupported for the strict dispatcher instead of returning fake results. */
+    if (dwFlags != GUEST_TH32CS_SNAPPROCESS &&
+        dwFlags != (GUEST_TH32CS_SNAPPROCESS | GUEST_TH32CS_INHERIT)) {
+        return 0;
+    }
+
+    if (!toolhelp_state_is_valid(toolhelp)) {
+        return toolhelp_state_fault(fault);
     }
 
     /* Check capacity */
@@ -173,6 +214,10 @@ static int handle_process32_first(CPU *cpu, GuestToolhelpSet *toolhelp, uint32_t
     uint32_t ret_ip = frame[0];
     uint32_t hSnapshot = frame[1];
     uint32_t lppe = frame[2];
+
+    if (!toolhelp_state_is_valid(toolhelp)) {
+        return toolhelp_state_fault(fault);
+    }
 
     /* Lookup snapshot by handle */
     GuestToolhelpSnapshot *snap = NULL;
@@ -270,6 +315,10 @@ static int handle_process32_next(CPU *cpu, GuestToolhelpSet *toolhelp, uint32_t 
     uint32_t ret_ip = frame[0];
     uint32_t hSnapshot = frame[1];
     uint32_t lppe = frame[2];
+
+    if (!toolhelp_state_is_valid(toolhelp)) {
+        return toolhelp_state_fault(fault);
+    }
 
     /* Lookup snapshot by handle */
     GuestToolhelpSnapshot *snap = NULL;

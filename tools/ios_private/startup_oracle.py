@@ -61,9 +61,6 @@ TEB_PROCESS_ID_OFFSET = 0x20
 TEB_THREAD_ID_OFFSET = 0x24
 SYSTEM_TIME_FILETIME_LOW = 0x927c8000
 SYSTEM_TIME_FILETIME_HIGH = 0x01c4c66e
-TICK_COUNT_DEFAULT = 1000
-PERF_COUNTER_DEFAULT_LOW = 1000000
-PERF_COUNTER_DEFAULT_HIGH = 0
 TEB_TLS_SLOTS_OFFSET = 0xE10
 TLS_SLOT_COUNT = 64
 TLS_SLOT_BYTES = TLS_SLOT_COUNT * 4
@@ -106,6 +103,8 @@ BOUNDARY_ARGUMENT_COUNTS = {
     "GetLastError": 0,
     "SetLastError": 1,
     "QueryPerformanceFrequency": 1,
+    "GetCurrentProcess": 0,
+    "DuplicateHandle": 7,
     "GetStartupInfoA": 1,
     "GetStdHandle": 1,
     "GetFileType": 1,
@@ -194,6 +193,7 @@ SUPPORTED_IMPORTS = {
     ("kernel32.dll", "GetCurrentProcessId"),
     ("kernel32.dll", "GetTickCount"),
     ("kernel32.dll", "QueryPerformanceCounter"),
+    ("kernel32.dll", "QueryPerformanceFrequency"),
     ("kernel32.dll", "CreateToolhelp32Snapshot"),
     ("kernel32.dll", "Process32First"),
     ("kernel32.dll", "Process32Next"),
@@ -952,44 +952,6 @@ def _get_current_process_id(engine: Any, registers: Any, unicorn_module: Any,
         return False
 
 
-def _get_tick_count(engine: Any, registers: Any, unicorn_module: Any,
-                    import_row: dict[str, Any],
-                    mapped_ranges: list[tuple[int, int]],
-                    state: dict[str, Any]) -> bool:
-    """Return monotonic milliseconds count in EAX."""
-    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
-    api: dict[str, Any] = {
-        "library": import_row["library"],
-        "name": import_row["name"],
-        "import_index": import_row["index"],
-        "tag": IMPORT_BASE + import_row["index"],
-        "call_ip": state["last_ip"],
-        "esp_before": esp,
-        "argument_count": 0,
-    }
-    state["api_calls"].append(api)
-
-    try:
-        if not _range_has_permissions(engine, esp, 4,
-                                      unicorn_module.UC_PROT_READ, mapped_ranges):
-            raise _GuestPointerFault("read", esp, 4)
-        return_address = _read_u32(engine, esp)
-        api.update(return_address=return_address, arguments=[])
-        engine.reg_write(registers.UC_X86_REG_EAX, TICK_COUNT_DEFAULT)
-        engine.reg_write(registers.UC_X86_REG_ESP, esp + 4)
-        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
-        api.update(outcome="success", result=TICK_COUNT_DEFAULT,
-                   esp_after=(esp + 4) & 0xFFFFFFFF)
-        state["resume"] = True
-        return True
-    except _GuestPointerFault as exc:
-        access, address, size = exc.args
-        api["outcome"] = "invalid_pointer"
-        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
-        state["status"] = "GUEST_STOP_MEMORY"
-        state["target"] = int(address) & 0xFFFFFFFF
-        state["memory_fault"] = dict(api["fault"])
-        return False
 
 
 def _is_toolhelp_handle(engine: Any, xr: Any) -> bool:
@@ -1091,57 +1053,6 @@ def _set_last_error_api(engine: Any, registers: Any, unicorn_module: Any,
         return False
 
 
-def _query_performance_counter(engine: Any, registers: Any, unicorn_module: Any,
-                               import_row: dict[str, Any],
-                               mapped_ranges: list[tuple[int, int]],
-                               state: dict[str, Any]) -> bool:
-    """Write 64-bit performance counter value to pointer and return TRUE (1)."""
-    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
-    api: dict[str, Any] = {
-        "library": import_row["library"],
-        "name": import_row["name"],
-        "import_index": import_row["index"],
-        "tag": IMPORT_BASE + import_row["index"],
-        "call_ip": state["last_ip"],
-        "esp_before": esp,
-        "argument_count": 1,
-    }
-    state["api_calls"].append(api)
-
-    def write_fault(address: int, size: int) -> None:
-        if not _range_has_permissions(engine, address, size,
-                                      unicorn_module.UC_PROT_WRITE, mapped_ranges):
-            raise _GuestPointerFault("write", address & 0xFFFFFFFF, size)
-
-    try:
-        if not _range_has_permissions(engine, esp, 8,
-                                      unicorn_module.UC_PROT_READ, mapped_ranges):
-            raise _GuestPointerFault("read", esp, 8)
-        return_address = _read_u32(engine, esp)
-        target_ptr = _read_u32(engine, esp + 4)
-        api.update(return_address=return_address, target_ptr=target_ptr,
-                   arguments=[target_ptr])
-        if target_ptr == 0:
-            raise _GuestPointerFault("write", 0, 8)
-        write_fault(target_ptr, 8)
-        _write_u32(engine, target_ptr, PERF_COUNTER_DEFAULT_LOW)
-        _write_u32(engine, target_ptr + 4, PERF_COUNTER_DEFAULT_HIGH)
-
-        engine.reg_write(registers.UC_X86_REG_EAX, 1)  # TRUE
-        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
-        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
-        api.update(outcome="success", result=1,
-                   esp_after=(esp + 8) & 0xFFFFFFFF)
-        state["resume"] = True
-        return True
-    except _GuestPointerFault as exc:
-        access, address, size = exc.args
-        api["outcome"] = "invalid_pointer"
-        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
-        state["status"] = "GUEST_STOP_MEMORY"
-        state["target"] = int(address) & 0xFFFFFFFF
-        state["memory_fault"] = dict(api["fault"])
-        return False
 
 
 def _set_unhandled_exception_filter(engine: Any, registers: Any, unicorn_module: Any,
@@ -3362,6 +3273,8 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         "direct_calls": [],
         "indirect_jumps": [],
         "cpuid_calls": [],
+        "clock": {"mode": 1, "frequency": 1000000, "next": 1000000, "increment": 1000,
+                  "query_count": 0, "sample_count": 0, "trace_hash": FNV64_OFFSET},
         "virtual_tsc_next": 1000000,
         "virtual_tsc_increment": 1000,
         "rdtsc_calls": [],
@@ -3633,9 +3546,9 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
                         return True
                     _record_unsupported_import(address, index, row, engine, xr,
                                                mapped_ranges, state)
-                elif row["name"] == "GetTickCount":
-                    handled = _get_tick_count(engine, xr, uc, row,
-                                              mapped_ranges, state)
+                elif row["name"] in ("GetTickCount", "QueryPerformanceCounter", "QueryPerformanceFrequency"):
+                    from clock_oracle import handle_clock_import
+                    handled = handle_clock_import(engine, xr, uc, row, mapped_ranges, state)
                     if handled or state["status"] is not None:
                         engine.emu_stop()
                         return True
@@ -3666,14 +3579,6 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
                         engine.emu_stop()
                         return True
                     _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
-                elif row["name"] == "QueryPerformanceCounter":
-                    handled = _query_performance_counter(engine, xr, uc, row,
-                                                         mapped_ranges, state)
-                    if handled or state["status"] is not None:
-                        engine.emu_stop()
-                        return True
-                    _record_unsupported_import(address, index, row, engine, xr,
-                                               mapped_ranges, state)
                 else:
                     _record_unsupported_import(address, index, row, engine, xr,
                                                mapped_ranges, state)
@@ -3991,6 +3896,9 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
         "indirect_jumps": state["indirect_jumps"],
         "user_objects": state["user_objects"],
         "resource_missing_application_icon": state["resource_missing_application_icon"],
+        "toolhelp_snapshots": {str(handle): dict(snap) for handle, snap in state.get("snapshots", {}).items()},
+        "clock_profile": "deterministic_entry_clock_v1",
+        "clock": dict(state["clock"]),
         "cursor_profile": state["cursor_profile"],
         "cursor_fixture": list(state["cursor_coords"]),
         "virtual_tsc_profile": "deterministic_entry_tsc_v1",

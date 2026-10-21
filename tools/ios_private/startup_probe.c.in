@@ -36,6 +36,8 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     if (rc) goto failed;
     rc = guest_process_init(&windows.process, image);
     if (rc) goto failed;
+    rc = guest_clock_fixture_init(&windows.clock, UINT64_C(1000000), UINT64_C(1000000), UINT64_C(1000));
+    if (rc) goto failed;
     rc = guest_dispatch_init(&table, 0x00401000u, 0x00381af1u,
                              nfs_startup_addresses, nfs_startup_functions, nfs_startup_count);
     if (rc) goto failed;
@@ -65,6 +67,20 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     const uint32_t expected_blocks[][5]={@EXPECTED_BLOCKS@};
     unsigned heap_count=0, block_count=0;
     int metadata_match=1;
+    /* The entry fixture is explicit; normal Windows contexts use live time. */
+    if (windows.clock.mode != 1u || windows.clock.frequency != UINT64_C(@EXPECTED_CLOCK_FREQUENCY@) ||
+        windows.clock.next != UINT64_C(@EXPECTED_CLOCK_NEXT@) ||
+        windows.clock.increment != UINT64_C(@EXPECTED_CLOCK_INCREMENT@) ||
+        windows.clock.query_count != UINT64_C(@EXPECTED_CLOCK_QUERIES@) ||
+        windows.clock.sample_count != UINT64_C(@EXPECTED_CLOCK_SAMPLES@) ||
+        windows.clock.trace_hash != UINT64_C(@EXPECTED_CLOCK_HASH@)) metadata_match=0;
+    const uint32_t expected_snapshots[GUEST_TOOLHELP_SNAPSHOT_LIMIT][4] = {@EXPECTED_SNAPSHOTS@};
+    if (windows.toolhelp.count != @EXPECTED_SNAPSHOT_COUNT@) metadata_match=0;
+    for (unsigned i=0; i<GUEST_TOOLHELP_SNAPSHOT_LIMIT; ++i) {
+        const GuestToolhelpSnapshot *snap=&windows.toolhelp.snapshots[i];
+        const uint32_t actual[]={snap->handle,snap->process_id,snap->iter_index,snap->active};
+        if (memcmp(actual,expected_snapshots[i],sizeof actual)) metadata_match=0;
+    }
     const uint32_t expected_user_objects[GUEST_USER_OBJECT_LIMIT][6] = {@EXPECTED_USER_OBJECTS@};
     if (windows.user_objects.count != @EXPECTED_USER_OBJECT_COUNT@) metadata_match=0;
     for (unsigned i=0; i<GUEST_USER_OBJECT_LIMIT; ++i) {
@@ -145,7 +161,7 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
         "%" PRIu64 " instructions / %" PRIu64 " dispatch calls / %u registered functions | "
         "%" PRIu64 " implemented API calls / %u native critical sections / %u TLS keys | "
         "x86 trace + GPR/EFLAGS + image/TEB/stack/heap/process match | "
-        "leaf regression PASS | cursor fixture (320,180) | virtual TSC fixture | no JIT | no game boot",
+        "leaf regression PASS | cursor fixture (320,180) | virtual TSC + clock fixtures | no JIT | no game boot",
         result.ip, import->library, import->name, result.instructions, result.calls, nfs_startup_count,
         result.imports_handled,guest_critical_count(&windows.critical),guest_tls_count(&windows.tls));
     goto cleanup;

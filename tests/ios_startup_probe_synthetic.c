@@ -41,7 +41,8 @@ enum TestMode {
     MODE_BLOCK_COUNT,
     MODE_DEPTH,
     MODE_TARGET,
-    MODE_USER_OBJECTS
+    MODE_USER_OBJECTS,
+    MODE_TOOLHELP
 };
 
 static enum TestMode mode;
@@ -53,7 +54,7 @@ static int mode_from_arg(const char *name, enum TestMode *out) {
         {"process", MODE_PROCESS}, {"step_count", MODE_STEP_COUNT},
         {"call_count", MODE_CALL_COUNT}, {"api_count", MODE_API_COUNT},
         {"block_count", MODE_BLOCK_COUNT}, {"depth", MODE_DEPTH},
-        {"target", MODE_TARGET}, {"user_objects", MODE_USER_OBJECTS}
+        {"target", MODE_TARGET}, {"user_objects", MODE_USER_OBJECTS}, {"toolhelp", MODE_TOOLHELP}
     };
     for (size_t i = 0; i < sizeof modes / sizeof modes[0]; ++i) {
         if (strcmp(name, modes[i].name) == 0) {
@@ -154,6 +155,10 @@ int guest_windows_import(CPU *cpu, const GuestImport *import, void *context,
     if (!cpu || !import || !import->name || !context || !fault) return 0;
     GuestWindows *windows = context;
     if (strcmp(import->name, "HeapCreate") == 0) {
+        if (mode == MODE_TOOLHELP) windows->toolhelp.snapshots[0].process_id = 101u;
+        CPU clock_cpu = *cpu;
+        const GuestImport tick = {.library="KERNEL32.dll", .name="GetTickCount"};
+        if (guest_clock_import(&clock_cpu, &tick, &windows->clock, fault) != 1) abort();
         /* A typed virtual descriptor fixture; corruption changes no guest bytes,
          * counts or registers, so only the exact object-metadata check catches it. */
         windows->user_objects.count = 1;

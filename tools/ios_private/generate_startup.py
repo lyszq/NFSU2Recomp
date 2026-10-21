@@ -73,10 +73,10 @@ def generate(exe):
                for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
     reference = run_startup_reference(exe, imports, diagnostic_directory=ROOT / "gen/ios-private")
     # Registry, CPU capability, cursor, window and toolhelp snapshot contracts advance
-    # the explicit fixture prefix to its QueryPerformanceFrequency query. Native comparisons stay exact.
-    if (reference["import_name"] != "QueryPerformanceFrequency" or reference["raw_instructions"] != 217807
-            or reference["calls"] != 10509 or reference["api_call_count"] != 877
-            or reference["critical_section_count"] != 14
+    # the explicit fixture prefix to its GetCurrentProcess query. Native comparisons stay exact.
+    if (reference["import_name"] != "GetCurrentProcess" or reference["raw_instructions"] != 218676
+            or reference["calls"] != 10541 or reference["api_call_count"] != 884
+            or reference["critical_section_count"] != 15
             or reference["tls_slot_count"] != 1 or reference["tls_thread_count"] != 1):
         raise ValueError(f"unexpected independent x86 entry boundary: {reference['import_name']} {reference['instructions']}")
     # Prioritize the authentic observed startup path within the bounded static
@@ -143,7 +143,17 @@ def generate(exe):
                 "system_id": 32512, "module": 0, "shared": True}:
             raise ValueError("unexpected USER32 object profile")
         user_objects[slot] = [int(handle), 2, 2, 0, 32512, 1]
-    substitutions = {"EXPECTED_TSC_NEXT": str(reference["virtual_tsc_next"]),
+    snapshot_rows = [[0] * 4 for _ in range(8)]
+    for handle, snap in reference["toolhelp_snapshots"].items():
+        slot = int(handle) - 0x00d10001
+        if not 0 <= slot < 8 or snap["process_id"] != 100 or snap["iter_index"] not in (0,1):
+            raise ValueError("unexpected Toolhelp guest snapshot profile")
+        snapshot_rows[slot] = [int(handle), snap["process_id"], snap["iter_index"], 1]
+    substitutions = {"EXPECTED_SNAPSHOT_COUNT": str(len(reference["toolhelp_snapshots"])),
+                     "EXPECTED_SNAPSHOTS": ",".join("{"+",".join(str(x)+"u" for x in row)+"}" for row in snapshot_rows), **{"EXPECTED_CLOCK_" + key: str(reference["clock"][field]) for key, field in
+                        [("FREQUENCY","frequency"),("NEXT","next"),("INCREMENT","increment"),
+                         ("QUERIES","query_count"),("SAMPLES","sample_count"),("HASH","trace_hash")]},
+                     "EXPECTED_TSC_NEXT": str(reference["virtual_tsc_next"]),
                      "EXPECTED_TSC_READS": str(len(reference["rdtsc_calls"])),
                      "EXPECTED_TSC_HASH": str(reference["virtual_tsc_hash"]),
                      "EXPECTED_USER_OBJECT_COUNT": str(len(reference["user_objects"])),

@@ -8,6 +8,7 @@
 #include "guest_locale.h"
 #include "guest_user_objects.h"
 #include "guest_toolhelp.h"
+#include "guest_clock.h"
 /* Explicit guest Windows XP compatibility policy, independent of the host OS.
  * Only implemented contracts are serviced. No unknown API success fallback.
  * Caller supplies the bootstrap TEB and serializes the guest thread/heap state.
@@ -23,6 +24,7 @@ typedef struct GuestWindows {
     GuestTLSSet tls;
     GuestProcess process;
     GuestToolhelpSet toolhelp;
+    GuestClock clock;
     uint32_t unhandled_exception_filter;
 } GuestWindows;
 int guest_user32_get_system_metrics(CPU *cpu, const GuestImport *import,

@@ -101,6 +101,32 @@ def _api_state_fault(state: dict[str, Any], api_name: str, address: int,
     }
 
 
+def _validated_snapshot_table(state: dict[str, Any], api_name: str
+                              ) -> dict[int, dict[str, int]] | None:
+    """Validate the bounded one-process snapshot table before using it."""
+    if "snapshots" not in state:
+        return {}
+    snapshots = state["snapshots"]
+    valid = isinstance(snapshots, dict) and len(snapshots) <= MAX_SNAPSHOTS
+    if valid:
+        for handle, row in snapshots.items():
+            if (type(handle) is not int or
+                    handle < SNAPSHOT_HANDLE_MIN or
+                    handle > SNAPSHOT_HANDLE_MAX or
+                    type(row) is not dict or
+                    set(row) != {"iter_index", "process_id"} or
+                    type(row["process_id"]) is not int or
+                    row["process_id"] != DEFAULT_PROCESS_ID or
+                    type(row["iter_index"]) is not int or
+                    row["iter_index"] not in (0, 1)):
+                valid = False
+                break
+    if not valid:
+        _api_state_fault(state, api_name, 0, "toolhelp_snapshot_table_invalid")
+        return None
+    return snapshots
+
+
 def _check_memory_access(engine: Any, unicorn_module: Any,
                          address: int, size: int,
                          permissions: int, access_type: str,
@@ -204,21 +230,13 @@ def create_toolhelp32_snapshot(engine: Any, registers: Any, unicorn_module: Any,
     return_address, dw_flags, th32_process_id = struct.unpack("<III", frame)
 
     if dw_flags not in ALLOWED_SNAPSHOT_FLAGS:
-        if not _set_last_error(
-                engine, registers, unicorn_module, mapped_ranges, state,
-                SNAPSHOT_IMPORT_NAME, ERROR_INVALID_PARAMETER):
-            return False
-        _record_api(
-            state, row, SNAPSHOT_IMPORT_NAME, [dw_flags, th32_process_id],
-            INVALID_HANDLE_VALUE, ERROR_INVALID_PARAMETER, "invalid_flags",
-            esp, 2, return_address)
-        engine.reg_write(registers.UC_X86_REG_EAX, INVALID_HANDLE_VALUE)
-        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
-        engine.reg_write(registers.UC_X86_REG_ESP, (esp + 12) & 0xFFFFFFFF)
-        state["resume"] = True
-        return True
+        # These may be valid Win32 snapshot requests, but this fixture models
+        # only process snapshots. Leave them for the strict unsupported path.
+        return False
 
-    snapshots = state.setdefault("snapshots", {})
+    snapshots = _validated_snapshot_table(state, SNAPSHOT_IMPORT_NAME)
+    if snapshots is None:
+        return False
     if len(snapshots) >= MAX_SNAPSHOTS:
         if not _set_last_error(
                 engine, registers, unicorn_module, mapped_ranges, state,
@@ -258,8 +276,9 @@ def create_toolhelp32_snapshot(engine: Any, registers: Any, unicorn_module: Any,
 
     snapshots[allocated_handle] = {
         "iter_index": 0,
-        "process_id": DEFAULT_PROCESS_ID if th32_process_id == 0 else th32_process_id,
+        "process_id": DEFAULT_PROCESS_ID,
     }
+    state["snapshots"] = snapshots
 
     _record_api(
         state, row, SNAPSHOT_IMPORT_NAME, [dw_flags, th32_process_id],
@@ -291,7 +310,9 @@ def process32_first(engine: Any, registers: Any, unicorn_module: Any,
     frame = bytes(engine.mem_read(esp, 12))
     return_address, h_snapshot, lppe = struct.unpack("<III", frame)
 
-    snapshots = state.setdefault("snapshots", {})
+    snapshots = _validated_snapshot_table(state, PROCESS_FIRST_IMPORT_NAME)
+    if snapshots is None:
+        return False
     if h_snapshot not in snapshots:
         if not _set_last_error(
                 engine, registers, unicorn_module, mapped_ranges, state,
@@ -380,7 +401,9 @@ def process32_next(engine: Any, registers: Any, unicorn_module: Any,
     frame = bytes(engine.mem_read(esp, 12))
     return_address, h_snapshot, lppe = struct.unpack("<III", frame)
 
-    snapshots = state.setdefault("snapshots", {})
+    snapshots = _validated_snapshot_table(state, PROCESS_NEXT_IMPORT_NAME)
+    if snapshots is None:
+        return False
     if h_snapshot not in snapshots:
         if not _set_last_error(
                 engine, registers, unicorn_module, mapped_ranges, state,
@@ -487,7 +510,9 @@ def toolhelp_close_handle(engine: Any, registers: Any, unicorn_module: Any,
     if h_object < SNAPSHOT_HANDLE_MIN or h_object > SNAPSHOT_HANDLE_MAX:
         return False
 
-    snapshots = state.setdefault("snapshots", {})
+    snapshots = _validated_snapshot_table(state, CLOSE_HANDLE_IMPORT_NAME)
+    if snapshots is None:
+        return False
     if h_object in snapshots:
         del snapshots[h_object]
         _record_api(

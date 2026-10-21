@@ -211,12 +211,12 @@ static int test_toolhelp_init_cleanup(void)
         CHECK(set.snapshots[i].iter_index == 0u);
     }
 
-    puts("PASS [1/11]: test_toolhelp_init_cleanup");
+    puts("PASS [1/12]: test_toolhelp_init_cleanup");
     return 0;
 }
 
 /* 2. test_snapshot_create_success:
- *    verifies CreateToolhelp32Snapshot(2, 0) returns a valid handle in
+ *    verifies CreateToolhelp32Snapshot(2, nonzero PID) returns a valid handle in
  *    0x00D10001..0x00D10008, advances ESP by 12, sets EAX=handle.
  */
 static int test_snapshot_create_success(void)
@@ -228,7 +228,7 @@ static int test_snapshot_create_success(void)
     init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
     set_last_error(&cpu, LAST_ERROR_SENTINEL);
 
-    CHECK(!write_stack_frame(STACK_ADDR, RETURN_ADDR, GUEST_TH32CS_SNAPPROCESS, 0u));
+    CHECK(!write_stack_frame(STACK_ADDR, RETURN_ADDR, GUEST_TH32CS_SNAPPROCESS, 1234u));
     before = cpu;
 
     uint32_t fault = 0xdeadbeefu;
@@ -262,7 +262,7 @@ static int test_snapshot_create_success(void)
 
     /* Also verify creating with TH32CS_SNAPPROCESS | TH32CS_INHERIT works */
     CHECK(!write_stack_frame(cpu.esp, RETURN_ADDR + 4u,
-                             GUEST_TH32CS_SNAPPROCESS | GUEST_TH32CS_INHERIT, 0u));
+                             GUEST_TH32CS_SNAPPROCESS | GUEST_TH32CS_INHERIT, 5678u));
     before = cpu;
     rc = guest_toolhelp_import(&cpu, &API_CREATE_SNAPSHOT, &set, &fault);
     CHECK(rc == 1);
@@ -272,14 +272,12 @@ static int test_snapshot_create_success(void)
     CHECK(set.count == 2u);
 
     guest_toolhelp_cleanup(&set);
-    puts("PASS [2/11]: test_snapshot_create_success");
+    puts("PASS [2/12]: test_snapshot_create_success");
     return 0;
 }
 
-/* 3. test_snapshot_create_invalid_flags:
- *    flags=4 returns INVALID_HANDLE_VALUE (-1), sets LastError to 87 (GUEST_ERROR_INVALID_PARAMETER).
- */
-static int test_snapshot_create_invalid_flags(void)
+/* 3. Unsupported snapshot requests remain unhandled and leave state untouched. */
+static int test_snapshot_create_unsupported_flags(void)
 {
     GuestToolhelpSet set;
     guest_toolhelp_init(&set);
@@ -288,37 +286,112 @@ static int test_snapshot_create_invalid_flags(void)
     init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
     set_last_error(&cpu, LAST_ERROR_SENTINEL);
 
-    /* flags = 4 is TH32CS_SNAPTHREAD, unsupported by design for single-binary instance guard */
-    CHECK(!write_stack_frame(STACK_ADDR, RETURN_ADDR, 4u, 0u));
-    before = cpu;
-
-    uint32_t fault = 0xdeadbeefu;
-    int rc = guest_toolhelp_import(&cpu, &API_CREATE_SNAPSHOT, &set, &fault);
-    CHECK(rc == 1);
-    CHECK(cpu.eax == GUEST_INVALID_HANDLE_VALUE);
-    CHECK(cpu.esp == before.esp + 12u);
-    CHECK(cpu.eip == RETURN_ADDR);
-    CHECK(get_last_error(&cpu) == GUEST_ERROR_INVALID_PARAMETER);
-    CHECK(set.count == 0u);
-
-    /* Verify flags = 0 also fails with invalid parameter */
-    cpu.esp = STACK_ADDR;
-    CHECK(!write_stack_frame(STACK_ADDR, RETURN_ADDR + 8u, 0u, 0u));
-    before = cpu;
-    rc = guest_toolhelp_import(&cpu, &API_CREATE_SNAPSHOT, &set, &fault);
-    CHECK(rc == 1);
-    CHECK(cpu.eax == GUEST_INVALID_HANDLE_VALUE);
-    CHECK(cpu.esp == before.esp + 12u);
-    CHECK(cpu.eip == RETURN_ADDR + 8u);
-    CHECK(get_last_error(&cpu) == GUEST_ERROR_INVALID_PARAMETER);
-    CHECK(set.count == 0u);
+    const uint32_t unsupported_flags[] = {
+        0u, 1u, 4u, 8u, 16u, 6u, 0x12345678u, GUEST_TH32CS_INHERIT
+    };
+    for (size_t i = 0; i < sizeof(unsupported_flags) / sizeof(unsupported_flags[0]); ++i) {
+        CHECK(!write_stack_frame(STACK_ADDR, RETURN_ADDR + (uint32_t)(i * 4u),
+                                 unsupported_flags[i], 0u));
+        before = cpu;
+        GuestToolhelpSet set_before = set;
+        uint32_t fault = 0xdeadbeefu;
+        int rc = guest_toolhelp_import(&cpu, &API_CREATE_SNAPSHOT, &set, &fault);
+        CHECK(rc == 0);
+        CHECK(!memcmp(&cpu, &before, sizeof(cpu)));
+        CHECK(!memcmp(&set, &set_before, sizeof(set)));
+        CHECK(fault == 0xdeadbeefu);
+        CHECK(get_last_error(&cpu) == LAST_ERROR_SENTINEL);
+    }
 
     guest_toolhelp_cleanup(&set);
-    puts("PASS [3/11]: test_snapshot_create_invalid_flags");
+    puts("PASS [3/12]: test_snapshot_create_unsupported_flags");
     return 0;
 }
 
-/* 4. test_snapshot_create_capacity_limit:
+/* 4. Corrupt host bookkeeping stops without changing CPU, guest memory, or table. */
+static int test_corrupted_snapshot_state(void)
+{
+    GuestToolhelpSet set;
+    guest_toolhelp_init(&set);
+    CPU cpu, before;
+    init_cpu(&cpu, STACK_ADDR, TEB_ADDR);
+    set_last_error(&cpu, LAST_ERROR_SENTINEL);
+
+    CHECK(!write_stack_frame(STACK_ADDR, RETURN_ADDR, GUEST_TH32CS_SNAPPROCESS, 1234u));
+    set.count = 1u; /* No active row: count disagrees with the slots. */
+    before = cpu;
+    GuestToolhelpSet set_before = set;
+    uint32_t fault = 0xdeadbeefu;
+    int rc = guest_toolhelp_import(&cpu, &API_CREATE_SNAPSHOT, &set, &fault);
+    CHECK(rc == -2);
+    CHECK(fault == 0u);
+    CHECK(!memcmp(&cpu, &before, sizeof(cpu)));
+    CHECK(!memcmp(&set, &set_before, sizeof(set)));
+    CHECK(get_last_error(&cpu) == LAST_ERROR_SENTINEL);
+
+    /* Inactive rows must be entirely zeroed, not just marked inactive. */
+    guest_toolhelp_init(&set);
+    set.snapshots[0].process_id = 100u;
+    CHECK(!write_stack_frame(STACK_ADDR, RETURN_ADDR + 4u,
+                             GUEST_TH32CS_SNAPPROCESS, 0u));
+    before = cpu;
+    set_before = set;
+    fault = 0xdeadbeefu;
+    rc = guest_toolhelp_import(&cpu, &API_CREATE_SNAPSHOT, &set, &fault);
+    CHECK(rc == -2);
+    CHECK(fault == 0u);
+    CHECK(!memcmp(&cpu, &before, sizeof(cpu)));
+    CHECK(!memcmp(&set, &set_before, sizeof(set)));
+    CHECK(get_last_error(&cpu) == LAST_ERROR_SENTINEL);
+
+    /* Active records must identify the fixed guest PID and reachable iterator state. */
+    guest_toolhelp_init(&set);
+    set.count = 1u;
+    set.snapshots[0].active = 1u;
+    set.snapshots[0].handle = GUEST_TOOLHELP_HANDLE_BASE + 1u;
+    set.snapshots[0].process_id = 101u;
+    set.snapshots[0].iter_index = 0u;
+    uint32_t size = GUEST_PROCESSENTRY32_SIZE;
+    void *size_pointer = guest_memory_pointer(BUFFER_ADDR, sizeof(size), 1);
+    CHECK(size_pointer != NULL);
+    memcpy(size_pointer, &size, sizeof(size));
+    CHECK(!write_stack_frame(STACK_ADDR, RETURN_ADDR + 8u,
+                             GUEST_TOOLHELP_HANDLE_BASE + 1u, BUFFER_ADDR));
+    before = cpu;
+    set_before = set;
+    uint8_t buffer_before[GUEST_PROCESSENTRY32_SIZE];
+    const void *buffer_pointer = guest_memory_pointer(BUFFER_ADDR, sizeof(buffer_before), 0);
+    CHECK(buffer_pointer != NULL);
+    memcpy(buffer_before, buffer_pointer, sizeof(buffer_before));
+    fault = 0xdeadbeefu;
+    rc = guest_toolhelp_import(&cpu, &API_PROCESS32_FIRST, &set, &fault);
+    CHECK(rc == -2);
+    CHECK(fault == 0u);
+    CHECK(!memcmp(&cpu, &before, sizeof(cpu)));
+    CHECK(!memcmp(&set, &set_before, sizeof(set)));
+    buffer_pointer = guest_memory_pointer(BUFFER_ADDR, sizeof(buffer_before), 0);
+    CHECK(buffer_pointer != NULL);
+    CHECK(!memcmp(buffer_before, buffer_pointer, sizeof(buffer_before)));
+    CHECK(get_last_error(&cpu) == LAST_ERROR_SENTINEL);
+
+    /* Foreign handles pass through before the malformed table is inspected. */
+    set.count = 0u;
+    set_before = set;
+    CHECK(!write_close_frame(STACK_ADDR, RETURN_ADDR + 12u, 0x12345678u));
+    before = cpu;
+    fault = 0xdeadbeefu;
+    rc = guest_toolhelp_import(&cpu, &API_CLOSE_HANDLE, &set, &fault);
+    CHECK(rc == 0);
+    CHECK(!memcmp(&cpu, &before, sizeof(cpu)));
+    CHECK(!memcmp(&set, &set_before, sizeof(set)));
+    CHECK(get_last_error(&cpu) == LAST_ERROR_SENTINEL);
+
+    guest_toolhelp_cleanup(&set);
+    puts("PASS [4/12]: test_corrupted_snapshot_state");
+    return 0;
+}
+
+/* 5. test_snapshot_create_capacity_limit:
  *    creating 8 snapshots succeeds; the 9th returns -1 and sets LastError.
  */
 static int test_snapshot_create_capacity_limit(void)
@@ -368,7 +441,7 @@ static int test_snapshot_create_capacity_limit(void)
     CHECK(set.count == GUEST_TOOLHELP_SNAPSHOT_LIMIT);
 
     guest_toolhelp_cleanup(&set);
-    puts("PASS [4/11]: test_snapshot_create_capacity_limit");
+    puts("PASS [5/12]: test_snapshot_create_capacity_limit");
     return 0;
 }
 
@@ -437,7 +510,7 @@ static int test_process32first_success(void)
     CHECK(set.snapshots[0].iter_index == 1u);
 
     guest_toolhelp_cleanup(&set);
-    puts("PASS [5/11]: test_process32first_success");
+    puts("PASS [6/12]: test_process32first_success");
     return 0;
 }
 
@@ -480,7 +553,7 @@ static int test_process32first_insufficient_buffer(void)
     CHECK(set.snapshots[0].iter_index == 0u);
 
     guest_toolhelp_cleanup(&set);
-    puts("PASS [6/11]: test_process32first_insufficient_buffer");
+    puts("PASS [7/12]: test_process32first_insufficient_buffer");
     return 0;
 }
 
@@ -527,7 +600,7 @@ static int test_process32first_invalid_handle(void)
     }
 
     guest_toolhelp_cleanup(&set);
-    puts("PASS [7/11]: test_process32first_invalid_handle");
+    puts("PASS [8/12]: test_process32first_invalid_handle");
     return 0;
 }
 
@@ -604,7 +677,7 @@ static int test_process32next_end_of_enumeration(void)
     CHECK(get_last_error(&cpu) == GUEST_ERROR_INSUFFICIENT_BUFFER);
 
     guest_toolhelp_cleanup(&set);
-    puts("PASS [8/11]: test_process32next_end_of_enumeration");
+    puts("PASS [9/12]: test_process32next_end_of_enumeration");
     return 0;
 }
 
@@ -683,7 +756,7 @@ static int test_close_handle_success_and_reuse(void)
     CHECK(set.snapshots[1].active == 1u);
 
     guest_toolhelp_cleanup(&set);
-    puts("PASS [9/11]: test_close_handle_success_and_reuse");
+    puts("PASS [10/12]: test_close_handle_success_and_reuse");
     return 0;
 }
 
@@ -734,11 +807,11 @@ static int test_close_handle_non_toolhelp(void)
     }
 
     guest_toolhelp_cleanup(&set);
-    puts("PASS [10/11]: test_close_handle_non_toolhelp");
+    puts("PASS [11/12]: test_close_handle_non_toolhelp");
     return 0;
 }
 
-/* 11. test_memory_faults:
+/* 12. test_memory_faults:
  *     stack frame at uncommitted address returns -1 with correct *fault.
  */
 static int test_memory_faults(void)
@@ -831,24 +904,24 @@ static int test_memory_faults(void)
     CHECK(fault == UNCOMMITTED_ADDR);
     CHECK(!memcmp(&cpu, &before, sizeof(cpu)));
 
-    /* J. Setting LastError when TEB is uncommitted returns -1 with fault = TEB + 0x34 */
+    /* J. Setting LastError for an invalid in-range handle with an uncommitted TEB faults. */
     init_cpu(&cpu, STACK_ADDR, UNCOMMITTED_ADDR);
-    CHECK(!write_stack_frame(STACK_ADDR, RETURN_ADDR, 4u, 0u)); /* invalid flags */
+    CHECK(!write_close_frame(STACK_ADDR, RETURN_ADDR, GUEST_TOOLHELP_HANDLE_BASE + 8u));
     fault = 0xdeadbeefu;
-    rc = guest_toolhelp_import(&cpu, &API_CREATE_SNAPSHOT, &set, &fault);
+    rc = guest_toolhelp_import(&cpu, &API_CLOSE_HANDLE, &set, &fault);
     CHECK(rc == -1);
     CHECK(fault == UNCOMMITTED_ADDR + LAST_ERROR_OFFSET);
 
-    /* K. fs_base == 0 returns -2 */
+    /* K. fs_base == 0 returns -2 when reporting an invalid in-range handle. */
     init_cpu(&cpu, STACK_ADDR, 0u);
-    CHECK(!write_stack_frame(STACK_ADDR, RETURN_ADDR, 4u, 0u));
+    CHECK(!write_close_frame(STACK_ADDR, RETURN_ADDR, GUEST_TOOLHELP_HANDLE_BASE + 8u));
     fault = 0xdeadbeefu;
-    rc = guest_toolhelp_import(&cpu, &API_CREATE_SNAPSHOT, &set, &fault);
+    rc = guest_toolhelp_import(&cpu, &API_CLOSE_HANDLE, &set, &fault);
     CHECK(rc == -2);
     CHECK(fault == 0u);
 
     guest_toolhelp_cleanup(&set);
-    puts("PASS [11/11]: test_memory_faults");
+    puts("PASS [12/12]: test_memory_faults");
     return 0;
 }
 
@@ -867,7 +940,8 @@ int main(void)
 
     CHECK(!test_toolhelp_init_cleanup());
     CHECK(!test_snapshot_create_success());
-    CHECK(!test_snapshot_create_invalid_flags());
+    CHECK(!test_snapshot_create_unsupported_flags());
+    CHECK(!test_corrupted_snapshot_state());
     CHECK(!test_snapshot_create_capacity_limit());
     CHECK(!test_process32first_success());
     CHECK(!test_process32first_insufficient_buffer());
@@ -879,6 +953,6 @@ int main(void)
 
     mock_memory_reset();
 
-    printf("\nALL 11 NATIVE TOOLHELP TESTS PASSED!\n");
+    printf("\nALL 12 NATIVE TOOLHELP TESTS PASSED!\n");
     return 0;
 }

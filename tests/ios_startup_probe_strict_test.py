@@ -111,8 +111,16 @@ def substitutions() -> dict[str, str]:
         "EXPECTED_BLOCKS": f"{{0u,0u,{HEAP_BLOCK}u,16u,16u}}",
         "EXPECTED_CALLS": "4u",
         "EXPECTED_DEPTH": "1u",
+        "EXPECTED_SNAPSHOT_COUNT": "0u",
+        "EXPECTED_SNAPSHOTS": ",".join("{0u,0u,0u,0u}" for _ in range(8)),
         "EXPECTED_USER_OBJECT_COUNT": "1u",
         "EXPECTED_USER_OBJECTS": "{0x00b10001u,2u,2u,0u,32512u,1u}," + ",".join("{0u,0u,0u,0u,0u,0u}" for _ in range(7)),
+        "EXPECTED_CLOCK_FREQUENCY": "1000000",
+        "EXPECTED_CLOCK_NEXT": "1001000",
+        "EXPECTED_CLOCK_INCREMENT": "1000",
+        "EXPECTED_CLOCK_QUERIES": "1",
+        "EXPECTED_CLOCK_SAMPLES": "1",
+        "EXPECTED_CLOCK_HASH": str(trace_hash([3,1000])),
         "EXPECTED_TSC_NEXT": "1002000",
         "EXPECTED_TSC_READS": "2",
         "EXPECTED_TSC_HASH": f"0x{EXPECTED_TSC_HASH:016x}",
@@ -151,6 +159,7 @@ def compile_case(directory: Path, name: str, base: dict[str, str],
         CC, "-O1", "-std=gnu11", "-Wall", "-Wextra", "-Werror", "-pthread",
         f"-I{ROOT / 'runtime'}", str(FIXTURE), str(source),
         str(ROOT / "runtime/guest_execution.c"),
+        str(ROOT / "runtime/guest_clock.c"),
         str(ROOT / "runtime/guest_dispatch.c"),
         str(ROOT / "runtime/guest_bootstrap.c"),
         str(ROOT / "runtime/guest_memory.c"),
@@ -199,6 +208,7 @@ def main() -> int:
         "apis_only": {"EXPECTED_CALLS": "5u", "EXPECTED_GPRS": gpr_after_extra_api},
         "heap_blocks_only": {"EXPECTED_GPRS": registers(0, BASE_STACK_ESP)},
         "depth_only": {"EXPECTED_CALLS": "5u"},
+        "clock_hash": {"EXPECTED_CLOCK_HASH": str(trace_hash([3,1000]) ^ 1)},
         "tsc_hash": {"EXPECTED_TSC_HASH": f"0x{EXPECTED_TSC_HASH ^ 1:016x}"},
     }
     with tempfile.TemporaryDirectory(prefix="ios-startup-probe-", dir=build_root) as tmp:
@@ -212,10 +222,10 @@ def main() -> int:
         rejected = [
             ("trace", "baseline"), ("image", "baseline"), ("teb", "baseline"),
             ("stack", "baseline"), ("heap", "baseline"), ("process", "baseline"),
-            ("target", "baseline"), ("user_objects", "baseline"), ("step_count", "steps_only"),
+            ("target", "baseline"), ("user_objects", "baseline"), ("toolhelp", "baseline"), ("step_count", "steps_only"),
             ("call_count", "calls_only"), ("api_count", "apis_only"),
             ("block_count", "heap_blocks_only"), ("depth", "depth_only"),
-            ("valid", "tsc_hash"),
+            ("valid", "tsc_hash"), ("valid", "clock_hash"),
         ]
         for mode, variant in rejected:
             run_case(binaries[variant], mode, False)

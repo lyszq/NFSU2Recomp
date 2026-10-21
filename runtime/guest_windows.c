@@ -44,8 +44,6 @@ static int identity_import(CPU *c,const GuestImport *import,uint32_t *fault) {
 
 #define GUEST_FILETIME_LOW  0x927c8000u
 #define GUEST_FILETIME_HIGH 0x01c4c66eu
-#define GUEST_TICK_COUNT    1000u
-#define GUEST_PERF_COUNT    1000000ULL
 
 static int processor_feature_import(CPU *c, const GuestImport *import, uint32_t *fault) {
     if (strcmp(import->name, "IsProcessorFeaturePresent")) return 0;
@@ -61,58 +59,16 @@ static int processor_feature_import(CPU *c, const GuestImport *import, uint32_t 
 }
 
 static int handle_time_import(CPU *c, const GuestImport *import, uint32_t *fault) {
-    int is_filetime = !strcmp(import->name, "GetSystemTimeAsFileTime");
-    int is_tick = !strcmp(import->name, "GetTickCount");
-    int is_perf = !strcmp(import->name, "QueryPerformanceCounter");
-    if (!is_filetime && !is_tick && !is_perf) return 0;
-
-    if (is_tick) {
-        if ((uint64_t)c->esp + 4ULL > 0x100000000ULL) { *fault = c->esp; return -1; }
-        const void *stack = guest_memory_pointer(c->esp, 4, 0);
-        if (!stack) { *fault = c->esp; return -1; }
-        uint32_t ret = read32(stack);
-        c->eax = GUEST_TICK_COUNT;
-        c->eip = ret;
-        c->esp += 4u;
-        return 1;
-    }
-
-    if ((uint64_t)c->esp + 8ULL > 0x100000000ULL) { *fault = c->esp; return -1; }
-    const uint8_t *stack = guest_memory_pointer(c->esp, 8, 0);
-    if (!stack) { *fault = c->esp; return -1; }
-    uint32_t ret = read32(stack);
-    uint32_t target_ptr = read32(stack + 4);
-
-    if (is_filetime) {
-        if (!target_ptr || (uint64_t)target_ptr + 8ULL > 0x100000000ULL) {
-            *fault = target_ptr;
-            return -1;
-        }
-        uint8_t *out = guest_memory_pointer(target_ptr, 8, 1);
-        if (!out) { *fault = target_ptr; return -1; }
-        write32(out, GUEST_FILETIME_LOW);
-        write32(out + 4, GUEST_FILETIME_HIGH);
-        c->eip = ret;
-        c->esp += 8u;
-        return 1;
-    }
-
-    if (is_perf) {
-        if (!target_ptr || (uint64_t)target_ptr + 8ULL > 0x100000000ULL) {
-            *fault = target_ptr;
-            return -1;
-        }
-        uint8_t *out = guest_memory_pointer(target_ptr, 8, 1);
-        if (!out) { *fault = target_ptr; return -1; }
-        write32(out, (uint32_t)(GUEST_PERF_COUNT & 0xFFFFFFFFu));
-        write32(out + 4, (uint32_t)(GUEST_PERF_COUNT >> 32));
-        c->eax = 1; /* TRUE */
-        c->eip = ret;
-        c->esp += 8u;
-        return 1;
-    }
-
-    return 0;
+    if (strcmp(import->name, "GetSystemTimeAsFileTime")) return 0;
+    const uint8_t *frame = guest_memory_pointer(c->esp, 8, 0);
+    if (!frame) { *fault = c->esp; return -1; }
+    uint32_t ret = read32(frame), target = read32(frame + 4);
+    uint8_t *out = target ? guest_memory_pointer(target, 8, 1) : NULL;
+    if (!out) { *fault = target; return -1; }
+    write32(out, GUEST_FILETIME_LOW);
+    write32(out + 4, GUEST_FILETIME_HIGH);
+    c->eip = ret; c->esp += 8u;
+    return 1;
 }
 static int tls_import(CPU *c,const GuestImport *import,GuestWindows *windows,uint32_t *fault) {
     GuestTLSOperation op; unsigned nargs;
@@ -830,6 +786,11 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
         if (handled) return handled;
         handled=identity_import(c,import,fault);
         if (handled) return handled;
+        /* A missing Windows context still uses the live provider, never a
+         * deterministic fixture. Stateful guest executions supply windows. */
+        GuestClock fallback_clock = {0};
+        handled=guest_clock_import(c,import,context ? &((GuestWindows *)context)->clock : &fallback_clock,fault);
+        if (handled) return handled;
         handled=handle_time_import(c,import,fault);
         if (handled) return handled;
         handled=processor_feature_import(c,import,fault);
@@ -918,6 +879,7 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
 int guest_windows_cleanup(GuestWindows *windows) {
     if (!windows) return EINVAL;
     windows->unhandled_exception_filter = 0;
+    memset(&windows->clock, 0, sizeof windows->clock);
     guest_user_objects_cleanup(&windows->user_objects);
     guest_toolhelp_cleanup(&windows->toolhelp);
     guest_process_cleanup(&windows->process);

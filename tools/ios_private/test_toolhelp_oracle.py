@@ -25,7 +25,6 @@ from toolhelp_oracle import (
     TOOLHELP_PROFILE,
     TH32CS_SNAPPROCESS,
     TH32CS_INHERIT,
-    ALLOWED_SNAPSHOT_FLAGS,
     SNAPSHOT_HANDLE_BASE,
     SNAPSHOT_HANDLE_MIN,
     SNAPSHOT_HANDLE_MAX,
@@ -38,7 +37,6 @@ from toolhelp_oracle import (
     DEFAULT_EXE_NAME,
     ERROR_INVALID_HANDLE,
     ERROR_NO_MORE_FILES,
-    ERROR_INVALID_PARAMETER,
     ERROR_INSUFFICIENT_BUFFER,
     TEB_BASE,
     LAST_ERROR_OFFSET,
@@ -231,8 +229,8 @@ class ToolhelpOracleTests(unittest.TestCase):
         self.assert_other_registers_preserved(regs_before)
         self.assertNotIn(snapshot_handle, self.state["snapshots"])
 
-    def test_snapshot_inherit_flag_accepted(self) -> None:
-        """CreateToolhelp32Snapshot accepts TH32CS_SNAPPROCESS | TH32CS_INHERIT."""
+    def test_snapshot_process_id_is_ignored(self) -> None:
+        """Process-only snapshots ignore th32ProcessID, including with INHERIT."""
         esp_init = STACK_BASE + 0x100
         row = {"library": "kernel32.dll", "name": "CreateToolhelp32Snapshot", "index": 1}
         self.write_snapshot_frame(TH32CS_SNAPPROCESS | TH32CS_INHERIT, 1234, esp=esp_init)
@@ -242,31 +240,108 @@ class ToolhelpOracleTests(unittest.TestCase):
 
         handle = self.engine.reg_read(x86_const.UC_X86_REG_EAX)
         self.assertEqual(handle, SNAPSHOT_HANDLE_MIN)
-        self.assertEqual(self.state["snapshots"][handle]["process_id"], 1234)
+        self.assertEqual(self.state["snapshots"][handle]["process_id"], DEFAULT_PROCESS_ID)
 
-    def test_invalid_flags_in_create_snapshot(self) -> None:
-        """Requirement 2: Invalid flags passed to CreateToolhelp32Snapshot."""
+    def test_unsupported_flags_in_create_snapshot(self) -> None:
+        """Requests outside the process-only fixture remain unhandled atomically."""
         row = {"library": "kernel32.dll", "name": "CreateToolhelp32Snapshot", "index": 1}
-        invalid_flags = (0, 1, 4, 8, 16, 0x12345678, TH32CS_INHERIT)
+        unsupported_flags = (0, 1, 4, 8, 16, 6, 0x12345678, TH32CS_INHERIT)
 
-        for flags in invalid_flags:
+        for flags in unsupported_flags:
             with self.subTest(flags=flags):
                 esp_init = STACK_BASE + 0x100
                 self.write_snapshot_frame(flags, 0, esp=esp_init)
                 regs_before = self.register_snapshot()
+                calls_before = list(self.state["api_calls"])
+                snapshots_before = dict(self.state["snapshots"])
+                frame_before = bytes(self.engine.mem_read(esp_init, 12))
 
-                self.assertTrue(create_toolhelp32_snapshot(
+                self.assertFalse(create_toolhelp32_snapshot(
                     self.engine, x86_const, unicorn, row, self.mapped_ranges, self.state))
 
+                self.assertEqual(self.register_snapshot(), regs_before)
+                self.assertEqual(self.read_last_error(), LAST_ERROR_SENTINEL)
+                self.assertEqual(bytes(self.engine.mem_read(esp_init, 12)), frame_before)
+                self.assertEqual(self.state["api_calls"], calls_before)
+                self.assertEqual(self.state["snapshots"], snapshots_before)
+                self.assertIsNone(self.state["status"])
+                self.assertFalse(self.state["resume"])
+
+    def test_corrupted_snapshot_table_stops_atomically(self) -> None:
+        """Malformed host-owned rows stop before outputs, register, or table changes."""
+        row = {"library": "kernel32.dll", "name": "CreateToolhelp32Snapshot", "index": 1}
+        invalid_tables = (
+            {SNAPSHOT_HANDLE_MIN: {"iter_index": 0, "process_id": 101}},
+            {SNAPSHOT_HANDLE_MIN: {"iter_index": 2, "process_id": DEFAULT_PROCESS_ID}},
+            {SNAPSHOT_HANDLE_MAX + 1: {"iter_index": 0, "process_id": DEFAULT_PROCESS_ID}},
+            {SNAPSHOT_HANDLE_MIN: {"iter_index": 0}},
+        )
+        for snapshots in invalid_tables:
+            with self.subTest(snapshots=snapshots):
+                self.state["snapshots"] = dict(snapshots)
+                self.state["status"] = None
+                self.state.pop("api_state_fault", None)
+                self.state["resume"] = False
+                esp_init = STACK_BASE + 0x100
+                self.write_snapshot_frame(TH32CS_SNAPPROCESS, 1234, esp=esp_init)
+                regs_before = self.register_snapshot()
+                snapshots_before = dict(self.state["snapshots"])
+                calls_before = list(self.state["api_calls"])
+
+                self.assertFalse(create_toolhelp32_snapshot(
+                    self.engine, x86_const, unicorn, row, self.mapped_ranges, self.state))
+
+                self.assertEqual(self.register_snapshot(), regs_before)
+                self.assertEqual(self.read_last_error(), LAST_ERROR_SENTINEL)
+                self.assertEqual(self.state["snapshots"], snapshots_before)
+                self.assertEqual(self.state["api_calls"], calls_before)
+                self.assertEqual(self.state["status"], "GUEST_STOP_API_STATE")
                 self.assertEqual(
-                    self.engine.reg_read(x86_const.UC_X86_REG_EAX), INVALID_HANDLE_VALUE)
-                self.assertEqual(
-                    self.engine.reg_read(x86_const.UC_X86_REG_ESP), esp_init + 12)
-                self.assertEqual(
-                    self.engine.reg_read(x86_const.UC_X86_REG_EIP), RETURN_ADDRESS)
-                self.assertEqual(self.read_last_error(), ERROR_INVALID_PARAMETER)
-                self.assert_other_registers_preserved(regs_before)
-                self.assertEqual(len(self.state["snapshots"]), 0)
+                    self.state["api_state_fault"]["reason"],
+                    "toolhelp_snapshot_table_invalid")
+                self.assertFalse(self.state["resume"])
+
+        # Enumeration handlers apply the same validation before touching the
+        # caller's output buffer or iterator state.
+        self.state["snapshots"] = {SNAPSHOT_HANDLE_MIN: {"iter_index": 2,
+                                                         "process_id": DEFAULT_PROCESS_ID}}
+        self.state["status"] = None
+        self.state.pop("api_state_fault", None)
+        self.state["resume"] = False
+        self.engine.mem_write(BUFFER_BASE, b"\xA5" * PROCESSENTRY32_SIZE)
+        self.write_process32_frame(SNAPSHOT_HANDLE_MIN, BUFFER_BASE)
+        regs_before = self.register_snapshot()
+        buffer_before = bytes(self.engine.mem_read(BUFFER_BASE, PROCESSENTRY32_SIZE))
+        snapshots_before = dict(self.state["snapshots"])
+        calls_before = list(self.state["api_calls"])
+        self.assertFalse(process32_first(
+            self.engine, x86_const, unicorn,
+            {"library": "kernel32.dll", "name": "Process32First", "index": 2},
+            self.mapped_ranges, self.state))
+        self.assertEqual(self.register_snapshot(), regs_before)
+        self.assertEqual(bytes(self.engine.mem_read(BUFFER_BASE, PROCESSENTRY32_SIZE)),
+                         buffer_before)
+        self.assertEqual(self.state["snapshots"], snapshots_before)
+        self.assertEqual(self.state["api_calls"], calls_before)
+        self.assertEqual(self.state["status"], "GUEST_STOP_API_STATE")
+        self.assertEqual(
+            self.state["api_state_fault"]["reason"],
+            "toolhelp_snapshot_table_invalid")
+
+        # A foreign CloseHandle range passes through before table validation.
+        self.state["status"] = None
+        self.state.pop("api_state_fault", None)
+        self.state["snapshots"] = {SNAPSHOT_HANDLE_MIN: {"iter_index": 2,
+                                                         "process_id": DEFAULT_PROCESS_ID}}
+        row_close = {"library": "kernel32.dll", "name": "CloseHandle", "index": 2}
+        self.write_close_handle_frame(0x12345678)
+        regs_before = self.register_snapshot()
+        snapshots_before = dict(self.state["snapshots"])
+        self.assertFalse(toolhelp_close_handle(
+            self.engine, x86_const, unicorn, row_close, self.mapped_ranges, self.state))
+        self.assertEqual(self.register_snapshot(), regs_before)
+        self.assertEqual(self.state["snapshots"], snapshots_before)
+        self.assertIsNone(self.state["status"])
 
     def test_process32_first_invalid_handle(self) -> None:
         """Requirement 3: Process32First with invalid handle."""
@@ -566,14 +641,14 @@ class ToolhelpOracleTests(unittest.TestCase):
     def test_teb_memory_and_state_faults(self) -> None:
         """Requirement 8: TEB unmapped, read-only, and invalid state faults."""
         esp_init = STACK_BASE + 0x100
-        row_snap = {"library": "kernel32.dll", "name": "CreateToolhelp32Snapshot", "index": 1}
+        row_first = {"library": "kernel32.dll", "name": "Process32First", "index": 1}
 
         # 1. Zero TEB triggers api state fault
         self.state["tls_current_teb"] = 0
-        self.write_snapshot_frame(0, 0, esp=esp_init)  # Invalid flags forces error write
+        self.write_process32_frame(0, BUFFER_BASE, esp=esp_init)
         regs_before = self.register_snapshot()
-        self.assertFalse(create_toolhelp32_snapshot(
-            self.engine, x86_const, unicorn, row_snap, self.mapped_ranges, self.state))
+        self.assertFalse(process32_first(
+            self.engine, x86_const, unicorn, row_first, self.mapped_ranges, self.state))
         self.assertEqual(self.state["status"], "GUEST_STOP_API_STATE")
         self.assertEqual(self.state["api_state_fault"]["reason"], "current_teb_invalid")
         self.assertEqual(self.register_snapshot(), regs_before)
@@ -581,8 +656,8 @@ class ToolhelpOracleTests(unittest.TestCase):
         # 2. Unmapped TEB forces memory fault
         self.state["tls_current_teb"] = 0x00300000  # Unmapped
         self.state["status"] = None
-        self.assertFalse(create_toolhelp32_snapshot(
-            self.engine, x86_const, unicorn, row_snap, self.mapped_ranges, self.state))
+        self.assertFalse(process32_first(
+            self.engine, x86_const, unicorn, row_first, self.mapped_ranges, self.state))
         self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
         self.assertEqual(self.state["memory_fault"]["access"], "write")
         self.assertEqual(self.state["memory_fault"]["address"], 0x00300000 + LAST_ERROR_OFFSET)
@@ -594,8 +669,8 @@ class ToolhelpOracleTests(unittest.TestCase):
         self.mapped_ranges.append((ro_teb, ro_teb + PAGE_SIZE))
         self.state["tls_current_teb"] = ro_teb
         self.state["status"] = None
-        self.assertFalse(create_toolhelp32_snapshot(
-            self.engine, x86_const, unicorn, row_snap, self.mapped_ranges, self.state))
+        self.assertFalse(process32_first(
+            self.engine, x86_const, unicorn, row_first, self.mapped_ranges, self.state))
         self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
         self.assertEqual(self.state["memory_fault"]["access"], "write")
         self.assertEqual(self.state["memory_fault"]["address"], ro_teb + LAST_ERROR_OFFSET)
@@ -603,8 +678,8 @@ class ToolhelpOracleTests(unittest.TestCase):
         # 4. TEB address addition overflow faults at 0xFFFFFFFF
         self.state["tls_current_teb"] = 0xFFFFFFE0
         self.state["status"] = None
-        self.assertFalse(create_toolhelp32_snapshot(
-            self.engine, x86_const, unicorn, row_snap, self.mapped_ranges, self.state))
+        self.assertFalse(process32_first(
+            self.engine, x86_const, unicorn, row_first, self.mapped_ranges, self.state))
         self.assertEqual(self.state["status"], "GUEST_STOP_MEMORY")
         self.assertEqual(self.state["memory_fault"]["address"], 0xFFFFFFFF)
 
