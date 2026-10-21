@@ -160,6 +160,35 @@ static void test_cursor_bridge(void) {
     printf("PASS: test_cursor_bridge\n");
 }
 
+static void test_metal_fill_mouse_bridge(void) {
+    guest_cursor_reset();
+    nfsu2_input_set_viewport(1280, 720, 1280, 720);
+    nfsu2_input_set_cursor(100.0f, 100.0f, false);
+
+    unsigned char buf[20];
+    metal_fill_mouse(buf, 20);
+
+    /* Move cursor with touch down */
+    nfsu2_input_set_cursor(130.0f, 150.0f, true);
+    metal_fill_mouse(buf, 20);
+
+    int32_t dx = 0, dy = 0;
+    memcpy(&dx, buf + 0, 4);
+    memcpy(&dy, buf + 4, 4);
+    assert(dx == 30);
+    assert(dy == 50);
+    assert(buf[12] == 0x80);
+
+    /* Consecutive call resets deltas */
+    metal_fill_mouse(buf, 20);
+    memcpy(&dx, buf + 0, 4);
+    memcpy(&dy, buf + 4, 4);
+    assert(dx == 0);
+    assert(dy == 0);
+
+    printf("PASS: test_metal_fill_mouse_bridge\n");
+}
+
 int main(void) {
     printf("=== Running NFSU2InputBridge Tests ===\n");
     test_initial_and_clear();
@@ -169,6 +198,7 @@ int main(void) {
     test_metal_fill_keyboard_compat();
     test_metal_available();
     test_cursor_bridge();
+    test_metal_fill_mouse_bridge();
     printf("=== All NFSU2InputBridge Tests PASSED ===\n");
     return 0;
 }
