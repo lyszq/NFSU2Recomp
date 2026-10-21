@@ -2,6 +2,7 @@
  * Test suite for NFSU2InputBridge (DirectInput DIK_* key table & analog mapping)
  */
 
+#include <stdbool.h>
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +13,11 @@
 /* Guest memory emulation for standalone test runner */
 uint8_t *g_mem = NULL;
 uint8_t g_cbits[GUEST_MEMORY_BITMAP_SIZE];
+
+void *guest_memory_pointer(uint32_t address, uint64_t size, int write_access) {
+    (void)address; (void)size; (void)write_access;
+    return NULL;
+}
 
 static void test_initial_and_clear(void) {
     nfsu2_input_clear_all();

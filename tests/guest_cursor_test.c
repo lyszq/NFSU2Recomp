@@ -110,7 +110,7 @@ static void test_win32_get_cursor_pos_success(void) {
     assert(pt != NULL);
     memset(pt, 0xAA, 8);
 
-    GuestImport imp = {"GetCursorPos", "USER32.dll", 0};
+    GuestImport imp = { .iat = 0, .library = "USER32.dll", .name = "GetCursorPos" };
     uint32_t fault = 0;
     int rc = guest_user32_get_cursor_pos(&cpu, &imp, &fault);
     assert(rc == 1);
@@ -146,7 +146,7 @@ static void test_win32_get_cursor_pos_null(void) {
     memcpy(stk, "\x34\x12\x00\x00", 4);
     memset(stk + 4, 0, 4);
 
-    GuestImport imp = {"GetCursorPos", "USER32.dll", 0};
+    GuestImport imp = { .iat = 0, .library = "USER32.dll", .name = "GetCursorPos" };
     uint32_t fault = 0;
     int rc = guest_user32_get_cursor_pos(&cpu, &imp, &fault);
     assert(rc == 1);
@@ -179,7 +179,7 @@ static void test_win32_set_and_show_cursor(void) {
     memcpy(stk + 4, &x, 4);
     memcpy(stk + 8, &y, 4);
 
-    GuestImport imp_set = {"SetCursorPos", "USER32.dll", 0};
+    GuestImport imp_set = { .iat = 0, .library = "USER32.dll", .name = "SetCursorPos" };
     uint32_t fault = 0;
     int rc = guest_user32_set_cursor_pos(&cpu, &imp_set, &fault);
     assert(rc == 1);
@@ -195,7 +195,7 @@ static void test_win32_set_and_show_cursor(void) {
     uint32_t bshow = 1;
     memcpy(stk + 4, &bshow, 4);
 
-    GuestImport imp_show = {"ShowCursor", "USER32.dll", 0};
+    GuestImport imp_show = { .iat = 0, .library = "USER32.dll", .name = "ShowCursor" };
     rc = guest_user32_show_cursor(&cpu, &imp_show, &fault);
     assert(rc == 1);
     assert((int32_t)cpu.eax == 1); /* Count incremented from 0 to 1 */
