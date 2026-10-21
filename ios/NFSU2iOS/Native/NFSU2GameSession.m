@@ -14,6 +14,7 @@ static void copy_text(char *destination, size_t capacity, const char *source) {
 #import <Foundation/Foundation.h>
 #import <pthread.h>
 #import <pthread/qos.h>
+#import <dispatch/dispatch.h>
 #import <setjmp.h>
 #import <fcntl.h>
 #import <unistd.h>
@@ -36,6 +37,9 @@ extern void fileio_set_write_root(const char *directory_path);
 extern jmp_buf g_exit_jmp;
 extern int g_exit_code;
 extern int g_exit_armed;
+extern void *win32_exit_scope_enter(jmp_buf *target);
+extern void win32_exit_scope_leave(void *previous);
+extern int win32_exit_thread_status(void);
 extern uint32_t g_image_base;
 extern uint32_t g_image_size;
 extern uint32_t g_image_entry;
@@ -55,6 +59,16 @@ static int g_pause_requested = 0;
 static int g_guest_thread_created = 0;
 static char g_session_status[512] = "Full runtime session has not started.";
 static CPU g_primary_cpu;
+
+static dispatch_queue_t session_log_queue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("dev.lyszq.nfsu2ios.session-log",
+                                      DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
 
 static NSString *runtime_log_path(void) {
     NSArray<NSString *> *documents = NSSearchPathForDirectoriesInDomains(
@@ -185,7 +199,23 @@ static int verify_executable_and_roots(const char *executable_path,
             return EINVAL;
         }
 
+        NSFileManager *manager = [NSFileManager defaultManager];
         NSError *fileError = nil;
+        NSDictionary *attributes = [manager attributesOfItemAtPath:standardExe
+                                                              error:&fileError];
+        NSNumber *savedSize = attributes[NSFileSize];
+        if (!attributes || !savedSize) {
+            NSString *message = [NSString stringWithFormat:@"Could not inspect the saved executable: %@",
+                                  fileError.localizedDescription ?: @"unknown file error"];
+            copy_text(diagnostic, diagnostic_capacity, message.UTF8String);
+            return EIO;
+        }
+        if (savedSize.unsignedLongLongValue != kExpectedExecutableSize) {
+            copy_text(diagnostic, diagnostic_capacity,
+                      "Saved SPEED2.EXE has an unsupported size; import the verified build again.");
+            return EINVAL;
+        }
+
         NSData *image = [NSData dataWithContentsOfFile:standardExe
                                                options:NSDataReadingMappedIfSafe
                                                  error:&fileError];
@@ -213,7 +243,6 @@ static int verify_executable_and_roots(const char *executable_path,
             return EINVAL;
         }
 
-        NSFileManager *manager = [NSFileManager defaultManager];
         BOOL isDirectory = NO;
         if (![manager fileExistsAtPath:standardRoot isDirectory:&isDirectory] || !isDirectory) {
             copy_text(diagnostic, diagnostic_capacity,
@@ -261,7 +290,10 @@ void nfs_game_session_set_active(int active) {
     if (g_session_started &&
         g_session_state != NFS_GAME_SESSION_FAILED &&
         g_session_state != NFS_GAME_SESSION_EXITED) {
-        if (g_session_active) {
+        if (g_session_state == NFS_GAME_SESSION_PREPARING) {
+            /* Remember lifecycle changes without claiming a worker exists yet. */
+            g_pause_requested = g_session_active ? 0 : 1;
+        } else if (g_session_active) {
             g_pause_requested = 0;
             set_status_locked(NFS_GAME_SESSION_RUNNING,
                 "Full runtime active; persistent guest worker retained. No real game frame is verified.");
@@ -289,12 +321,23 @@ void nfs_game_session_get_status(char *diagnostic, size_t diagnostic_capacity) {
         snprintf(diagnostic, diagnostic_capacity, "%s\nRenderer: %ld presents / %ld triangles / %ld texture uploads (scene unverified)",
                  g_session_status, frames, triangles, textures);
     static long logged_frames = -1, logged_triangles = -1, logged_textures = -1;
-    if (frames != logged_frames || triangles != logged_triangles || textures != logged_textures) {
-        fprintf(stderr, "runtime evidence: presents=%ld triangles=%ld textures_uploaded=%ld; actual scene/device validation pending\n",
-                frames, triangles, textures);
+    int log_changed = frames != logged_frames || triangles != logged_triangles ||
+                      textures != logged_textures;
+    if (log_changed) {
         logged_frames = frames; logged_triangles = triangles; logged_textures = textures;
     }
     pthread_mutex_unlock(&g_session_lock);
+
+    /* This getter is polled from the main-thread status timer. Keep filesystem
+     * writes off both UIKit and the lifecycle lock while retaining the evidence.
+     */
+    if (log_changed) {
+        dispatch_async(session_log_queue(), ^{
+            fprintf(stderr,
+                    "runtime evidence: presents=%ld triangles=%ld textures_uploaded=%ld; actual scene/device validation pending\n",
+                    frames, triangles, textures);
+        });
+    }
 }
 
 void nfs_game_session_get_log_path(char *path, size_t path_capacity) {
@@ -316,13 +359,16 @@ static void *guest_entry_thread(void *unused) {
      * lock exactly once; guest RAM stays mapped for the process lifetime.
      */
     volatile int guest_lock_held = 0;
+    void * volatile previous_exit_scope = NULL;
     int exit_code = setjmp(g_exit_jmp);
     if (exit_code == 0) {
+        previous_exit_scope = win32_exit_scope_enter(&g_exit_jmp);
         g_exit_armed = 1;
         guest_lock(&g_primary_cpu);
         guest_lock_held = 1;
         CPU *c = &g_primary_cpu;
         PUSH32(0xDEADC0DEu);
+        fprintf(stderr, "runtime guest entry begin: eip=0x0075bcc7\n");
         sub_0075bcc7(c);
     } else {
         g_exit_armed = 0;
@@ -332,10 +378,15 @@ static void *guest_entry_thread(void *unused) {
         guest_unlock();
         guest_lock_held = 0;
     }
+    win32_exit_scope_leave(previous_exit_scope);
     g_exit_armed = 0;
 
     char final_status[256];
-    if (exit_code != 0) {
+    if (exit_code == 2) {
+        snprintf(final_status, sizeof final_status,
+                 "Primary guest thread exited with code %d. Session memory is retained; other workers may remain active.",
+                 win32_exit_thread_status());
+    } else if (exit_code != 0) {
         snprintf(final_status, sizeof final_status,
                  "Guest process exited with code %d. Session memory is retained; no game frame is verified.",
                  g_exit_code);
@@ -434,19 +485,22 @@ int nfs_game_session_start(const char *executable_path,
         return fail_session(rc, local_diagnostic, diagnostic, diagnostic_capacity);
     }
 
+    pthread_t thread;
     pthread_mutex_lock(&g_session_lock);
-    if (g_session_active) {
-        set_status_locked(NFS_GAME_SESSION_RUNNING,
-            "Full runtime initialized; starting guest entry on a 16 MiB worker stack. No real game frame is verified.");
-    } else {
-        g_pause_requested = 1;
-        set_status_locked(NFS_GAME_SESSION_PAUSE_REQUESTED,
-            "Full runtime initialized while app inactive; guest waits at its first safe checkpoint.");
+    g_pause_requested = g_session_active ? 0 : 1;
+    rc = pthread_create(&thread, &attributes, guest_entry_thread, NULL);
+    if (rc == 0) {
+        g_guest_thread_created = 1;
+        if (g_session_active) {
+            set_status_locked(NFS_GAME_SESSION_RUNNING,
+                "Full runtime initialized; guest entry is running on a 16 MiB worker stack. No real game frame is verified.");
+        } else {
+            set_status_locked(NFS_GAME_SESSION_PAUSE_REQUESTED,
+                "Full runtime initialized while app inactive; guest waits at its first safe checkpoint.");
+        }
+        copy_text(diagnostic, diagnostic_capacity, g_session_status);
     }
     pthread_mutex_unlock(&g_session_lock);
-
-    pthread_t thread;
-    rc = pthread_create(&thread, &attributes, guest_entry_thread, NULL);
     pthread_attr_destroy(&attributes);
     if (rc) {
         snprintf(local_diagnostic, sizeof local_diagnostic,
@@ -454,10 +508,6 @@ int nfs_game_session_start(const char *executable_path,
         return fail_session(rc, local_diagnostic, diagnostic, diagnostic_capacity);
     }
 
-    pthread_mutex_lock(&g_session_lock);
-    g_guest_thread_created = 1;
-    copy_text(diagnostic, diagnostic_capacity, g_session_status);
-    pthread_mutex_unlock(&g_session_lock);
     return 0;
 }
 

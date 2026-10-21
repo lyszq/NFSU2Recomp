@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <time.h>
 #include <sys/event.h>
 #include <sched.h>
@@ -19,6 +20,9 @@ extern void nfs_game_session_checkpoint(void);
 #endif
 
 void dispatch_indirect(CPU*,uint32_t);
+void *win32_exit_scope_enter(jmp_buf *target);
+void win32_exit_scope_leave(void *previous);
+int win32_exit_thread(int code);
 void mem_commit(uint32_t,uint32_t);
 uint32_t win32_alloc(uint32_t n, int zero);
 uint32_t res_find(uint32_t,uint32_t,int);
@@ -345,31 +349,41 @@ static void *guest_thread_main(void *p){
     mem_altstack_install();
     TArg *t = (TArg*)p;
     CPU cpu; memset(&cpu,0,sizeof cpu);
-    uint32_t stack_lo, stack_hi;
-    pthread_mutex_lock(&g_lock);
-    stack_lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; stack_hi = g_tstack_next;
-    pthread_mutex_unlock(&g_lock);
-    mem_commit(stack_lo, GTHREAD_STACK);
-    cpu.esp = stack_hi - 0x1000u;
-    cpu.top = 0; cpu.fcw = 0x037f;
-    cpu.fs_base = t->teb; cpu.gs_base = t->teb;
-    /* TEB */
-    MR32(t->teb+0x00)=0xFFFFFFFFu; MR32(t->teb+0x04)=stack_hi; MR32(t->teb+0x08)=stack_lo;
-    MR32(t->teb+0x18)=t->teb; MR32(t->teb+0x24)=t->ob?t->ob->tid:0;
-    MR32(t->teb+0x2C)=t->teb+0x1000u; MR32(t->teb+0x30)=0x00C10000u;
-    /* stdcall: arg, sonra donus adresi */
-    { CPU *c=&cpu; PUSH32(t->arg); PUSH32(0xDEAD7EADu); }
-    __sync_fetch_and_add(&g_threads_started, 1);
-    { static int sh=0; if (getenv("VERBOSE") && sh<40){ sh++;
-        fprintf(stderr,"      [thread] BASLADI entry=0x%08x arg=0x%08x teb=0x%08x tid=%u\n",
-                t->entry, t->arg, t->teb, t->ob?t->ob->tid:0); } }
-    tl_obj = t->ob;
-    /* tani: thread listelerinde (perflog thread.csv, sample) taninsin */
-    { char nm[32]; snprintf(nm, sizeof nm, "konuk %u @%06x", t->ob ? t->ob->tid : 0u, t->entry & 0xFFFFFFu);
-      pthread_setname_np(nm); }
-    guest_lock(&cpu);
-    dispatch_indirect(&cpu, t->entry);
-    guest_unlock();
+    jmp_buf exit_scope;
+    void * volatile previous_exit_scope = win32_exit_scope_enter(&exit_scope);
+    volatile int guest_lock_held = 0;
+    int exit_kind = setjmp(exit_scope);
+    if (exit_kind == 0){
+        uint32_t stack_lo, stack_hi;
+        pthread_mutex_lock(&g_lock);
+        stack_lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; stack_hi = g_tstack_next;
+        pthread_mutex_unlock(&g_lock);
+        mem_commit(stack_lo, GTHREAD_STACK);
+        cpu.esp = stack_hi - 0x1000u;
+        cpu.top = 0; cpu.fcw = 0x037f;
+        cpu.fs_base = t->teb; cpu.gs_base = t->teb;
+        /* TEB */
+        MR32(t->teb+0x00)=0xFFFFFFFFu; MR32(t->teb+0x04)=stack_hi; MR32(t->teb+0x08)=stack_lo;
+        MR32(t->teb+0x18)=t->teb; MR32(t->teb+0x24)=t->ob?t->ob->tid:0;
+        MR32(t->teb+0x2C)=t->teb+0x1000u; MR32(t->teb+0x30)=0x00C10000u;
+        /* stdcall: arg, sonra donus adresi */
+        { CPU *c=&cpu; PUSH32(t->arg); PUSH32(0xDEAD7EADu); }
+        __sync_fetch_and_add(&g_threads_started, 1);
+        { static int sh=0; if (getenv("VERBOSE") && sh<40){ sh++;
+            fprintf(stderr,"      [thread] BASLADI entry=0x%08x arg=0x%08x teb=0x%08x tid=%u\n",
+                    t->entry, t->arg, t->teb, t->ob?t->ob->tid:0); } }
+        tl_obj = t->ob;
+        /* tani: thread listelerinde (perflog thread.csv, sample) taninsin */
+        { char nm[32]; snprintf(nm, sizeof nm, "konuk %u @%06x", t->ob ? t->ob->tid : 0u, t->entry & 0xFFFFFFu);
+          pthread_setname_np(nm); }
+        guest_lock(&cpu);
+        guest_lock_held = 1;
+        dispatch_indirect(&cpu, t->entry);
+        guest_unlock();
+        guest_lock_held = 0;
+    }
+    if (guest_lock_held){ guest_unlock(); guest_lock_held = 0; }
+    win32_exit_scope_leave((void *)previous_exit_scope);
     if (t->ob){ pthread_mutex_lock(&t->ob->mtx); t->ob->signaled=1;
                 pthread_cond_broadcast(&t->ob->cv); pthread_mutex_unlock(&t->ob->mtx); }
     free(t);
@@ -412,43 +426,56 @@ static void *timer_thread_main(void *p){
     (void)p;
     mem_altstack_install();
     CPU cpu; memset(&cpu,0,sizeof cpu);
-    uint32_t stack_lo, stack_hi, teb;
-    pthread_mutex_lock(&g_lock);
-    stack_lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; stack_hi = g_tstack_next;
-    teb = 0x00C60000u;
-    pthread_mutex_unlock(&g_lock);
-    mem_commit(stack_lo, GTHREAD_STACK);
-    mem_commit(teb, 0x2000);
-    cpu.top = 0; cpu.fcw = 0x037f;
-    cpu.fs_base = teb; cpu.gs_base = teb;
-    MR32(teb+0x00)=0xFFFFFFFFu; MR32(teb+0x04)=stack_hi; MR32(teb+0x08)=stack_lo;
-    MR32(teb+0x18)=teb; MR32(teb+0x24)=999u;
-    MR32(teb+0x2C)=teb+0x1000u; MR32(teb+0x30)=0x00C10000u;
+    jmp_buf exit_scope;
+    void * volatile previous_exit_scope = win32_exit_scope_enter(&exit_scope);
+    volatile int guest_lock_held = 0;
+    int exit_kind = setjmp(exit_scope);
+    if (exit_kind == 0){
+        uint32_t stack_lo, stack_hi, teb;
+        pthread_mutex_lock(&g_lock);
+        stack_lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; stack_hi = g_tstack_next;
+        teb = 0x00C60000u;
+        pthread_mutex_unlock(&g_lock);
+        mem_commit(stack_lo, GTHREAD_STACK);
+        mem_commit(teb, 0x2000);
+        cpu.top = 0; cpu.fcw = 0x037f;
+        cpu.fs_base = teb; cpu.gs_base = teb;
+        MR32(teb+0x00)=0xFFFFFFFFu; MR32(teb+0x04)=stack_hi; MR32(teb+0x08)=stack_lo;
+        MR32(teb+0x18)=teb; MR32(teb+0x24)=999u;
+        MR32(teb+0x2C)=teb+0x1000u; MR32(teb+0x30)=0x00C10000u;
 
-    for (;;){
-        struct timespec ts = {0, 1000000L};      /* 1 ms */
-        nanosleep(&ts, 0);
-        uint64_t now = now_us();
-        for (int i = 0; i < MAXTIMER; i++){
-            uint32_t proc, user, id;
-            pthread_mutex_lock(&g_lock);
-            if (!g_tm[i].due_us || g_tm[i].due_us > now){ pthread_mutex_unlock(&g_lock); continue; }
-            proc = g_tm[i].proc; user = g_tm[i].user; id = g_tm[i].id;
-            if (g_tm[i].period_us) g_tm[i].due_us = now + g_tm[i].period_us;
-            else                   g_tm[i].due_us = 0;      /* tek seferlik biter */
-            pthread_mutex_unlock(&g_lock);
+        for (;;){
+            struct timespec ts = {0, 1000000L};      /* 1 ms */
+            nanosleep(&ts, 0);
+            uint64_t now = now_us();
+            for (int i = 0; i < MAXTIMER; i++){
+                uint32_t proc, user, id;
+                pthread_mutex_lock(&g_lock);
+                if (!g_tm[i].due_us || g_tm[i].due_us > now){ pthread_mutex_unlock(&g_lock); continue; }
+                proc = g_tm[i].proc; user = g_tm[i].user; id = g_tm[i].id;
+                if (g_tm[i].period_us) g_tm[i].due_us = now + g_tm[i].period_us;
+                else                   g_tm[i].due_us = 0;      /* tek seferlik biter */
+                pthread_mutex_unlock(&g_lock);
 
-            cpu.esp = stack_hi - 0x1000u;
-            { CPU *c=&cpu;
-              /* stdcall: dw2, dw1, dwUser, uMsg, uTimerID  (sagdan sola) */
-              PUSH32(0u); PUSH32(0u); PUSH32(user); PUSH32(0u); PUSH32(id);
-              PUSH32(0xDEAD7EADu); }
-            guest_lock(&cpu);
-            dispatch_indirect(&cpu, proc);
-            guest_unlock();
-            g_timer_ticks++;
+                cpu.esp = stack_hi - 0x1000u;
+                { CPU *c=&cpu;
+                  /* stdcall: dw2, dw1, dwUser, uMsg, uTimerID  (sagdan sola) */
+                  PUSH32(0u); PUSH32(0u); PUSH32(user); PUSH32(0u); PUSH32(id);
+                  PUSH32(0xDEAD7EADu); }
+                guest_lock(&cpu);
+                guest_lock_held = 1;
+                dispatch_indirect(&cpu, proc);
+                guest_unlock();
+                guest_lock_held = 0;
+                g_timer_ticks++;
+            }
         }
     }
+    if (guest_lock_held){ guest_unlock(); guest_lock_held = 0; }
+    pthread_mutex_lock(&g_lock);
+    g_timer_running = 0;
+    pthread_mutex_unlock(&g_lock);
+    win32_exit_scope_leave((void *)previous_exit_scope);
     return 0;
 }
 
@@ -826,8 +853,10 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         if (o){ pthread_mutex_lock(&o->mtx); o->signaled=1;
                 pthread_cond_broadcast(&o->cv); pthread_mutex_unlock(&o->mtx); }
         __sync_fetch_and_add(&g_threads_exited, 1);
-        guest_unlock();
-        pthread_exit(0);
+        if (!win32_exit_thread((int)A(c,0))){
+            guest_unlock();
+            pthread_exit(0);
+        }
         r=1; }
     else if (!strcmp(n,"TerminateThread")) r=1;
     else if (!strcmp(n,"GetExitCodeThread")){ uint32_t p=A(c,1); if(p) MR32(p)=0; r=1; }

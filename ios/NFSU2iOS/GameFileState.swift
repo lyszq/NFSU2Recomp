@@ -12,6 +12,11 @@ private func mergeGameAssetFolder(from source: URL, to destination: URL,
     }
 
     let sourceExecutable = source.appendingPathComponent("SPEED2.EXE")
+    let executableAttributes = try manager.attributesOfItem(atPath: sourceExecutable.path)
+    guard (executableAttributes[.size] as? NSNumber)?.intValue == expectedSize else {
+        throw NSError(domain: "NFSU2", code: 11,
+            userInfo: [NSLocalizedDescriptionKey: "The selected game folder must contain the same verified SPEED2.EXE build."])
+    }
     let executableData = try Data(contentsOf: sourceExecutable)
     let executableHash = SHA256.hash(data: executableData).map { String(format: "%02x", $0) }.joined()
     guard executableData.count == expectedSize, executableHash == expectedSHA256 else {
@@ -163,6 +168,8 @@ final class GameFileState: ObservableObject {
     init() {
         gameAssetFileCount = countGameAssetFiles(at: Self.savedExecutable.deletingLastPathComponent())
         let saved = Self.savedExecutable
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: saved.path),
+              (attributes[.size] as? NSNumber)?.intValue == Self.expectedSize else { return }
         guard let data = try? Data(contentsOf: saved),
               data.count == Self.expectedSize else { return }
         let digest = SHA256.hash(data: data)
@@ -179,7 +186,6 @@ final class GameFileState: ObservableObject {
     }
 
     func importExecutable(from url: URL) {
-        isVerified = false
         let accessGranted = url.startAccessingSecurityScopedResource()
         defer { if accessGranted { url.stopAccessingSecurityScopedResource() } }
 
@@ -188,6 +194,11 @@ final class GameFileState: ObservableObject {
             return
         }
         do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            guard (attributes[.size] as? NSNumber)?.intValue == Self.expectedSize else {
+                message = "Unsupported SPEED2.EXE size (expected \(Self.expectedSize) bytes)."
+                return
+            }
             let data = try Data(contentsOf: url)
             guard data.count == Self.expectedSize else {
                 message = "Unsupported SPEED2.EXE size: \(data.count) bytes (expected \(Self.expectedSize))."

@@ -19,6 +19,9 @@
 jmp_buf g_exit_jmp;
 int g_exit_code = 0;
 int g_exit_armed = 0;
+#include "win32_exit_scope.inc"
+
+static void request_process_exit(int code){ win32_request_process_exit(code); }
 
 typedef struct { uint32_t iat; const char*dll; const char*name; int nargs; } ImpEnt;
 extern const ImpEnt g_imp[]; extern const uint32_t g_imp_count;
@@ -417,9 +420,9 @@ int win32_call(CPU *c, uint32_t idx){
     else if (!strcmp(n,"GetModuleFileNameA")){ uint32_t p=ARG(c,1),sz=ARG(c,2);
         const char*s="C:\\\\NFSU2\\\\SPEED2.EXE"; uint32_t l=(uint32_t)strlen(s);
         if(p&&sz){ if(l>=sz) l=sz-1; memcpy(g_mem+p,s,l); MR8(p+l)=0; } r=l; }
-    else if (!strcmp(n,"ExitProcess")){ g_exit_code=(int)ARG(c,0);
+    else if (!strcmp(n,"ExitProcess")){ int code=(int)ARG(c,0);
         fprintf(stderr,"\n*** guest ExitProcess(%u) - sonlandiriliyor\n",ARG(c,0));
-        if(g_exit_armed) longjmp(g_exit_jmp,1); return -1; }
+        request_process_exit(code); return -1; }
     else if (!strcmp(n,"LoadLibraryA")||!strcmp(n,"LoadLibraryW")){
         r = 0x20000000u;
         { static int sh=0; uint32_t p2=ARG(c,0);
@@ -590,9 +593,9 @@ int win32_call(CPU *c, uint32_t idx){
         r = com_directsoundcreate(ARG(c,1));
     else if (!strcmp(n,"SetConsoleCtrlHandler")) r = 1;
     else if (!strcmp(n,"RtlUnwind"))             r = 0;
-    else if (!strcmp(n,"TerminateProcess")){ g_exit_code=(int)ARG(c,1);
+    else if (!strcmp(n,"TerminateProcess")){ int code=(int)ARG(c,1);
         fprintf(stderr,"\n*** guest TerminateProcess(%u) - sonlandiriliyor\n",ARG(c,1));
-        if(g_exit_armed) longjmp(g_exit_jmp,1); return -1; }
+        request_process_exit(code); return -1; }
     else if (fileio_call(c, n, &r)) { /* dosya G/C */ }
     else if (win32_ext_call(c, n, &r)) { /* 2. tur katman */ }
     else { handled = 0; g_win32_unimpl++; stat_[idx].unimpl++;
@@ -615,6 +618,7 @@ int win32_call(CPU *c, uint32_t idx){
 }
 
 void win32_init(void){
+    win32_exit_reset();
     stat_ = calloc(g_imp_count, sizeof *stat_);
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
     tick0 = (uint64_t)ts.tv_sec*1000 + ts.tv_nsec/1000000;

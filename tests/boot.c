@@ -12,6 +12,9 @@
 #include <setjmp.h>
 #include <pthread.h>
 extern jmp_buf g_exit_jmp; extern int g_exit_code, g_exit_armed; extern int g_bt_on;
+extern void *win32_exit_scope_enter(jmp_buf *target);
+extern void win32_exit_scope_leave(void *previous);
+extern int win32_exit_thread_status(void);
 void dispatch_init(void); void dispatch_report(void);
 void win32_init(void); void win32_report(void);
 void com_report(void); void com_set_trace(int);
@@ -112,16 +115,27 @@ static void *guest_main_thread(void *unused){
     (void)unused;
     pthread_setname_np("konuk ana");
     mem_altstack_install();
-    if (setjmp(g_exit_jmp)==0){
+    void * volatile previous_exit_scope = NULL;
+    volatile int guest_lock_held = 0;
+    int exit_kind = setjmp(g_exit_jmp);
+    if (exit_kind==0){
+        previous_exit_scope = win32_exit_scope_enter(&g_exit_jmp);
         g_exit_armed = 1;
         guest_lock(&cpu);
+        guest_lock_held = 1;
         PUSH32(0xDEADC0DEu);
         sub_0075bcc7(&cpu);
         guest_unlock();
+        guest_lock_held = 0;
         fprintf(stderr,"\n*** guest entry point DONDU (eip=0x%08x, eax=0x%08x)\n",cpu.eip,cpu.eax);
     } else {
-        fprintf(stderr,"\n*** guest cikis kodu %d ile sonlandi\n", g_exit_code);
+        if (guest_lock_held) guest_unlock();
+        if (exit_kind == 2)
+            fprintf(stderr,"\n*** guest ana thread cikis kodu %d ile sonlandi\n", win32_exit_thread_status());
+        else fprintf(stderr,"\n*** guest cikis kodu %d ile sonlandi\n", g_exit_code);
     }
+    win32_exit_scope_leave((void *)previous_exit_scope);
+    g_exit_armed = 0;
     return 0;
 }
 

@@ -37,6 +37,7 @@ void dispatch_init(void){
 }
 
 int  win32_call(CPU*, uint32_t);
+void win32_exit_checkpoint(CPU*);
 int  run_generated(CPU*, uint32_t);
 void genexec_report(void);
 int  com_call(CPU*, uint32_t);
@@ -62,10 +63,18 @@ void dispatch_indirect(CPU *c, uint32_t addr){
      * cagriliyor).  Eskiden her cagri once g_patch[] dizisini dogrusal
      * tariyordu; kosuda tek basina 377 milyon COM cagrisi var. */
     if (addr >= 0xE0000000u){
+        /* COM vtables are an exceptionally hot path; process-exit polling is
+         * done at guest-function/import boundaries to keep COM dispatch lean. */
         if (addr < 0xF0000000u){ com_call(c, addr); return; }
         if (win32_call(c, addr - 0xF0000000u) < 0) g_guest_exited = 1;
+        /* A child may request process exit while this thread is in a Win32
+         * wait. Observe it after the call has released its internal locks. */
+        win32_exit_checkpoint(c);
         return;
     }
+    /* Process exit can be requested by a secondary guest thread. Check at
+     * guest function boundaries so each host thread unwinds only its own stack. */
+    win32_exit_checkpoint(c);
     for (int i = 0; i < g_patch_n; i++)
         if (g_patch[i].addr == addr){ g_stat_indirect_ok++; g_patch[i].fn(c); return; }
     /* EFXSTAT: D3DX efekt vtable cagrilarinin envanteri (d3dx_hle.c) */
