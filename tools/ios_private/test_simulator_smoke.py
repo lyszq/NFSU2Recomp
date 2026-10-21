@@ -40,6 +40,17 @@ class SimulatorEvidenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'no available iPad'):
             select_device({'devices': {}})
 
+    def test_future_runtime_is_not_selected_for_the_active_xcode_sdk(self):
+        device = {'name':'iPad Pro', 'isAvailable':True, 'udid':'12345678-1234-1234-1234-123456789abc'}
+        inventory = {'devices': {'com.apple.CoreSimulator.SimRuntime.iOS-18-5':[device],
+                                 'com.apple.CoreSimulator.SimRuntime.iOS-26-2':[dict(device)]}}
+        self.assertEqual(select_device(inventory, '18.5')['runtime'], 'com.apple.CoreSimulator.SimRuntime.iOS-18-5')
+
+    def test_only_future_runtime_is_an_environment_failure(self):
+        device = {'name':'iPad Pro', 'isAvailable':True, 'udid':'12345678-1234-1234-1234-123456789abc'}
+        with self.assertRaisesRegex(ValueError, 'matching active SDK'):
+            select_device({'devices': {'com.apple.CoreSimulator.SimRuntime.iOS-26-2':[device]}}, '18.5')
+
     def test_bounded_overlay_is_rejected_before_adding_ui_test_target(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

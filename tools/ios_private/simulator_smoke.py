@@ -15,22 +15,25 @@ from verify_simulator_smoke import inspect
 
 BUNDLE = 'dev.lyszq.nfsu2ios'
 
-def select_device(inventory):
+def select_device(inventory, sdk_version=None):
+    sdk_pair = tuple(int(part) for part in sdk_version.split('.')[:2]) if sdk_version else None
     candidates = []
     for runtime, devices in inventory['devices'].items():
         match = re.search(r'\.iOS-(\d+)-(\d+)(?:-(\d+))?$', runtime)
         if not match:
             continue
         version = tuple(int(v or 0) for v in match.groups())
+        if sdk_pair and version[:2] != sdk_pair:
+            continue
         for device in devices:
             if device.get('isAvailable') and 'iPad' in device['name']:
                 candidates.append((version, device['name'], runtime, device))
     if not candidates:
-        raise ValueError('no available iPad iOS Simulator runtime; no device validation inferred')
+        raise ValueError('no available iPad iOS Simulator runtime matching active SDK; no device validation inferred')
     _, _, runtime, device = sorted(candidates, key=lambda c: c[:2], reverse=True)[0]
     if not re.fullmatch(r'[A-Fa-f0-9-]{36}', device['udid']):
         raise ValueError('invalid simulator UUID')
-    return {'udid': device['udid'], 'name': device['name'], 'runtime': runtime}
+    return {'udid': device['udid'], 'name': device['name'], 'runtime': runtime, 'sdk_version': sdk_version}
 
 def capture(*args):
     return subprocess.check_output(args, text=True, timeout=30).strip()
@@ -116,10 +119,11 @@ def main():
     a = p.parse_args()
     if a.mode == 'select':
         inventory = json.loads(capture('xcrun', 'simctl', 'list', 'devices', 'available', '-j'))
-        device = select_device(inventory)
+        sdk_version = capture('xcrun', '--sdk', 'iphonesimulator', '--show-sdk-version')
+        device = select_device(inventory, sdk_version)
         a.out.write_text(json.dumps(device, indent=2) + '\n')
-        subprocess.run(['xcrun', 'simctl', 'boot', device['udid']], check=False)
-        subprocess.run(['xcrun', 'simctl', 'bootstatus', device['udid'], '-b'], check=True, timeout=240)
+        subprocess.run(['xcrun', 'simctl', 'boot', device['udid']], check=False, timeout=180)
+        subprocess.run(['xcrun', 'simctl', 'bootstatus', device['udid'], '-b'], check=True, timeout=600)
         print(device['udid'])
         if os.environ.get('GITHUB_ENV'):
             with Path(os.environ['GITHUB_ENV']).open('a') as env:
