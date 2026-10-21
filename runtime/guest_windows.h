@@ -18,6 +18,7 @@ typedef struct GuestWindows {
     GuestCriticalSet critical;
     GuestTLSSet tls;
     GuestProcess process;
+    uint32_t unhandled_exception_filter;
 } GuestWindows;
 int guest_windows_import(CPU *cpu, const GuestImport *import, void *context,
                          uint32_t *fault);

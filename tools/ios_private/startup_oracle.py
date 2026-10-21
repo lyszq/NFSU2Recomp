@@ -151,6 +151,8 @@ SUPPORTED_IMPORTS = {
     ("kernel32.dll", "LCMapStringA"),
     ("kernel32.dll", "MultiByteToWideChar"),
     ("kernel32.dll", "HeapFree"),
+    ("kernel32.dll", "HeapSize"),
+    ("kernel32.dll", "SetUnhandledExceptionFilter"),
 }
 ERROR_MOD_NOT_FOUND = 126
 
@@ -763,6 +765,57 @@ def _set_handle_count(engine: Any, registers: Any, unicorn_module: Any,
         return False
 
 
+def _set_unhandled_exception_filter(engine: Any, registers: Any, unicorn_module: Any,
+                                    import_row: dict[str, Any],
+                                    mapped_ranges: list[tuple[int, int]],
+                                    state: dict[str, Any]) -> bool:
+    """Implement SetUnhandledExceptionFilter: track top-level filter and return previous."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    try:
+        if not _range_has_permissions(engine, esp, 8,
+                                      unicorn_module.UC_PROT_READ,
+                                      mapped_ranges):
+            raise _GuestPointerFault("read", esp, 8)
+        return_address = _read_u32(engine, esp)
+        filter_address = _read_u32(engine, esp + 4)
+        previous_filter = state.get("unhandled_exception_filter", 0)
+        state["unhandled_exception_filter"] = filter_address
+
+        state["api_calls"].append({
+            "library": import_row["library"],
+            "name": import_row["name"],
+            "import_index": import_row["index"],
+            "tag": IMPORT_BASE + import_row["index"],
+            "call_ip": state["last_ip"],
+            "esp_before": esp,
+            "argument_count": 1,
+            "return_address": return_address,
+            "argument": filter_address,
+            "arguments": [filter_address],
+            "outcome": "success",
+            "result": previous_filter,
+            "previous_filter": previous_filter,
+            "new_filter": filter_address,
+            "last_error_policy": "preserved",
+            "esp_after": (esp + 8) & 0xFFFFFFFF,
+        })
+        engine.reg_write(registers.UC_X86_REG_EAX, previous_filter)
+        engine.reg_write(registers.UC_X86_REG_ESP, esp + 8)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = {
+            "access": access,
+            "address": int(address),
+            "size": size,
+        }
+        return False
+
+
 def _guest_process_import(engine: Any, registers: Any, unicorn_module: Any,
                           import_row: dict[str, Any],
                           mapped_ranges: list[tuple[int, int]],
@@ -1273,6 +1326,60 @@ def _heap_free(engine: Any, registers: Any, unicorn_module: Any,
     engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
     api["result"] = result
     state["api_calls"].append(api)
+    state["resume"] = True
+    return True
+
+
+def _heap_size(engine: Any, registers: Any, unicorn_module: Any,
+               import_row: dict[str, Any],
+               mapped_ranges: list[tuple[int, int]],
+               state: dict[str, Any]) -> bool:
+    """Implement HeapSize: return size of allocated block or -1."""
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    if not _range_is_mapped(esp, 16, mapped_ranges):
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = esp
+        state["memory_fault"] = {"access": "read", "address": esp, "size": 16}
+        return False
+
+    ret_addr = _read_u32(engine, esp)
+    handle = _read_u32(engine, esp + 4)
+    flags = _read_u32(engine, esp + 8)
+    address = _read_u32(engine, esp + 12)
+
+    heaps = state.get("heaps", {})
+    heap = next((h for h in heaps.values() if h.get("handle") == handle), None)
+    block_size = None
+    if heap is not None and address:
+        blocks = heap.get("blocks", [])
+        block = next((b for b in blocks if b.get("address") == address), None)
+        if block:
+            block_size = block.get("size")
+
+    result = block_size if block_size is not None else 0xFFFFFFFF
+
+    api = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 3,
+        "return_address": ret_addr,
+        "handle": handle,
+        "flags": flags,
+        "address": address,
+        "result": result,
+        "outcome": "found" if block_size is not None else "not_found",
+        "last_error_policy": "preserved",
+        "esp_after": (esp + 16) & 0xFFFFFFFF,
+    }
+    state["api_calls"].append(api)
+
+    engine.reg_write(registers.UC_X86_REG_EAX, result)
+    engine.reg_write(registers.UC_X86_REG_ESP, esp + 16)
+    engine.reg_write(registers.UC_X86_REG_EIP, ret_addr)
     state["resume"] = True
     return True
 
@@ -2672,6 +2779,7 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         "tls_threads": {TEB_BASE: 1},
         "tls_current_teb": TEB_BASE,
         "process": process_state,
+        "unhandled_exception_filter": 0,
         "resume": False,
         "memory_fault": None,
     }
@@ -2837,6 +2945,21 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
                 elif row["name"] == "MultiByteToWideChar":
                     handled = _multi_byte_to_wide_char(engine, xr, uc, row,
                                                        mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "SetUnhandledExceptionFilter":
+                    handled = _set_unhandled_exception_filter(engine, xr, uc, row,
+                                                              mapped_ranges, state)
+                    if handled or state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr,
+                                               mapped_ranges, state)
+                elif row["name"] == "HeapSize":
+                    handled = _heap_size(engine, xr, uc, row, mapped_ranges, state)
                     if handled or state["status"] is not None:
                         engine.emu_stop()
                         return True

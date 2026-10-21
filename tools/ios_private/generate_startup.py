@@ -53,8 +53,8 @@ def generate(exe):
                 "name": entry.name.decode("ascii") if entry.name else f"#{entry.ordinal}"}
                for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
     reference = run_startup_reference(exe, imports)
-    if (reference["import_name"] != "SetUnhandledExceptionFilter" or reference["instructions"] != 14849
-            or reference["calls"] != 217 or reference["api_call_count"] != 65
+    if (reference["import_name"] != "GetSystemTimeAsFileTime" or reference["instructions"] != 15018
+            or reference["calls"] != 235 or reference["api_call_count"] != 69
             or reference["critical_section_count"] != 14
             or reference["tls_slot_count"] != 1 or reference["tls_thread_count"] != 1):
         raise ValueError("unexpected independent x86 entry boundary")
@@ -66,7 +66,7 @@ def generate(exe):
     seen = set()
     bodies, omitted = {}, []
     lifter = StartupLifter(str(exe), comments=False, trap=False)
-    while queue and len(bodies) < 96:
+    while queue and len(bodies) < 128:
         address = queue.popleft()
         if address in seen or address == LEAF:
             continue

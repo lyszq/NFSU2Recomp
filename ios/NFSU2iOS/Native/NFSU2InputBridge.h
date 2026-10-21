@@ -3,7 +3,7 @@
  *
  * DirectInput 8 klavye tarama kodları (DIK_*) tamponunu (g_keys[256]) yönetir.
  * Swift dokunmatik kontrolleri ve GameController.framework (GCController)
- * girdilerini doğrudan C çalışma zamanına (runtime/com.c) aktarır.
+ * girdilerini doğrudan C çalışma zamanına (runtime/com.c) gecikmesiz aktarır.
  */
 
 #ifndef NFSU2_INPUT_BRIDGE_H
@@ -25,7 +25,8 @@ extern "C" {
 #define NFSU2_DIK_1               0x02
 #define NFSU2_DIK_2               0x03
 #define NFSU2_DIK_3               0x04
-#define NFSU2_DIK_TAB             0x0F
+#define NFSU2_DIK_BACK            0x0E  /* Geri Al / Backspace */
+#define NFSU2_DIK_TAB             0x0F  /* Harita / Skor */
 #define NFSU2_DIK_Q               0x10  /* Vites Küçült (Manuel) */
 #define NFSU2_DIK_W               0x11  /* İkincil Gaz */
 #define NFSU2_DIK_E               0x12  /* Vites Yükselt (Manuel) */
@@ -35,6 +36,7 @@ extern "C" {
 #define NFSU2_DIK_A               0x1E  /* İkincil Sol */
 #define NFSU2_DIK_S               0x1F  /* İkincil Fren / Geri */
 #define NFSU2_DIK_D               0x20  /* İkincil Sağ */
+#define NFSU2_DIK_L               0x26  /* SMS / Mesajlar */
 #define NFSU2_DIK_LSHIFT          0x2A  /* NOS / Nitro */
 #define NFSU2_DIK_C               0x2E  /* Kamera Görünümü Değiştir */
 #define NFSU2_DIK_B               0x30  /* Arkaya Bak (Look Back) */
@@ -47,22 +49,28 @@ extern "C" {
 #define NFSU2_DIK_DOWN            0xD0  /* Fren / Geri Vites (Brake/Reverse) */
 
 /*
- * Swift -> C Köprü Fonksiyonları
+ * Swift -> C Köprü Fonksiyonları (Sıfır Gecikme, Atomik Bellek Erişimi)
  */
 
 /* Belirli bir DIK_* tuşunun basılı olma durumunu ayarlar (1 = basılı, 0 = serbest) */
 void nfsu2_input_set_key(uint8_t dik_code, bool is_pressed);
 
-/* Tüm tuş tamponunu (g_keys) sıfırlar (arka plana atılınca veya duraklatmada çağrılır) */
+/* Tüm tuş tamponunu (g_keys) sıfırlar (arka plana atılınca, kopmada veya duraklatmada çağrılır) */
 void nfsu2_input_clear_all(void);
 
 /* Belirli bir tuşun durumunu okur */
 bool nfsu2_input_get_key(uint8_t dik_code);
 
+/* Şu anda basılı olan aktif tuş sayısını döndürür */
+uint32_t nfsu2_input_active_count(void);
+
 /* DirectInput 256 baytlık klavye tablosunu doldurur (0x80 = basılı, 0x00 = basılı değil) */
 void nfsu2_input_fill_keyboard(uint8_t *dst, uint32_t count);
 
-/* Analog giriş yardımcıları: Analog tetik ve çubuk girdilerini dijital DIK_* kodlarına çevirir */
+/*
+ * Analog giriş yardımcıları: Analog tetik, direksiyon kaydırıcı (steer slider)
+ * ve çubuk girdilerini dijital DIK_* kodlarına çevirir.
+ */
 void nfsu2_input_set_steering(float analog_x);  /* -1.0 (tam sol) .. +1.0 (tam sağ) */
 void nfsu2_input_set_throttle(float analog_val); /* 0.0 .. 1.0 */
 void nfsu2_input_set_brake(float analog_val);    /* 0.0 .. 1.0 */

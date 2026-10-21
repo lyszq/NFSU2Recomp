@@ -15,6 +15,6 @@ current_hsp = target["settings"]["base"].get("HEADER_SEARCH_PATHS", ["$(inherite
 target["settings"]["base"]["HEADER_SEARCH_PATHS"] = list(dict.fromkeys(current_hsp + ["$(SRCROOT)/../runtime", "$(SRCROOT)/NFSU2iOS/Native"]))
 current_defs = target["settings"]["base"].get("GCC_PREPROCESSOR_DEFINITIONS", ["$(inherited)"])
 target["settings"]["base"]["GCC_PREPROCESSOR_DEFINITIONS"] = list(dict.fromkeys(current_defs + ["NFS_PRIVATE_PROBE=1", "NFS_PRIVATE_STARTUP=1"]))
-target["info"]["properties"]["CFBundleShortVersionString"] = "0.10.0"
-target["info"]["properties"]["CFBundleVersion"] = "16"
+target["info"]["properties"]["CFBundleShortVersionString"] = "0.11.0"
+target["info"]["properties"]["CFBundleVersion"] = "17"
 (root / "ios/project-private.yml").write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8", newline="\n")

@@ -257,6 +257,40 @@ static int handle_get_module_file_name_a(CPU *c, const GuestImport *import,
     return 1;
 }
 
+static int handle_set_unhandled_exception_filter(CPU *c, const GuestImport *import,
+                                                GuestWindows *windows, uint32_t *fault) {
+    if (strcmp(import->name, "SetUnhandledExceptionFilter") != 0) return 0;
+
+    uint64_t esp_sum = (uint64_t)c->esp + 8ULL;
+    if (esp_sum > 0x100000000ULL) {
+        *fault = c->esp;
+        return -1;
+    }
+    const uint8_t *stack = guest_memory_pointer(c->esp, 8, 0);
+    if (!stack) {
+        *fault = c->esp;
+        return -1;
+    }
+
+    uint32_t ret_ip = read32(stack);
+    uint32_t new_filter = read32(stack + 4);
+    uint32_t prev_filter = 0;
+
+    if (windows) {
+        prev_filter = windows->unhandled_exception_filter;
+        windows->unhandled_exception_filter = new_filter;
+    } else {
+        static uint32_t s_fallback_filter = 0;
+        prev_filter = s_fallback_filter;
+        s_fallback_filter = new_filter;
+    }
+
+    c->eax = prev_filter;
+    c->eip = ret_ip;
+    c->esp += 8u;
+    return 1;
+}
+
 static int widechar_import(CPU *c, const GuestImport *import, uint32_t *fault) {
     if (strcmp(import->name, "WideCharToMultiByte")) return 0;
 
@@ -656,6 +690,8 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
         handled=critical_import(c,import,context,fault);
         if (handled) return handled;
         handled=handle_get_module_file_name_a(c,import,(GuestWindows *)context,fault);
+        if (handled) return handled;
+        handled=handle_set_unhandled_exception_filter(c,import,(GuestWindows *)context,fault);
         if (handled) return handled;
         handled=widechar_import(c,import,fault);
         if (handled) return handled;

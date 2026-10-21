@@ -1,35 +1,55 @@
-/* CoreAudio cikisi.
+/* NFSU2 iOS Port - CoreAudio / RemoteIO / DirectSound Audio Layer
  *
- * DirectSound katmani simdiye kadar yalnizca muhasebe yapiyordu (yazilan
- * bayt sayilir, oynatma imleci gecen zamana gore ilerlerdi) ama SES
- * CIKISI HIC YOKTU.  Oyun gercek PCM yaziyor (olculdu: ~9 MB, 5000+ dolu
- * yazma); burada o tamponlari karistirip AudioQueue ile calariz.
+ * EA Trax (interaktif muzik akisi), SFX (ses efektleri), ve motor sesleri
+ * icin dusuk gecikmeli, kilit-serbest cift tamponlu (ring buffer) ve
+ * dinamik donanim ornekleme hizina (44.1 kHz / 48 kHz) uyarlanabilen mimari.
  *
- * Karistirici 44.1 kHz, 2 kanal, 16-bit cikisa donusturur; kaynak
- * tamponlar farkli hizda/kanalda olabilir (en yakin komsu ornekleme). */
+ * iOS AVAudioSession ve RemoteIO AudioUnit yasam dongusu:
+ * - Kesintiler (AVAudioSessionInterruptionNotification): Arama / Alarm sirasinda
+ *   ses unitesi guvenli sekilde durdurulur, sonrasinda otomatik surdurulur.
+ * - Rota degisiklikleri (AVAudioSessionRouteChangeNotification): AirPods veya
+ *   kulaklik takilip cikarildiginda donanim ornekleme hizi (44.1 <-> 48 kHz)
+ *   ve tampon boyutu calisma aninda yeniden yapilandirilir.
+ * - Medya sifirlama (AVAudioSessionMediaServicesWereResetNotification): audiod
+ *   cokerse AudioUnit bastan olusturulur.
+ * - Real-time thread priority inversion korumasi: au_cb asla bekletici kilit
+ *   tutmaz; kilit-serbest ring buffer ve atomik bayraklar uzerinden calisir.
+ */
+
 #import <AudioToolbox/AudioToolbox.h>
 #import <AudioUnit/AudioUnit.h>
 #include <TargetConditionals.h>
+
 #if TARGET_OS_IPHONE
 #import <AVFoundation/AVFoundation.h>
+#import <UIKit/UIKit.h>
 #endif
+
+#include "audio.h"
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
 #include <math.h>
+#include <stdatomic.h>
 
 extern uint8_t *g_mem;
 uint64_t host_us(void);          /* oyunun SANAL saati (kare basina 16.67 ms) */
 
+/* --- Donanim ve Durum Degiskenleri --- */
+static atomic_uint_fast32_t g_hw_rate        = AUDIO_DEFAULT_RATE; /* 44100 veya 48000 Hz */
+static atomic_bool          g_audio_suspended   = false;
+static atomic_bool          g_audio_reconfiguring = false;
+static atomic_bool          g_audio_on          = false;
+static int                  g_backend           = 0;     /* 1 = AudioUnit, 2 = AudioQueue */
+
 /* Oyun ses verisini kendi sanal zamaninda uretir; karistirici ise gercek
- * zamanda tuketiyordu.  Emulator 60 fps'in altinda kalinca sanal zaman
- * geride kalir ve her tampon turunda yazilmamis bir bolge kalir -> ses
- * duzenli araliklarla kesilir (olculdu: bosluk periyodu tam olarak tampon
- * suresi).  Cozum: tuketimi oyunun uretim hizina baglamak. */
+ * zamanda tuketiyordu. Emulator 60 fps altina dusunce sesin kesilmesini
+ * onlemek icin tuketimi oyunun uretim hizina baglayan servo (PLL). */
 static double g_rate_ratio = 1.0;
-static int    g_sync_mode = -1;      /* SNDSYNC: 1 = oyun hizina bagla */
+static int    g_sync_mode  = -1;      /* SNDSYNC: 1 = oyun hizina bagla */
+
 static void update_rate_ratio(void){
     if (g_sync_mode < 0){
         const char *e = getenv("SNDSYNC");
@@ -45,27 +65,20 @@ static void update_rate_ratio(void){
         if (dr > 1000.0){
             double k = dv / dr;
             if (k < 0.25) k = 0.25;
-            /* TAVAN 1.0: ses GERCEK ZAMANDAN HIZLI calmamali.  Bu oran
-             * oyunun saatinden geliyordu ve saat (creep hatasi yuzunden)
-             * yer yer 2 kata kadar hizli kosuyordu -> sarkilar hizli
-             * caliyordu.  Saat duzeltildi, ama bagi da guvenli yapiyoruz:
-             * bu yolla bir saat hatasi bir daha PERDE hatasina donusemez. */
+            /* TAVAN 1.0: ses GERCEK ZAMANDAN HIZLI calmamali. */
             if (k > 1.00) k = 1.00;
-            /* yumusat: ani kare hizi dalgalanmalari perdeyi zipllatmasin */
             g_rate_ratio += (k - g_rate_ratio) * 0.10;
         }
     }
     lv = vus; lr = rus;
 }
 
-#define OUT_RATE   44100
-#define OUT_CH     2
-/* Emulator CPU'yu doldurdugu icin 3x1024 (~70 ms) tamponlama yetmiyor,
- * geri cagirma geciktiginde kuyruk aciligindan ses kesiliyordu. */
+#define OUT_CH     AUDIO_OUT_CHANNELS
 #define NBUF       6
 #define FRAMES     2048
 
-#define MAXSND 128
+#define MAXSND     AUDIO_MAX_BUFFERS
+
 typedef struct {
     uint32_t data, bytes, rate, chans, bits;
     int      used, playing, loop;
@@ -83,25 +96,114 @@ typedef struct {
 static SndBuf g_snd[MAXSND];
 static int    g_sndn = 1;                    /* 0 = gecersiz kimlik */
 static pthread_mutex_t g_slock = PTHREAD_MUTEX_INITIALIZER;
+
 static AudioQueueRef        g_q;
 static AudioQueueBufferRef  g_qb[NBUF];
-static AudioUnit            g_au;            /* dusuk gecikmeli yol */
-static int g_audio_on = 0;
-static int g_backend = 0;                    /* 1 = AudioUnit, 2 = AudioQueue */
-static unsigned g_au_slice = 0;              /* geri cagirma basina kare */
+static AudioUnit            g_au = NULL;     /* Dusuk gecikmeli RemoteIO */
+static unsigned             g_au_slice = 0;  /* Geri cagirma basina gerceklesen kare */
+
 static uint64_t g_mixed_frames = 0, g_active_peak = 0;
 static uint64_t g_replay = 0, g_reissue = 0, g_starved = 0, g_worst_gap_us = 0;
 static uint64_t g_out_frames = 0, g_out_zero = 0, g_gap_cb = 0;
 
-/* --- tani: karistirici cikisini ve tampon durumunu diske dok --- */
+/* Tani dosyalari */
 static FILE *g_dump = NULL;      /* SNDDUMP=<yol> : ham s16le stereo */
 static FILE *g_csv  = NULL;      /* SNDCSV=<yol>  : geri-cagirma basina durum */
 static uint64_t g_cb_no = 0;
 
+/* --- Kilit-Serbest (Lock-Free) SPSC Dairesel Tampon Uygulamasi --- */
+static AudioRingBuffer g_stream_rb;
+
+bool audio_ringbuf_init(AudioRingBuffer *rb, size_t capacity_frames, uint32_t channels){
+    if (!rb || (capacity_frames & (capacity_frames - 1)) != 0) return false;
+    rb->channels = (channels > 0) ? channels : OUT_CH;
+    rb->capacity_frames = capacity_frames;
+    rb->mask = capacity_frames - 1;
+    atomic_init(&rb->write_pos, 0);
+    atomic_init(&rb->read_pos, 0);
+    rb->buffer = (int16_t *)calloc(capacity_frames * rb->channels, sizeof(int16_t));
+    return rb->buffer != NULL;
+}
+
+void audio_ringbuf_destroy(AudioRingBuffer *rb){
+    if (rb && rb->buffer){
+        free(rb->buffer);
+        rb->buffer = NULL;
+    }
+}
+
+void audio_ringbuf_reset(AudioRingBuffer *rb){
+    if (!rb) return;
+    atomic_store_explicit(&rb->write_pos, 0, memory_order_relaxed);
+    atomic_store_explicit(&rb->read_pos, 0, memory_order_relaxed);
+    if (rb->buffer){
+        memset(rb->buffer, 0, rb->capacity_frames * rb->channels * sizeof(int16_t));
+    }
+}
+
+size_t audio_ringbuf_available_read(const AudioRingBuffer *rb){
+    if (!rb) return 0;
+    size_t w = atomic_load_explicit(&rb->write_pos, memory_order_acquire);
+    size_t r = atomic_load_explicit(&rb->read_pos, memory_order_relaxed);
+    return (w >= r) ? (w - r) : 0;
+}
+
+size_t audio_ringbuf_available_write(const AudioRingBuffer *rb){
+    if (!rb) return 0;
+    size_t w = atomic_load_explicit(&rb->write_pos, memory_order_relaxed);
+    size_t r = atomic_load_explicit(&rb->read_pos, memory_order_acquire);
+    size_t used = (w >= r) ? (w - r) : 0;
+    return (used < rb->capacity_frames) ? (rb->capacity_frames - used) : 0;
+}
+
+size_t audio_ringbuf_write(AudioRingBuffer *rb, const int16_t *src, size_t frames){
+    if (!rb || !src || !frames) return 0;
+    size_t avail = audio_ringbuf_available_write(rb);
+    if (frames > avail) frames = avail;
+    if (frames == 0) return 0;
+
+    size_t w = atomic_load_explicit(&rb->write_pos, memory_order_relaxed);
+    size_t idx = w & rb->mask;
+    size_t first = rb->capacity_frames - idx;
+    if (first > frames) first = frames;
+    size_t second = frames - first;
+
+    memcpy(rb->buffer + idx * rb->channels, src, first * rb->channels * sizeof(int16_t));
+    if (second > 0){
+        memcpy(rb->buffer, src + first * rb->channels, second * rb->channels * sizeof(int16_t));
+    }
+
+    atomic_store_explicit(&rb->write_pos, w + frames, memory_order_release);
+    return frames;
+}
+
+size_t audio_ringbuf_read(AudioRingBuffer *rb, int16_t *dst, size_t frames){
+    if (!rb || !dst || !frames) return 0;
+    size_t avail = audio_ringbuf_available_read(rb);
+    if (frames > avail) frames = avail;
+    if (frames == 0) return 0;
+
+    size_t r = atomic_load_explicit(&rb->read_pos, memory_order_relaxed);
+    size_t idx = r & rb->mask;
+    size_t first = rb->capacity_frames - idx;
+    if (first > frames) first = frames;
+    size_t second = frames - first;
+
+    memcpy(dst, rb->buffer + idx * rb->channels, first * rb->channels * sizeof(int16_t));
+    if (second > 0){
+        memcpy(dst + first * rb->channels, rb->buffer, second * rb->channels * sizeof(int16_t));
+    }
+
+    atomic_store_explicit(&rb->read_pos, r + frames, memory_order_release);
+    return frames;
+}
+
+/* --- DirectSound COM Katmani Fonksiyonlari --- */
+
 int audio_register(uint32_t data, uint32_t bytes, uint32_t rate,
                    uint32_t chans, uint32_t bits){
     if (!data || !bytes) return 0;
-    if (rate < 4000u || rate > 192000u) rate = 44100u;
+    if (rate < 4000u || rate > 192000u) rate = AUDIO_DEFAULT_RATE;
     if (chans < 1u || chans > 2u) chans = 1u;
     if (bits != 8u && bits != 16u) bits = 16u;
     pthread_mutex_lock(&g_slock);
@@ -122,13 +224,12 @@ int audio_register(uint32_t data, uint32_t bytes, uint32_t rate,
     pthread_mutex_unlock(&g_slock);
     return id;
 }
+
 void audio_play(int id, int loop){
     if (id <= 0 || id >= MAXSND) return;
     pthread_mutex_lock(&g_slock);
     if (g_snd[id].used){
-        /* DIKKAT: zaten calan bir tamponda imleci SIFIRLAMA.  Oyun akis
-         * tamponlarinda Play'i tekrar tekrar cagiriyor; her cagride basa
-         * donulunce sarki "dur-basla" seklinde tekliyordu. */
+        /* Calan akis tamponunda imleci SIFIRLAMA; dur-basla teklemelerini engeller */
         if (!g_snd[id].playing){ g_snd[id].cursor = 0.0; g_replay++; }
         else g_reissue++;
         g_snd[id].playing = 1;
@@ -137,9 +238,14 @@ void audio_play(int id, int loop){
     }
     pthread_mutex_unlock(&g_slock);
 }
-/* Guest Unlock'tan: yazilan bolgenin BITIS ofseti.  Karistirici oynatma
- * imlecini bunun sabit bir mesafe gerisinde tutar (servo) - boylece ne
- * yazilmamis bolge calinir (bosluk) ne de imlec geri kalir (gecikme). */
+
+void audio_stop(int id){
+    if (id <= 0 || id >= MAXSND) return;
+    pthread_mutex_lock(&g_slock);
+    if (g_snd[id].used){ g_snd[id].playing = 0; g_snd[id].stops++; }
+    pthread_mutex_unlock(&g_slock);
+}
+
 void audio_note_write(int id, uint32_t end_off){
     if (id <= 0 || id >= MAXSND) return;
     pthread_mutex_lock(&g_slock);
@@ -149,21 +255,23 @@ void audio_note_write(int id, uint32_t end_off){
     }
     pthread_mutex_unlock(&g_slock);
 }
+
 void audio_note_write_stat(int id, uint32_t n, int nonzero){
     if (id <= 0 || id >= MAXSND) return;
     pthread_mutex_lock(&g_slock);
-    if (g_snd[id].used){ g_snd[id].wr_calls++; g_snd[id].wr_bytes += n;
-                         if (nonzero) g_snd[id].wr_nonzero++; }
+    if (g_snd[id].used){
+        g_snd[id].wr_calls++;
+        g_snd[id].wr_bytes += n;
+        if (nonzero) g_snd[id].wr_nonzero++;
+    }
     pthread_mutex_unlock(&g_slock);
 }
-/* DirectSound SetFrequency: oynatma ornekleme hizini degistirir.
- * Oyun motor sesi gibi efektlerin PERDESINI boyle ayarliyor; uygulanmayinca
- * her ses ozgun hizinda calar. */
+
 void audio_set_freq(int id, uint32_t hz){
     if (id <= 0 || id >= MAXSND) return;
     pthread_mutex_lock(&g_slock);
     if (g_snd[id].used && g_snd[id].rate){
-        if (!hz) g_snd[id].freq = 1.0;                      /* DSBFREQUENCY_ORIGINAL */
+        if (!hz) g_snd[id].freq = 1.0;
         else {
             double f = (double)hz / (double)g_snd[id].rate;
             if (f < 0.05) f = 0.05;
@@ -173,9 +281,7 @@ void audio_set_freq(int id, uint32_t hz){
     }
     pthread_mutex_unlock(&g_slock);
 }
-/* Ayni PCM verisini paylasan ikinci bir ses (DuplicateSoundBuffer).
- * Oyun ES ZAMANLI efektleri boyle calar; kopya bos donunce hepsi
- * sessiz kaliyordu. */
+
 int audio_duplicate(int src){
     if (src <= 0 || src >= MAXSND) return 0;
     int id = 0;
@@ -191,18 +297,7 @@ int audio_duplicate(int src){
     pthread_mutex_unlock(&g_slock);
     return id;
 }
-void audio_stop(int id){
-    if (id <= 0 || id >= MAXSND) return;
-    pthread_mutex_lock(&g_slock);
-    if (g_snd[id].used){ g_snd[id].playing = 0; g_snd[id].stops++; }
-    pthread_mutex_unlock(&g_slock);
-}
-/* Guest'in GetCurrentPosition'i icin.
- * DirectSound iki imlec dondurur: OYNATMA ve YAZMA.  Yazma imleci
- * oynatmanin ONUNDEDIR (donanimin okumakta oldugu guvenli sinir); oyun
- * veriyi oradan itibaren yazar.  Ikisini esit dondurmek, oyunun tam
- * caldigimiz noktaya yazmasina ve sesin "dur-basla" seklinde teklemesine
- * yol aciyordu. */
+
 #define WRITE_LEAD_MS 50u
 void audio_cursors(int id, uint32_t *play, uint32_t *write){
     uint32_t p = 0, w = 0;
@@ -221,13 +316,15 @@ void audio_cursors(int id, uint32_t *play, uint32_t *write){
     if (play)  *play  = p;
     if (write) *write = w;
 }
-/* Karistiricinin zaman ekseni (SNDDUMP dosyasiyla ayni t).  Tani
- * kayitlarini ses dokumuyle hizalamak icin. */
-double audio_time(void){ return (double)g_mixed_frames / (double)OUT_RATE; }
-uint32_t audio_cursor(int id){ uint32_t p; audio_cursors(id, &p, 0); return p; }
+
+uint32_t audio_cursor(int id){
+    uint32_t p = 0;
+    audio_cursors(id, &p, NULL);
+    return p;
+}
+
 void audio_set_volume(int id, long millibel){
     if (id <= 0 || id >= MAXSND) return;
-    /* DirectSound: 0 = tam ses, -10000 = sessiz (yuzde yuz logaritmik) */
     float v = (millibel <= -10000L) ? 0.f : powf(10.f, (float)millibel / 2000.f);
     if (v > 1.f) v = 1.f;
     pthread_mutex_lock(&g_slock);
@@ -235,12 +332,37 @@ void audio_set_volume(int id, long millibel){
     pthread_mutex_unlock(&g_slock);
 }
 
+double audio_time(void){
+    uint32_t hw_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
+    if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
+    return (double)g_mixed_frames / (double)hw_rate;
+}
+
+uint32_t audio_get_hardware_rate(void){
+    return (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
+}
+
+int audio_is_active(void){
+    return atomic_load_explicit(&g_audio_on, memory_order_relaxed) &&
+           !atomic_load_explicit(&g_audio_suspended, memory_order_relaxed);
+}
+
+int audio_is_suspended(void){
+    return atomic_load_explicit(&g_audio_suspended, memory_order_relaxed);
+}
+
+/* --- Karistirici (Mixer) Cekirdegi ---
+ * Dinamik Donanim Hizina (44.1 kHz / 48 kHz) Dogrusal Ara-Degerleme (Linear Interpolation)
+ * ile yuksek kaliteli resample yapar; motor sesi ve EA Trax'te aliasing'i onler. */
 static void mix_into(int16_t *out, unsigned frames){
     static float acc[FRAMES * OUT_CH];
     if (frames > FRAMES) frames = FRAMES;
     memset(acc, 0, sizeof(float) * frames * OUT_CH);
     uint64_t active = 0;
     update_rate_ratio();
+
+    uint32_t hw_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
+    if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
 
     pthread_mutex_lock(&g_slock);
     for (int i = 1; i < g_sndn; i++){
@@ -251,20 +373,8 @@ static void mix_into(int16_t *out, unsigned frames){
         if (!bpf) continue;
         uint32_t nsrc = b->bytes / bpf;
         if (!nsrc) continue;
-        /* TEK YONLU servo: hiz orani (feedforward) uretimle tuketimi zaten
-         * esitliyor.  Servo yalnizca ONUMUZDEKI YAZILI VERI AZALDIGINDA
-         * devreye girip yavaslatir; boylece yazilmamis bolge hic calinmaz.
-         * Iki yonlu servo hedefi yanlis secilince durumu kotulestirmisti. */
-        /* --- oynatma imlecini oyunun YAZMA imlecine kilitle (PLL) ---
-         * Serbest calisan imlec, %1'lik bir hiz farkiyla bile tampon
-         * boyunca yavasca kayar ve her turda yazilmamis bolgeden bir kez
-         * gecer.  Olculdu: tam 30 sn'de bir 50-95 ms sessizlik; hiz orani
-         * 0.99 iken bile.  Periyot = tampon_suresi / hiz_hatasi, yani
-         * ileri-besleme hatayi kucultur ama SIFIRLAMAZ.
-         * Cozum: tuketim hizini, yazili veri miktarini (avail) sabit
-         * tutacak sekilde surekli duzelt.  Hedef, oyunun kendi dogal
-         * denge noktasi olsun -- sabit bir sayi secmek yanlis olur
-         * (once 0.25 secilmisti, oyun 0.30-0.64 arasinda calisiyor). */
+
+        /* Oynatma imlecini oyunun YAZMA imlecine kilitle (PLL / Servo) */
         if (b->wseen){
             uint32_t bpf2 = b->chans * (b->bits/8u);
             uint32_t pbyte = ((uint32_t)(b->cursor * (double)bpf2)) % b->bytes;
@@ -272,68 +382,58 @@ static void mix_into(int16_t *out, unsigned frames){
             double frac = (double)avail / (double)b->bytes;
             double want;
             if (frac > 0.85){
-                /* imlec yaziciyi GECTI (avail modulo sarmasiyla buyuk
-                 * gorunuyor).  Hedefe dogru servo yapmak yerine sert
-                 * yavasla ve hedefi bozma. */
                 b->over++;
                 want = 0.94;
             } else {
                 if (b->target <= 0.0) b->target = frac;
-                else b->target += (frac - b->target) * 0.0008;   /* cok yavas */
+                else b->target += (frac - b->target) * 0.0008;
                 if (b->target < 0.12) b->target = 0.12;
                 if (b->target > 0.60) b->target = 0.60;
-                /* Kp kucuk + kelepce dar: perde degisimi 3 sentin altinda
-                 * kalir, yani duyulmaz; ama kayma tamamen yok olur. */
                 want = 1.0 + (frac - b->target) * 1.5;
                 if (want < 0.97) want = 0.97;
                 if (want > 1.03) want = 1.03;
             }
             b->trim += (want - b->trim) * 0.05;
-        } else b->trim += (1.0 - b->trim) * 0.08;
-        if (b->trim < 0.5 || b->trim > 2.0) b->trim = 1.0;
-        if (g_csv){
-            uint32_t bpf3 = b->chans * (b->bits/8u);
-            uint32_t pb = ((uint32_t)(b->cursor * (double)bpf3)) % b->bytes;
-            uint32_t av = b->wseen ? ((b->wpos + b->bytes - pb) % b->bytes) : 0u;
-            fprintf(g_csv, "%llu,%.4f,%d,%u,%u,%u,%u,%u,%.4f,%.4f,%.4f,%.4f,",
-                    (unsigned long long)g_cb_no,
-                    (double)g_mixed_frames/(double)OUT_RATE, i, b->rate, b->bytes,
-                    pb, b->wpos, av, (double)av/(double)b->bytes,
-                    b->target, b->trim, g_rate_ratio);
+        } else {
+            b->trim += (1.0 - b->trim) * 0.08;
         }
-        double step = (double)b->rate / (double)OUT_RATE * g_rate_ratio * b->trim * b->freq;
+        if (b->trim < 0.5 || b->trim > 2.0) b->trim = 1.0;
+
+        /* Dinamik adim: Kaynak Frekans / Donanim Cikis Frekansi * Senkron * Servo * Pitch */
+        double step = ((double)b->rate / (double)hw_rate) * g_rate_ratio * b->trim * b->freq;
         active++;
+
+        /* Dogrusal Ara-Degerlemeli (Linear Interpolated) Karistirma */
         for (unsigned f = 0; f < frames; f++){
             double sp = b->cursor + step * (double)f;
             if (sp >= (double)nsrc){
                 if (b->loop) sp = fmod(sp, (double)nsrc);
                 else { b->playing = 0; break; }
             }
-            uint32_t si = (uint32_t)sp;
+            uint32_t si0 = (uint32_t)sp;
+            uint32_t si1 = (si0 + 1 < nsrc) ? (si0 + 1) : (b->loop ? 0 : si0);
+            float alpha = (float)(sp - (double)si0);
+
             for (int c = 0; c < OUT_CH; c++){
                 uint32_t sc = (b->chans == 2u) ? (uint32_t)c : 0u;
-                uint32_t off = b->data + si*bpf + sc*bps;
-                float s;
+                uint32_t off0 = b->data + si0 * bpf + sc * bps;
+                uint32_t off1 = b->data + si1 * bpf + sc * bps;
+                float s0, s1;
                 if (b->bits == 16u){
-                    int16_t v; memcpy(&v, g_mem + off, 2);
-                    s = (float)v / 32768.f;
+                    int16_t v0, v1;
+                    memcpy(&v0, g_mem + off0, 2);
+                    memcpy(&v1, g_mem + off1, 2);
+                    s0 = (float)v0 / 32768.f;
+                    s1 = (float)v1 / 32768.f;
                 } else {
-                    s = ((float)g_mem[off] - 128.f) / 128.f;
+                    s0 = ((float)g_mem[off0] - 128.f) / 128.f;
+                    s1 = ((float)g_mem[off1] - 128.f) / 128.f;
                 }
-                acc[f*OUT_CH + c] += s * b->vol;
+                float sample = s0 + alpha * (s1 - s0);
+                acc[f * OUT_CH + c] += sample * b->vol;
             }
         }
-        if (g_csv){
-            /* bu tamponun OKUDUGU kaynak bolgesinde kac bayt sifir? */
-            uint32_t bpf4 = b->chans * (b->bits/8u);
-            uint32_t p0 = ((uint32_t)(b->cursor * (double)bpf4)) % b->bytes;
-            uint32_t nby = (uint32_t)(step * (double)frames * (double)bpf4);
-            if (nby > b->bytes) nby = b->bytes;
-            uint32_t z = 0;
-            for (uint32_t q = 0; q < nby; q++)
-                if (!g_mem[b->data + ((p0 + q) % b->bytes)]) z++;
-            fprintf(g_csv, "%.4f\n", nby ? (double)z/(double)nby : 0.0);
-        }
+
         b->cursor += step * (double)frames;
         if (nsrc){
             if (b->cursor >= (double)nsrc){
@@ -343,58 +443,20 @@ static void mix_into(int16_t *out, unsigned frames){
         }
     }
     pthread_mutex_unlock(&g_slock);
+
     if (active > g_active_peak) g_active_peak = active;
     g_mixed_frames += frames;
-    /* Periyodik durum: hangi tampon caliyor, dolu mu? */
-    if (getenv("SNDSTAT")){
-        static uint64_t next = 0;
-        if (g_mixed_frames >= next){
-            next = g_mixed_frames + (uint64_t)OUT_RATE * 2ull;
-            pthread_mutex_lock(&g_slock);
-            fprintf(stderr, "  [durum] ");
-            for (int i2 = 1; i2 < g_sndn; i2++){
-                if (!g_snd[i2].used) continue;
-                uint32_t nz = 0, lim = g_snd[i2].bytes < 8192u ? g_snd[i2].bytes : 8192u;
-                for (uint32_t q = 0; q < lim; q++) if (g_mem[g_snd[i2].data + q]) nz++;
-                fprintf(stderr, "#%d[%s%s %uHz veri=%u%%] ", i2,
-                        g_snd[i2].playing ? "cal" : "dur",
-                        g_snd[i2].loop ? "+dongu" : "",
-                        g_snd[i2].rate, lim ? (unsigned)(100u*nz/lim) : 0u);
-            }
-            fprintf(stderr, "\n");
-            pthread_mutex_unlock(&g_slock);
-        }
-    }
 
-    /* Okudugumuz veri gercekten sessiz mi?  Sessizse oyun o bolgeyi
-     * HENUZ YAZMAMIS demektir (bizim imlec yaziciyi geciyor). */
+    /* Sessizlik kontrolu */
     if (active){
         unsigned zero = 0;
         for (unsigned k = 0; k < frames * OUT_CH; k++) if (acc[k] == 0.f) zero++;
         g_out_frames += frames * OUT_CH;
         g_out_zero   += zero;
-        if (zero > (frames * OUT_CH) * 3u / 4u){
-            g_gap_cb++;
-            static int shown = 0;
-            if (getenv("SNDGAP") && shown < 40 &&
-                g_mixed_frames > (uint64_t)OUT_RATE * 5ull){ shown++;
-                fprintf(stderr, "  [bosluk] t=%.2f sn\n",
-                        (double)g_mixed_frames / (double)OUT_RATE);
-            }
-            if (0){
-                fprintf(stderr, "  [bosluk] calan tamponlar:");
-                pthread_mutex_lock(&g_slock);
-                for (int i2 = 1; i2 < g_sndn; i2++)
-                    if (g_snd[i2].used && g_snd[i2].playing)
-                        fprintf(stderr, " #%d(imlec=%.0f/%u dongu=%d)", i2,
-                                g_snd[i2].cursor,
-                                g_snd[i2].bytes / (g_snd[i2].chans*(g_snd[i2].bits/8u)),
-                                g_snd[i2].loop);
-                pthread_mutex_unlock(&g_slock);
-                fprintf(stderr, "\n");
-            }
-        }
+        if (zero > (frames * OUT_CH) * 3u / 4u) g_gap_cb++;
     }
+
+    /* Doygunluk ve int16 paketleme */
     for (unsigned k = 0; k < frames * OUT_CH; k++){
         float v = acc[k];
         if (v >  1.f) v =  1.f;
@@ -406,49 +468,170 @@ static void mix_into(int16_t *out, unsigned frames){
 }
 
 static uint64_t now_us_a(void){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
-    return (uint64_t)ts.tv_sec*1000000ull + (uint64_t)ts.tv_nsec/1000ull;
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
 }
+
+/* AudioQueue Geri Cagirmasi (Yedek Yol) */
 static void cb(void *ud, AudioQueueRef q, AudioQueueBufferRef buf){
     (void)ud;
-    /* Geri cagirmalar arasi sure tampon suresini asarsa kuyruk BOSALMIS,
-     * yani ses kesilmis demektir.  Olculuyor. */
-    { static uint64_t last = 0;
-      uint64_t now = now_us_a();
-      uint64_t budget = (uint64_t)FRAMES * 1000000ull / (uint64_t)OUT_RATE;
-      if (last && now - last > budget * (uint64_t)NBUF) g_starved++;
-      if (last){ uint64_t d = now - last; if (d > g_worst_gap_us) g_worst_gap_us = d; }
-      last = now; }
+    if (atomic_load_explicit(&g_audio_suspended, memory_order_relaxed)){
+        memset(buf->mAudioData, 0, FRAMES * OUT_CH * sizeof(int16_t));
+        buf->mAudioDataByteSize = FRAMES * OUT_CH * sizeof(int16_t);
+        AudioQueueEnqueueBuffer(q, buf, 0, NULL);
+        return;
+    }
+    uint32_t hw_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
+    if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
+
+    static uint64_t last = 0;
+    uint64_t now = now_us_a();
+    uint64_t budget = (uint64_t)FRAMES * 1000000ull / (uint64_t)hw_rate;
+    if (last && now - last > budget * (uint64_t)NBUF) g_starved++;
+    if (last){ uint64_t d = now - last; if (d > g_worst_gap_us) g_worst_gap_us = d; }
+    last = now;
+
     mix_into((int16_t *)buf->mAudioData, FRAMES);
     buf->mAudioDataByteSize = FRAMES * OUT_CH * sizeof(int16_t);
     AudioQueueEnqueueBuffer(q, buf, 0, NULL);
 }
 
-/* AudioUnit render geri cagirmasi.  AudioQueue yolundan tek farki, ciktinin
- * hazir bir kuyruk tamponuna degil dogrudan aygitin ABL'sine yazilmasi. */
+/* RemoteIO AudioUnit Render Geri Cagirmasi (Ana Dusuk Gecikmeli Yol)
+ * Priority Inversion Korumasi: Asla bekletici kilit almaz veya sistem cagrilarina takilmaz. */
 static OSStatus au_cb(void *ud, AudioUnitRenderActionFlags *flags,
                       const AudioTimeStamp *ts, UInt32 bus, UInt32 nframes,
                       AudioBufferList *abl){
     (void)ud; (void)flags; (void)ts; (void)bus;
-    { static uint64_t last = 0;
-      uint64_t now = now_us_a();
-      if (last){ uint64_t d = now - last; if (d > g_worst_gap_us) g_worst_gap_us = d; }
-      last = now; }
-    if (!abl || abl->mNumberBuffers < 1) return noErr;
+    if (!abl || abl->mNumberBuffers < 1 || !abl->mBuffers[0].mData) return noErr;
+
+    /* Askiya alma veya rota rekonfigrasyonu sirasinda koruma: sessizlik ver ve don */
+    if (atomic_load_explicit(&g_audio_suspended, memory_order_relaxed) ||
+        atomic_load_explicit(&g_audio_reconfiguring, memory_order_relaxed) ||
+        !atomic_load_explicit(&g_audio_on, memory_order_relaxed)){
+        memset(abl->mBuffers[0].mData, 0, nframes * OUT_CH * sizeof(int16_t));
+        abl->mBuffers[0].mDataByteSize = nframes * OUT_CH * sizeof(int16_t);
+        return noErr;
+    }
+
+    static uint64_t last = 0;
+    uint64_t now = now_us_a();
+    if (last){ uint64_t d = now - last; if (d > g_worst_gap_us) g_worst_gap_us = d; }
+    last = now;
+
     int16_t *out = (int16_t *)abl->mBuffers[0].mData;
-    if (!out) return noErr;
-    if (nframes > (UInt32)FRAMES) nframes = (UInt32)FRAMES;   /* acc dizisi siniri */
+    if (nframes > (UInt32)FRAMES) nframes = (UInt32)FRAMES;
     if (nframes > g_au_slice) g_au_slice = nframes;
+
     mix_into(out, (unsigned)nframes);
     abl->mBuffers[0].mDataByteSize = nframes * OUT_CH * sizeof(int16_t);
     return noErr;
 }
 
-/* AudioQueue 6 x 2048 kare kuyruklar: 278.6 ms.  Bu, Windows'ta OLMAYAN,
- * tamamen bizim ekledigimiz gecikmeydi ve oyunun kendi DirectSound
- * gecikmesinin (~275 ms) uzerine biniyordu.  AudioUnit aygitin kendi
- * dilimiyle (genelde 512 kare = 11.6 ms) calisir. */
 #if TARGET_OS_IPHONE
+
+/* --- iOS AVAudioSession ve Yasam Dongusu Gozlemcisi --- */
+@interface NFSU2AudioLifecycleObserver : NSObject
+@end
+
+@implementation NFSU2AudioLifecycleObserver
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+        AVAudioSession *session = [AVAudioSession sharedInstance];
+
+        [nc addObserver:self
+               selector:@selector(handleInterruption:)
+                   name:AVAudioSessionInterruptionNotification
+                 object:session];
+
+        [nc addObserver:self
+               selector:@selector(handleRouteChange:)
+                   name:AVAudioSessionRouteChangeNotification
+                 object:session];
+
+        [nc addObserver:self
+               selector:@selector(handleMediaReset:)
+                   name:AVAudioSessionMediaServicesWereResetNotification
+                 object:session];
+
+#if !TARGET_OS_SIMULATOR && !TARGET_OS_MACCATALYST
+        [nc addObserver:self
+               selector:@selector(handleAppDidEnterBackground:)
+                   name:UIApplicationDidEnterBackgroundNotification
+                 object:nil];
+
+        [nc addObserver:self
+               selector:@selector(handleAppWillEnterForeground:)
+                   name:UIApplicationWillEnterForegroundNotification
+                 object:nil];
+#endif
+    }
+    return self;
+}
+
+- (void)handleInterruption:(NSNotification *)note {
+    NSDictionary *info = note.userInfo;
+    if (!info) return;
+    AVAudioSessionInterruptionType type = (AVAudioSessionInterruptionType)[[info objectForKey:AVAudioSessionInterruptionTypeKey] unsignedIntegerValue];
+
+    if (type == AVAudioSessionInterruptionTypeBegan) {
+        fprintf(stderr, "  [ses-ios] Kesinti basladi (Telefon/Alarm/Siri), ses guvenle durduruluyor\n");
+        audio_ios_pause();
+    } else if (type == AVAudioSessionInterruptionTypeEnded) {
+        NSUInteger opts = [[info objectForKey:AVAudioSessionInterruptionOptionKey] unsignedIntegerValue];
+        fprintf(stderr, "  [ses-ios] Kesinti bitti, surdurulme bayragi=%d\n",
+                (opts & AVAudioSessionInterruptionOptionShouldResume) ? 1 : 0);
+        if (opts & AVAudioSessionInterruptionOptionShouldResume) {
+            audio_ios_resume();
+        }
+    }
+}
+
+- (void)handleRouteChange:(NSNotification *)note {
+    NSDictionary *info = note.userInfo;
+    if (!info) return;
+    AVAudioSessionRouteChangeReason reason = (AVAudioSessionRouteChangeReason)[[info objectForKey:AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
+    fprintf(stderr, "  [ses-ios] Rota degisikligi algilandi (sebep: %u)\n", (unsigned)reason);
+
+    AVAudioSession *session = [AVAudioSession sharedInstance];
+    double currentHW = session.sampleRate;
+    if (currentHW > 4000.0 && currentHW < 192000.0) {
+        uint32_t target_rate = (uint32_t)round(currentHW);
+        uint32_t current_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
+        if (target_rate != current_rate) {
+            fprintf(stderr, "  [ses-ios] Donanim ornekleme hizi degisimi: %u Hz -> %u Hz\n",
+                    current_rate, target_rate);
+            audio_ios_reconfigure_sample_rate(target_rate);
+        }
+    }
+}
+
+- (void)handleMediaReset:(NSNotification *)note {
+    (void)note;
+    fprintf(stderr, "  [ses-ios] KRITIK: audiod MediaServicesWereReset! Ses hatti bastan kuruluyor.\n");
+    audio_ios_restart_subsystem();
+}
+
+#if !TARGET_OS_SIMULATOR && !TARGET_OS_MACCATALYST
+- (void)handleAppDidEnterBackground:(NSNotification *)note {
+    (void)note;
+    fprintf(stderr, "  [ses-ios] Uygulama arka plana gecti, RemoteIO durduruluyor\n");
+    audio_ios_pause();
+}
+
+- (void)handleAppWillEnterForeground:(NSNotification *)note {
+    (void)note;
+    fprintf(stderr, "  [ses-ios] Uygulama on plana dondu, RemoteIO canlandiriliyor\n");
+    audio_ios_resume();
+}
+#endif
+
+@end
+
+static NFSU2AudioLifecycleObserver *g_lifecycle_observer = nil;
+
 static int audio_setup_ios_session(void){
     @autoreleasepool {
         AVAudioSession *session = [AVAudioSession sharedInstance];
@@ -463,19 +646,13 @@ static int audio_setup_ios_session(void){
             return 0;
         }
 
-        [session setPreferredIOBufferDuration:0.01 error:&err];
-        if (err){
-            fprintf(stderr, "  [ses-ios] setPreferredIOBufferDuration uyarisi: %s\n",
-                    [[err localizedDescription] UTF8String]);
-            err = nil;
-        }
+        /* 5-10 ms ultra dusuk gecikmeli donanim tamponu */
+        [session setPreferredIOBufferDuration:0.008 error:&err];
+        if (err) err = nil;
 
-        [session setPreferredSampleRate:(double)OUT_RATE error:&err];
-        if (err){
-            fprintf(stderr, "  [ses-ios] setPreferredSampleRate uyarisi: %s\n",
-                    [[err localizedDescription] UTF8String]);
-            err = nil;
-        }
+        /* Donanim ornekleme hizi tercihi: 44.1 kHz */
+        [session setPreferredSampleRate:(double)AUDIO_DEFAULT_RATE error:&err];
+        if (err) err = nil;
 
         ok = [session setActive:YES error:&err];
         if (!ok || err){
@@ -484,63 +661,53 @@ static int audio_setup_ios_session(void){
             return 0;
         }
 
-        fprintf(stderr, "  [ses-ios] AVAudioSession basariyla baslatildi (Playback, MixWithOthers, 10ms tampon)\n");
+        /* Gercek donanim ornekleme hizini sorgula (AirPods 48kHz, Dahili 44.1kHz/48kHz) */
+        double actRate = session.sampleRate;
+        if (actRate >= 4000.0 && actRate <= 192000.0){
+            atomic_store_explicit(&g_hw_rate, (uint32_t)round(actRate), memory_order_relaxed);
+        } else {
+            atomic_store_explicit(&g_hw_rate, AUDIO_DEFAULT_RATE, memory_order_relaxed);
+        }
+
+        fprintf(stderr, "  [ses-ios] AVAudioSession baslatildi (Gercek Donanim: %u Hz, IO: %.1f ms)\n",
+                (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed),
+                session.IOBufferDuration * 1000.0);
+
+        if (!g_lifecycle_observer){
+            g_lifecycle_observer = [[NFSU2AudioLifecycleObserver alloc] init];
+        }
         return 1;
     }
 }
 #endif
 
-static int au_start(const AudioStreamBasicDescription *f){
+/* RemoteIO AudioUnit Baslatma */
+static int au_start(uint32_t rate){
     AudioComponentDescription d;
     memset(&d, 0, sizeof d);
     d.componentType         = kAudioUnitType_Output;
-    #if TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE
     d.componentSubType      = kAudioUnitSubType_RemoteIO;
 #else
     d.componentSubType      = kAudioUnitSubType_DefaultOutput;
 #endif
     d.componentManufacturer = kAudioUnitManufacturer_Apple;
+
     AudioComponent comp = AudioComponentFindNext(NULL, &d);
     if (!comp) return 0;
     if (AudioComponentInstanceNew(comp, &g_au) != noErr) return 0;
-#if TARGET_OS_IPHONE
-    { UInt32 enableOutput = 1;
-      AudioUnitSetProperty(g_au, kAudioOutputUnitProperty_EnableIO,
-                           kAudioUnitScope_Output, 0, &enableOutput, sizeof enableOutput); }
-#endif
-    if (AudioUnitSetProperty(g_au, kAudioUnitProperty_StreamFormat,
-                             kAudioUnitScope_Input, 0, f, sizeof *f) != noErr) goto fail;
-    { UInt32 mx = FRAMES;
-      AudioUnitSetProperty(g_au, kAudioUnitProperty_MaximumFramesPerSlice,
-                           kAudioUnitScope_Global, 0, &mx, sizeof mx); }
-    { AURenderCallbackStruct rc; rc.inputProc = au_cb; rc.inputProcRefCon = NULL;
-      if (AudioUnitSetProperty(g_au, kAudioUnitProperty_SetRenderCallback,
-                               kAudioUnitScope_Input, 0, &rc, sizeof rc) != noErr) goto fail; }
-    if (AudioUnitInitialize(g_au) != noErr) goto fail;
-    if (AudioOutputUnitStart(g_au) != noErr){ AudioUnitUninitialize(g_au); goto fail; }
-    return 1;
-fail:
-    AudioComponentInstanceDispose(g_au); g_au = NULL; return 0;
-}
 
-void audio_init(void){
-    if (g_audio_on) return;
-    { const char *e = getenv("NOSOUND"); if (e && *e && *e != '0') return; }
 #if TARGET_OS_IPHONE
-    if (!audio_setup_ios_session()){
-        fprintf(stderr, "ses: iOS AVAudioSession baslatilamadi, ses devre disi\n");
-        return;
+    {
+        UInt32 enableOutput = 1;
+        AudioUnitSetProperty(g_au, kAudioOutputUnitProperty_EnableIO,
+                             kAudioUnitScope_Output, 0, &enableOutput, sizeof enableOutput);
     }
 #endif
-    { const char *d = getenv("SNDDUMP");
-      if (d && *d){ g_dump = fopen(d, "wb");
-          fprintf(stderr, "ses: cikis dokumu -> %s (%d Hz s16le %d kanal)\n", d, OUT_RATE, OUT_CH); } }
-    { const char *d = getenv("SNDCSV");
-      if (d && *d){ g_csv = fopen(d, "w");
-          if (g_csv) fprintf(g_csv, "cb,t,id,rate,bytes,pbyte,wpos,avail,frac,target,trim,ratio,zero\n"); } }
+
     AudioStreamBasicDescription f;
     memset(&f, 0, sizeof f);
-    f.mSampleRate       = OUT_RATE;
+    f.mSampleRate       = (double)rate;
     f.mFormatID         = kAudioFormatLinearPCM;
     f.mFormatFlags      = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
     f.mChannelsPerFrame = OUT_CH;
@@ -548,39 +715,204 @@ void audio_init(void){
     f.mFramesPerPacket  = 1;
     f.mBytesPerFrame    = OUT_CH * sizeof(int16_t);
     f.mBytesPerPacket   = f.mBytesPerFrame;
-    /* SNDBACKEND=queue ile eski (yuksek gecikmeli) yola donulebilir. */
-    { const char *e = getenv("SNDBACKEND");
-      if (!(e && *e == 'q') && au_start(&f)){
-          g_backend = 1; g_audio_on = 1;
-          fprintf(stderr, "ses: CoreAudio cikisi acildi (AudioUnit, %d Hz, %d kanal)\n",
-                  OUT_RATE, OUT_CH);
-          return;
-      } }
+
+    if (AudioUnitSetProperty(g_au, kAudioUnitProperty_StreamFormat,
+                             kAudioUnitScope_Input, 0, &f, sizeof f) != noErr) goto fail;
+
+    {
+        UInt32 mx = FRAMES;
+        AudioUnitSetProperty(g_au, kAudioUnitProperty_MaximumFramesPerSlice,
+                             kAudioUnitScope_Global, 0, &mx, sizeof mx);
+    }
+
+    {
+        AURenderCallbackStruct rc;
+        rc.inputProc = au_cb;
+        rc.inputProcRefCon = NULL;
+        if (AudioUnitSetProperty(g_au, kAudioUnitProperty_SetRenderCallback,
+                                 kAudioUnitScope_Input, 0, &rc, sizeof rc) != noErr) goto fail;
+    }
+
+    if (AudioUnitInitialize(g_au) != noErr) goto fail;
+    if (AudioOutputUnitStart(g_au) != noErr){
+        AudioUnitUninitialize(g_au);
+        goto fail;
+    }
+    return 1;
+
+fail:
+    if (g_au){
+        AudioComponentInstanceDispose(g_au);
+        g_au = NULL;
+    }
+    return 0;
+}
+
+/* --- Yasam Dongusu API Fonksiyonlari --- */
+
+void audio_ios_pause(void){
+    atomic_store_explicit(&g_audio_suspended, true, memory_order_release);
+    if (g_backend == 1 && g_au){
+        AudioOutputUnitStop(g_au);
+    } else if (g_backend == 2 && g_q){
+        AudioQueuePause(g_q);
+    }
+}
+
+void audio_ios_resume(void){
+#if TARGET_OS_IPHONE
+    @autoreleasepool {
+        NSError *err = nil;
+        [[AVAudioSession sharedInstance] setActive:YES error:&err];
+    }
+#endif
+    if (g_backend == 1 && g_au){
+        AudioOutputUnitStart(g_au);
+    } else if (g_backend == 2 && g_q){
+        AudioQueueStart(g_q, NULL);
+    }
+    atomic_store_explicit(&g_audio_suspended, false, memory_order_release);
+}
+
+void audio_ios_reconfigure_sample_rate(uint32_t new_rate){
+    if (new_rate < 4000u || new_rate > 192000u) return;
+    if (g_backend != 1 || !g_au) {
+        atomic_store_explicit(&g_hw_rate, new_rate, memory_order_relaxed);
+        return;
+    }
+
+    atomic_store_explicit(&g_audio_reconfiguring, true, memory_order_release);
+
+    AudioOutputUnitStop(g_au);
+    AudioUnitUninitialize(g_au);
+
+    atomic_store_explicit(&g_hw_rate, new_rate, memory_order_release);
+
+    AudioStreamBasicDescription f;
+    memset(&f, 0, sizeof f);
+    f.mSampleRate       = (double)new_rate;
+    f.mFormatID         = kAudioFormatLinearPCM;
+    f.mFormatFlags      = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    f.mChannelsPerFrame = OUT_CH;
+    f.mBitsPerChannel   = 16;
+    f.mFramesPerPacket  = 1;
+    f.mBytesPerFrame    = OUT_CH * sizeof(int16_t);
+    f.mBytesPerPacket   = f.mBytesPerFrame;
+
+    AudioUnitSetProperty(g_au, kAudioUnitProperty_StreamFormat,
+                         kAudioUnitScope_Input, 0, &f, sizeof f);
+
+    AudioUnitInitialize(g_au);
+    AudioOutputUnitStart(g_au);
+
+    atomic_store_explicit(&g_audio_reconfiguring, false, memory_order_release);
+    fprintf(stderr, "  [ses-ios] RemoteIO hatti %u Hz icin basariyla guncellendi\n", new_rate);
+}
+
+void audio_ios_restart_subsystem(void){
+    atomic_store_explicit(&g_audio_reconfiguring, true, memory_order_release);
+    audio_shutdown();
+    audio_init();
+    atomic_store_explicit(&g_audio_reconfiguring, false, memory_order_release);
+}
+
+/* --- Ana Baslatma ve Kapatma Fonksiyonlari --- */
+
+void audio_init(void){
+    if (atomic_load_explicit(&g_audio_on, memory_order_relaxed)) return;
+    { const char *e = getenv("NOSOUND"); if (e && *e && *e != '0') return; }
+
+    /* Ring buffer baslat */
+    audio_ringbuf_init(&g_stream_rb, AUDIO_RING_FRAMES, OUT_CH);
+
+#if TARGET_OS_IPHONE
+    if (!audio_setup_ios_session()){
+        fprintf(stderr, "ses: iOS AVAudioSession baslatilamadi, ses devre disi\n");
+        return;
+    }
+#endif
+
+    uint32_t hw_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
+    if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
+
+    { const char *d = getenv("SNDDUMP");
+      if (d && *d){ g_dump = fopen(d, "wb");
+          fprintf(stderr, "ses: cikis dokumu -> %s (%d Hz s16le %d kanal)\n", d, hw_rate, OUT_CH); } }
+    { const char *d = getenv("SNDCSV");
+      if (d && *d){ g_csv = fopen(d, "w");
+          if (g_csv) fprintf(g_csv, "cb,t,id,rate,bytes,pbyte,wpos,avail,frac,target,trim,ratio,zero\n"); } }
+
+    /* SNDBACKEND=queue ile AudioQueue yedek yoluna donulebilir */
+    {
+        const char *e = getenv("SNDBACKEND");
+        if (!(e && *e == 'q') && au_start(hw_rate)){
+            g_backend = 1;
+            atomic_store_explicit(&g_audio_on, true, memory_order_release);
+            fprintf(stderr, "ses: CoreAudio cikisi acildi (AudioUnit RemoteIO, %d Hz, %d kanal)\n",
+                    hw_rate, OUT_CH);
+            return;
+        }
+    }
+
+    AudioStreamBasicDescription f;
+    memset(&f, 0, sizeof f);
+    f.mSampleRate       = hw_rate;
+    f.mFormatID         = kAudioFormatLinearPCM;
+    f.mFormatFlags      = kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked;
+    f.mChannelsPerFrame = OUT_CH;
+    f.mBitsPerChannel   = 16;
+    f.mFramesPerPacket  = 1;
+    f.mBytesPerFrame    = OUT_CH * sizeof(int16_t);
+    f.mBytesPerPacket   = f.mBytesPerFrame;
+
     if (AudioQueueNewOutput(&f, cb, NULL, NULL, NULL, 0, &g_q) != noErr){
-        fprintf(stderr, "ses: AudioQueue acilamadi\n"); return;
+        fprintf(stderr, "ses: AudioQueue acilamadi\n");
+        return;
     }
     for (int i = 0; i < NBUF; i++){
-        if (AudioQueueAllocateBuffer(g_q, FRAMES*OUT_CH*sizeof(int16_t), &g_qb[i]) != noErr)
+        if (AudioQueueAllocateBuffer(g_q, FRAMES * OUT_CH * sizeof(int16_t), &g_qb[i]) != noErr)
             continue;
-        memset(g_qb[i]->mAudioData, 0, FRAMES*OUT_CH*sizeof(int16_t));
-        g_qb[i]->mAudioDataByteSize = FRAMES*OUT_CH*sizeof(int16_t);
+        memset(g_qb[i]->mAudioData, 0, FRAMES * OUT_CH * sizeof(int16_t));
+        g_qb[i]->mAudioDataByteSize = FRAMES * OUT_CH * sizeof(int16_t);
         AudioQueueEnqueueBuffer(g_q, g_qb[i], 0, NULL);
     }
     AudioQueueSetParameter(g_q, kAudioQueueParam_Volume, 1.0f);
     if (AudioQueueStart(g_q, NULL) != noErr){
-        fprintf(stderr, "ses: AudioQueue baslatilamadi\n"); return;
+        fprintf(stderr, "ses: AudioQueue baslatilamadi\n");
+        return;
     }
-    g_audio_on = 1; g_backend = 2;
+    g_backend = 2;
+    atomic_store_explicit(&g_audio_on, true, memory_order_release);
     fprintf(stderr, "ses: CoreAudio cikisi acildi (AudioQueue, %d Hz, %d kanal)\n",
-            OUT_RATE, OUT_CH);
+            hw_rate, OUT_CH);
+}
+
+void audio_shutdown(void){
+    atomic_store_explicit(&g_audio_on, false, memory_order_release);
+    if (g_backend == 1 && g_au){
+        AudioOutputUnitStop(g_au);
+        AudioUnitUninitialize(g_au);
+        AudioComponentInstanceDispose(g_au);
+        g_au = NULL;
+    } else if (g_backend == 2 && g_q){
+        AudioQueueStop(g_q, true);
+        AudioQueueDispose(g_q, true);
+        g_q = NULL;
+    }
+    audio_ringbuf_destroy(&g_stream_rb);
+    g_backend = 0;
 }
 
 void audio_report(void){
     if (g_dump){ fflush(g_dump); fclose(g_dump); g_dump = NULL; }
     if (g_csv){  fflush(g_csv);  fclose(g_csv);  g_csv  = NULL; }
-    fprintf(stderr, "  ses cikisi        : %s, %llu kare karistirildi, "
+    uint32_t hw_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
+    if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
+
+    fprintf(stderr, "  ses cikisi        : %s (Donanim: %u Hz), %llu kare karistirildi, "
             "en fazla %llu es zamanli tampon, %d kayitli\n",
-            g_audio_on ? "acik" : "KAPALI",
+            atomic_load_explicit(&g_audio_on, memory_order_relaxed) ? "acik" : "KAPALI",
+            hw_rate,
             (unsigned long long)g_mixed_frames,
             (unsigned long long)g_active_peak, g_sndn - 1);
     fprintf(stderr, "  ses Play cagrisi  : %llu bastan basladi, %llu zaten caliyordu\n",
@@ -602,16 +934,19 @@ void audio_report(void){
                 (unsigned long long)b->wr_calls, (unsigned long long)b->wr_nonzero,
                 b->wr_bytes/1024.0, b->playing ? "CALIYOR" : "durdu");
     }
-    { uint64_t ov = 0; for (int i = 1; i < g_sndn; i++) ov += g_snd[i].over;
-      fprintf(stderr, "  ses imlec asimi   : %llu geri-cagirmada oynatma yaziciyi gecti\n",
-              (unsigned long long)ov); }
+    {
+        uint64_t ov = 0;
+        for (int i = 1; i < g_sndn; i++) ov += g_snd[i].over;
+        fprintf(stderr, "  ses imlec asimi   : %llu geri-cagirmada oynatma yaziciyi gecti\n",
+                (unsigned long long)ov);
+    }
     fprintf(stderr, "  ses cikis yolu    : %s, geri cagirma %u kare (%.1f ms kuyruk gecikmesi)\n",
-            g_backend == 1 ? "AudioUnit" : g_backend == 2 ? "AudioQueue" : "yok",
+            g_backend == 1 ? "AudioUnit RemoteIO" : g_backend == 2 ? "AudioQueue" : "yok",
             g_backend == 1 ? g_au_slice : (unsigned)(FRAMES*NBUF),
             (g_backend == 1 ? (double)g_au_slice : (double)(FRAMES*NBUF))
-                * 1000.0 / (double)OUT_RATE);
+                * 1000.0 / (double)hw_rate);
     fprintf(stderr, "  ses kesilmesi     : %llu aclik, en uzun geri-cagirma araligi %.1f ms"
             " (tampon %.1f ms)\n",
             (unsigned long long)g_starved, g_worst_gap_us/1000.0,
-            (double)FRAMES*NBUF*1000.0/(double)OUT_RATE);
+            (double)FRAMES*NBUF*1000.0/(double)hw_rate);
 }
