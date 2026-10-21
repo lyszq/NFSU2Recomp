@@ -15,7 +15,7 @@ clang -O2 -std=gnu11 -Wall -Wextra -Werror -Wno-unused-label \
   ios/NFSU2iOS/Native/GuestImageProbe.c tests/guest_image_cli.c \
   gen/ios-private/lifted.c gen/ios-private/private_probe.c \
   gen/ios-private/startup_lifted.c gen/ios-private/startup_probe.c \
-  -o "$DEST/private-lifted-test"
+  -lm -o "$DEST/private-lifted-test"
 file "$DEST/private-lifted-test"
 if [[ "$(uname -s)" == Darwin ]]; then
   clang -std=gnu11 -fsyntax-only -Iruntime -Igen/ios-private tests/boot.c
