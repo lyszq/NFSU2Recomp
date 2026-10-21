@@ -72,10 +72,10 @@ def generate(exe):
                 "name": entry.name.decode("ascii") if entry.name else f"#{entry.ordinal}"}
                for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
     reference = run_startup_reference(exe, imports, diagnostic_directory=ROOT / "gen/ios-private")
-    # Registry, CPU capability, cursor and window contracts advance
-    # the explicit fixture prefix to its CreateToolhelp32Snapshot query. Native comparisons stay exact.
-    if (reference["import_name"] != "CreateToolhelp32Snapshot" or reference["raw_instructions"] != 217258
-            or reference["calls"] != 10482 or reference["api_call_count"] != 865
+    # Registry, CPU capability, cursor, window and toolhelp snapshot contracts advance
+    # the explicit fixture prefix to its QueryPerformanceFrequency query. Native comparisons stay exact.
+    if (reference["import_name"] != "QueryPerformanceFrequency" or reference["raw_instructions"] != 217807
+            or reference["calls"] != 10509 or reference["api_call_count"] != 877
             or reference["critical_section_count"] != 14
             or reference["tls_slot_count"] != 1 or reference["tls_thread_count"] != 1):
         raise ValueError(f"unexpected independent x86 entry boundary: {reference['import_name']} {reference['instructions']}")

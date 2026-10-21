@@ -100,6 +100,12 @@ BOUNDARY_ARGUMENT_COUNTS = {
     "RegisterClassA": 1,
     "CreateWindowExA": 12,
     "CreateToolhelp32Snapshot": 2,
+    "Process32First": 2,
+    "Process32Next": 2,
+    "CloseHandle": 1,
+    "GetLastError": 0,
+    "SetLastError": 1,
+    "QueryPerformanceFrequency": 1,
     "GetStartupInfoA": 1,
     "GetStdHandle": 1,
     "GetFileType": 1,
@@ -188,6 +194,12 @@ SUPPORTED_IMPORTS = {
     ("kernel32.dll", "GetCurrentProcessId"),
     ("kernel32.dll", "GetTickCount"),
     ("kernel32.dll", "QueryPerformanceCounter"),
+    ("kernel32.dll", "CreateToolhelp32Snapshot"),
+    ("kernel32.dll", "Process32First"),
+    ("kernel32.dll", "Process32Next"),
+    ("kernel32.dll", "CloseHandle"),
+    ("kernel32.dll", "GetLastError"),
+    ("kernel32.dll", "SetLastError"),
 }
 ERROR_MOD_NOT_FOUND = 126
 
@@ -968,6 +980,105 @@ def _get_tick_count(engine: Any, registers: Any, unicorn_module: Any,
         engine.reg_write(registers.UC_X86_REG_EIP, return_address)
         api.update(outcome="success", result=TICK_COUNT_DEFAULT,
                    esp_after=(esp + 4) & 0xFFFFFFFF)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
+def _is_toolhelp_handle(engine: Any, xr: Any) -> bool:
+    try:
+        esp = int(engine.reg_read(xr.UC_X86_REG_ESP)) & 0xFFFFFFFF
+        h = _read_u32(engine, esp + 4)
+        return 0x00D10001 <= h <= 0x00D10008
+    except Exception:
+        return False
+
+
+def _get_last_error(engine: Any, registers: Any, unicorn_module: Any,
+                    import_row: dict[str, Any], mapped_ranges: list[tuple[int, int]],
+                    state: dict[str, Any]) -> bool:
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api: dict[str, Any] = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 0,
+    }
+    state["api_calls"].append(api)
+    try:
+        if not _range_has_permissions(engine, esp, 4, unicorn_module.UC_PROT_READ, mapped_ranges):
+            raise _GuestPointerFault("read", esp, 4)
+        return_address = _read_u32(engine, esp)
+        teb = state.get("tls_current_teb", TEB_BASE)
+        if not teb:
+            state["status"] = "GUEST_STOP_API_STATE"
+            state["target"] = 0
+            state["api_state_fault"] = {"api": "GetLastError", "address": 0, "reason": "null TEB"}
+            return False
+        teb_err_addr = teb + LAST_ERROR_OFFSET
+        if not _range_has_permissions(engine, teb_err_addr, 4, unicorn_module.UC_PROT_READ, mapped_ranges):
+            raise _GuestPointerFault("read", teb_err_addr, 4)
+        val = _read_u32(engine, teb_err_addr)
+        api.update(return_address=return_address, arguments=[], result=val,
+                   outcome="success", esp_after=(esp + 4) & 0xFFFFFFFF)
+        engine.reg_write(registers.UC_X86_REG_EAX, val)
+        engine.reg_write(registers.UC_X86_REG_ESP, (esp + 4) & 0xFFFFFFFF)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
+        state["resume"] = True
+        return True
+    except _GuestPointerFault as exc:
+        access, address, size = exc.args
+        api["outcome"] = "invalid_pointer"
+        api["fault"] = {"access": access, "address": int(address), "size": int(size)}
+        state["status"] = "GUEST_STOP_MEMORY"
+        state["target"] = int(address) & 0xFFFFFFFF
+        state["memory_fault"] = dict(api["fault"])
+        return False
+
+
+def _set_last_error_api(engine: Any, registers: Any, unicorn_module: Any,
+                        import_row: dict[str, Any], mapped_ranges: list[tuple[int, int]],
+                        state: dict[str, Any]) -> bool:
+    esp = int(engine.reg_read(registers.UC_X86_REG_ESP)) & 0xFFFFFFFF
+    api: dict[str, Any] = {
+        "library": import_row["library"],
+        "name": import_row["name"],
+        "import_index": import_row["index"],
+        "tag": IMPORT_BASE + import_row["index"],
+        "call_ip": state["last_ip"],
+        "esp_before": esp,
+        "argument_count": 1,
+    }
+    state["api_calls"].append(api)
+    try:
+        if not _range_has_permissions(engine, esp, 8, unicorn_module.UC_PROT_READ, mapped_ranges):
+            raise _GuestPointerFault("read", esp, 8)
+        return_address = _read_u32(engine, esp)
+        err = _read_u32(engine, esp + 4)
+        teb = state.get("tls_current_teb", TEB_BASE)
+        if not teb:
+            state["status"] = "GUEST_STOP_API_STATE"
+            state["target"] = 0
+            state["api_state_fault"] = {"api": "SetLastError", "address": 0, "reason": "null TEB"}
+            return False
+        teb_err_addr = teb + LAST_ERROR_OFFSET
+        if not _range_has_permissions(engine, teb_err_addr, 4, unicorn_module.UC_PROT_WRITE, mapped_ranges):
+            raise _GuestPointerFault("write", teb_err_addr, 4)
+        _write_u32(engine, teb_err_addr, err)
+        api.update(return_address=return_address, arguments=[err], result=None,
+                   outcome="success", esp_after=(esp + 8) & 0xFFFFFFFF)
+        engine.reg_write(registers.UC_X86_REG_ESP, (esp + 8) & 0xFFFFFFFF)
+        engine.reg_write(registers.UC_X86_REG_EIP, return_address)
         state["resume"] = True
         return True
     except _GuestPointerFault as exc:
@@ -3530,6 +3641,31 @@ def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Pat
                         return True
                     _record_unsupported_import(address, index, row, engine, xr,
                                                mapped_ranges, state)
+                elif row["name"] in ("CreateToolhelp32Snapshot", "Process32First", "Process32Next") or (row["name"] == "CloseHandle" and _is_toolhelp_handle(engine, xr)):
+                    from toolhelp_oracle import _toolhelp_import
+                    handled = _toolhelp_import(engine, xr, uc, row, mapped_ranges, state)
+                    if handled:
+                        return True
+                    if state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
+                elif row["name"] == "GetLastError":
+                    handled = _get_last_error(engine, xr, uc, row, mapped_ranges, state)
+                    if handled:
+                        return True
+                    if state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
+                elif row["name"] == "SetLastError":
+                    handled = _set_last_error_api(engine, xr, uc, row, mapped_ranges, state)
+                    if handled:
+                        return True
+                    if state["status"] is not None:
+                        engine.emu_stop()
+                        return True
+                    _record_unsupported_import(address, index, row, engine, xr, mapped_ranges, state)
                 elif row["name"] == "QueryPerformanceCounter":
                     handled = _query_performance_counter(engine, xr, uc, row,
                                                          mapped_ranges, state)

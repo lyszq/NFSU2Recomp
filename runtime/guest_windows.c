@@ -822,6 +822,8 @@ int guest_windows_import(CPU *c, const GuestImport *import, void *context,
         if (handled) return handled;
         handled=guest_error_import(c,import,fault);
         if (handled) return handled;
+        handled=guest_toolhelp_import(c,import,context ? &((GuestWindows *)context)->toolhelp : NULL,fault);
+        if (handled) return handled;
         handled=guest_stdio_import(c,import,fault);
         if (handled) return handled;
         handled=handle_count_import(c,import,fault);
@@ -917,6 +919,7 @@ int guest_windows_cleanup(GuestWindows *windows) {
     if (!windows) return EINVAL;
     windows->unhandled_exception_filter = 0;
     guest_user_objects_cleanup(&windows->user_objects);
+    guest_toolhelp_cleanup(&windows->toolhelp);
     guest_process_cleanup(&windows->process);
     int rc=guest_critical_cleanup(&windows->critical);
     if (!rc) guest_tls_cleanup(&windows->tls);
