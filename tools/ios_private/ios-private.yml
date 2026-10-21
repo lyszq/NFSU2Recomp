@@ -67,6 +67,7 @@ jobs:
         run: |
           rm -f "$RUNNER_TEMP/private-input/SPEED2.EXE"
           rm -f "$RUNNER_TEMP/source/gen/ios-private/lifted.c" "$RUNNER_TEMP/source/gen/ios-private/private_probe.c" "$RUNNER_TEMP/source/gen/ios-private/startup_lifted.c" "$RUNNER_TEMP/source/gen/ios-private/startup_probe.c"
+          rm -f "$RUNNER_TEMP/source/gen/ios-private/"startup_*.bin
 
   private-ios:
     if: github.event.repository.private == true
@@ -156,3 +157,4 @@ jobs:
         run: |
           rm -f "$RUNNER_TEMP/private-input/SPEED2.EXE"
           rm -f "$RUNNER_TEMP/source/gen/ios-private/lifted.c" "$RUNNER_TEMP/source/gen/ios-private/private_probe.c" "$RUNNER_TEMP/source/gen/ios-private/startup_lifted.c" "$RUNNER_TEMP/source/gen/ios-private/startup_probe.c"
+          rm -f "$RUNNER_TEMP/source/gen/ios-private/"startup_*.bin

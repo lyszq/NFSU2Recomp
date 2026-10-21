@@ -3012,7 +3012,7 @@ def _is_rep_continuation(state: dict, address: int, mnemonic: str) -> bool:
     return continuation
 
 
-def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
+def run_startup_reference(exe: Path, imports: list, *, diagnostic_directory: Path | None = None) -> dict[str, Any]:
     """Run the exact PE entry until its first unimplemented import thunk.
 
     `imports` is the same ordered list passed to the native IAT binder.  Each
@@ -3422,6 +3422,7 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
 
     regids = {name: _register_id(xr, name) for name in
               ("eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi")}
+    diagnostic_trace = bytearray()
 
     def on_code(uc_engine: Any, address: int, size: int, user_data: Any) -> None:
         if stop_at_import(address):
@@ -3450,6 +3451,9 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
             engine.emu_stop()
             return
         state["last_ip"] = int(address) & 0xFFFFFFFF
+        if diagnostic_directory is not None:
+            diagnostic_trace.extend(struct.pack("<9I", address, *(
+                int(uc_engine.reg_read(register)) & 0xFFFFFFFF for register in regids.values())))
         state["instructions"] += 1
         state["trace_hash"] = ((state["trace_hash"] ^ state["last_ip"]) * FNV64_PRIME) & FNV64_MASK
 
@@ -3615,6 +3619,15 @@ def run_startup_reference(exe: Path, imports: list) -> dict[str, Any]:
         heap_hash_start = 0
         heap_hash_size = 0
         heap_state = b""
+
+    if diagnostic_directory is not None:
+        # Private host diagnostics only. These snapshots never enter source
+        # control, public Actions, or the iOS app bundle.
+        directory = Path(diagnostic_directory)
+        for label, data in (("trace", diagnostic_trace), ("image", image_state),
+                            ("teb", teb_state), ("stack", stack_window),
+                            ("heap", heap_state), ("process", process_bytes)):
+            (directory / f"startup_{label}.bin").write_bytes(data)
 
     flags = {
         "cf": eflags & 0x001,

@@ -67,7 +67,7 @@ def generate(exe):
     imports = [{"iat": entry.address, "library": descriptor.dll.decode("ascii"),
                 "name": entry.name.decode("ascii") if entry.name else f"#{entry.ordinal}"}
                for descriptor in pe.DIRECTORY_ENTRY_IMPORT for entry in descriptor.imports]
-    reference = run_startup_reference(exe, imports)
+    reference = run_startup_reference(exe, imports, diagnostic_directory=ROOT / "gen/ios-private")
     if (reference["import_name"] != "RegOpenKeyA" or reference["raw_instructions"] != 129062
             or reference["calls"] != 6781 or reference["api_call_count"] != 558
             or reference["critical_section_count"] != 14

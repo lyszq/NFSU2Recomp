@@ -17,6 +17,9 @@ typedef struct Execution {
     int tail_pending;
 } Execution;
 static _Thread_local Execution *active;
+#ifdef NFS_PRIVATE_TRACE
+extern void nfs_private_trace_step(const CPU *, uint32_t, uint64_t);
+#endif
 
 static uint64_t monotonic_ns(void) {
     struct timespec ts;
@@ -120,6 +123,9 @@ void guest_execution_step(CPU *cpu, uint32_t ip) {
     if (!(active->result.instructions & 255u) &&
         monotonic_ns() - active->started >= active->config.timeout_ns)
         stop(GUEST_STOP_TIMEOUT, ip);
+#ifdef NFS_PRIVATE_TRACE
+    nfs_private_trace_step(cpu, ip, active->result.instructions);
+#endif
     active->result.instructions++;
     active->result.trace_hash ^= ip;
     active->result.trace_hash *= UINT64_C(1099511628211);

@@ -12,6 +12,10 @@ extern const uint32_t nfs_startup_addresses[], nfs_startup_count;
 extern const GuestFunction nfs_startup_functions[];
 extern const GuestImport nfs_startup_imports[];
 extern const uint32_t nfs_startup_import_count;
+#ifdef NFS_PRIVATE_TRACE
+extern void nfs_private_trace_memory(const char *, uint32_t, size_t);
+extern void nfs_private_trace_finish(const GuestPEImage *);
+#endif
 static uint64_t memory_hash(const void *source, size_t size) {
     const uint8_t *bytes = source;
     uint64_t hash = UINT64_C(14695981039346656037);
@@ -40,6 +44,12 @@ int nfs_private_startup_probe(const GuestPEImage *image, char *out, size_t capac
     PUSH32(0xdeadc0deu);
     rc = guest_execution_run(&config, c, image->entry_point, &result);
     if (rc) goto failed;
+#ifdef NFS_PRIVATE_TRACE
+    nfs_private_trace_finish(image);
+    nfs_private_trace_memory("stack", @STACK_WINDOW_ADDRESS@, @STACK_WINDOW_SIZE@);
+    nfs_private_trace_memory("heap", @HEAP_WINDOW_ADDRESS@, @HEAP_WINDOW_SIZE@);
+    nfs_private_trace_memory("process", @PROCESS_WINDOW_ADDRESS@, @PROCESS_WINDOW_SIZE@);
+#endif
     const uint32_t expected_heaps[][4]={@EXPECTED_HEAPS@};
     const uint32_t expected_blocks[][5]={@EXPECTED_BLOCKS@};
     unsigned heap_count=0, block_count=0;
