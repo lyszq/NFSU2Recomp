@@ -1,2 +1,2 @@
-Public runner / private IO request 2026-10-22T16:32:30+00:00 - v0.25 audio cursor and nominal pitch fixes; measured PSO and file lookup optimizations; renamed public repository
+Public runner / private IO request 2026-10-22T16:44:00+00:00 - v0.25 strict audio core channel-loop build fix; nominal pitch, cursor semantics and lookup optimizations
 Owner-reviewed environment required.

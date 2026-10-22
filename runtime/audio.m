@@ -503,7 +503,7 @@ static void mix_chunk(int16_t *out, unsigned frames, uint32_t hw_rate){
             uint32_t si1 = (si0 + 1 < nsrc) ? (si0 + 1) : (b->loop ? 0 : si0);
             float alpha = (float)(sp - (double)si0);
 
-            for (int c = 0; c < OUT_CH; c++){
+            for (unsigned c = 0; c < OUT_CH; c++){
                 uint32_t sc = (b->chans == 2u) ? (uint32_t)c : 0u;
                 uint32_t off0 = b->data + si0 * bpf + sc * bps;
                 uint32_t off1 = b->data + si1 * bpf + sc * bps;
