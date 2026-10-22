@@ -6,6 +6,8 @@ mkdir -p "$DEST"
 CC="${CC:-clang}"
 FLAGS=(-O2 -std=gnu11 -Wall -Wextra -Werror -Iruntime -fno-strict-aliasing -pthread)
 LIBS=(-lm)
+"$CC" "${FLAGS[@]}" tests/win32_runtime_clock_test.c -o "$DEST/win32-runtime-clock-test"
+"$DEST/win32-runtime-clock-test"
 # Exercise the production file import with synthetic guest memory. The legacy
 # implementation retains its production warning flags; the fixture is strict.
 "$CC" -O2 -std=gnu11 -Iruntime -fno-strict-aliasing -pthread \

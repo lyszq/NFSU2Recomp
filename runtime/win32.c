@@ -8,6 +8,15 @@
 #include <stdlib.h>
 #include <time.h>
 #include <setjmp.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+#include "win32_runtime_clock.h"
+#define WIN32_USE_CONTINUOUS_CLOCK 1
+#else
+#define WIN32_USE_CONTINUOUS_CLOCK 0
+#endif
 
 /* getenv() her cagrida ortam dizisini TARAR ve kilit alir.  Cizim basina
  * calisan yollarda (ornegin SetVertexShaderConstantF icindeki "PDLIST"
@@ -67,6 +76,29 @@ uint32_t win32_get_last_error(CPU *c){
 #define HEAP_BASE 0x10000000u
 #define HEAP_MAX  0x2F000000u
 #define HDR 16u
+
+static uint64_t real_us(void){
+    struct timespec ts = {0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 || ts.tv_sec < 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+#if WIN32_USE_CONTINUOUS_CLOCK
+/* Win32 clocks and multimedia timer deadlines must advance without Present.
+ * The desktop hybrid clock caps a frame's time; that can strand the movie
+ * initialization's 200 ms QPC calibration after part of that cap is spent.
+ * iOS uses one continuous microsecond clock for QPC, timers and audio pacing.
+ * Frame pacing remains in frame_pace; Present must not reset the clock. */
+static Win32RuntimeClock g_ios_clock;
+uint64_t host_us(void){
+    return win32_runtime_clock_sample_at(&g_ios_clock, real_us());
+}
+void vclock_tick(void){}
+void vclock_report(void){
+    fprintf(stderr, "  iOS clock: continuous monotonic microseconds; elapsed %.3f s\n",
+            (double)host_us() / 1000000.0);
+}
+#else
 /* ---- HIBRIT sanal saat -------------------------------------------------
  * Denenenler:
  *   (a) cagri basina sabit artis -> zaman duzensiz, animasyonlar bozuk
@@ -82,12 +114,6 @@ static _Atomic uint64_t g_vclock_base  = 0;   /* kare basindaki sanal zaman */
 static _Atomic uint64_t g_vclock_creep = 0;   /* mesgul-bekleme telafisi    */
 static _Atomic uint64_t g_real_base    = 0;   /* o karenin gercek zamani    */
 static _Atomic uint32_t g_vclock_polls = 0;
-
-static uint64_t real_us(void){
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
-}
 
 /* Sanal saat.
  * Kareler ARASINDA tam 16.667 ms ilerler: animasyon hizi emulatorun
@@ -179,6 +205,7 @@ uint64_t host_us(void){
     }
     return base + d + atomic_load(&g_vclock_creep);
 }
+#endif
 uint32_t host_ms(void){ return (uint32_t)(host_us() / 1000ull) + 1000u; }
 uint64_t host_qpc(void){ return host_us(); }
 
@@ -653,6 +680,9 @@ void win32_init(void){
     com_init();
     /* CRT heap modu tanilamasi icin sonradan okunacak adresler */
     fprintf(stderr,"win32: %u import IAT'e baglandi, heap 0x%08x\n", g_imp_count, HEAP_BASE);
+#if WIN32_USE_CONTINUOUS_CLOCK
+    fprintf(stderr,"runtime clock: continuous monotonic microseconds; QPF=1000000; independent of Present\n");
+#endif
 }
 
 void win32_report(void){
