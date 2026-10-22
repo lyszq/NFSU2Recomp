@@ -5,6 +5,13 @@
 uint64_t g_icall_hits = 0;
 #include <stdio.h>
 #include <stdlib.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+#include "win32_runtime_clock.h"
+uint64_t host_us(void);
+#endif
 
 typedef void (*guest_fn)(CPU*);
 extern const uint32_t g_fn_addr[];
@@ -166,7 +173,13 @@ void cpuid_shim(CPU *c){
     }
 }
 uint64_t rdtsc_shim(void){
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+    /* CPU calibration compares TSC deltas with QPC intervals. A per-call
+     * increment measures polling rate instead of time and reports 15 kHz. */
+    return win32_runtime_tsc_from_us(host_us());
+#else
     static uint64_t t = 0; return (t += 3000);
+#endif
 }
 
 void dispatch_report(void){

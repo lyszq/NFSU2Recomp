@@ -6,6 +6,16 @@
 
 /* Runtime QPC values are elapsed microseconds, matching the 1 MHz QPF. */
 #define WIN32_RUNTIME_CLOCK_FREQUENCY UINT64_C(1000000)
+/* A defined guest TSC rate, independent of the physical Apple CPU frequency.
+ * Its interval ratios must agree with QPC even when no frames are presented. */
+#define WIN32_RUNTIME_TSC_FREQUENCY UINT64_C(3000000000)
+
+static inline uint64_t win32_runtime_tsc_from_us(uint64_t elapsed_us)
+{
+    /* Unsigned wrap matches the guest's 64-bit timestamp counter. */
+    return elapsed_us * (WIN32_RUNTIME_TSC_FREQUENCY /
+                         WIN32_RUNTIME_CLOCK_FREQUENCY);
+}
 
 typedef struct {
     _Atomic uint64_t origin_us;

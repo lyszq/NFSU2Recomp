@@ -9,6 +9,7 @@ import re
 # Map object ownership prevents weak/no-op application bridges masking real backends.
 REQUIRED = {
     "dispatch_init": "dispatch.o", "dispatch_indirect": "dispatch.o",
+    "rdtsc_shim": "dispatch.o",
     "win32_init": "win32.o", "win32_call": "win32.o", "com_call": "com.o",
     "win32_exit_scope_enter": "win32.o", "win32_exit_scope_leave": "win32.o",
     "win32_exit_checkpoint": "win32.o",

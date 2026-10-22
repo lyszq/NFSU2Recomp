@@ -96,6 +96,9 @@ if [[ "$(uname -s)" == Darwin ]]; then
   xcrun --sdk iphoneos clang -O2 -std=gnu11 -Iruntime -fno-strict-aliasing \
     -arch arm64 -miphoneos-version-min=16.0 -DNFS_FULL_RUNTIME=1 \
     -c runtime/win32.c -o "$DEST/win32-ios-arm64.o"
+  xcrun --sdk iphoneos clang -O2 -std=gnu11 -Iruntime -fno-strict-aliasing \
+    -arch arm64 -miphoneos-version-min=16.0 -DNFS_FULL_RUNTIME=1 \
+    -c runtime/dispatch.c -o "$DEST/dispatch-ios-arm64.o"
   echo 'PASS | production Win32 thread/timer source compiles for macOS and iOS ARM64'
   "$CC" -O2 -std=gnu11 -fobjc-arc -Iruntime -fno-strict-aliasing \
     -DNFS_FULL_RUNTIME=1 -DNFS_ENHANCED=0 -DNFSU2_LEGACY_METAL_INPUT=1 \

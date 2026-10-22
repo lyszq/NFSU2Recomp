@@ -39,3 +39,28 @@ unchanged polling, out-of-order samples and long elapsed intervals. Public tests
 contain no original game input. Any original-function replay stays private.
 Native compile/link and helper tests still require physical iPad follow-up to
 establish that loading, later menus and racing work with the complete game.
+
+## Second review before building
+
+The existing full-runtime `rdtsc_shim` added 3,000 per call. A replay of the
+complete five-sample calibration with continuous QPC therefore returned 15,000
+Hz: it measured call count rather than elapsed time. iOS now derives TSC from
+the same `host_us` timeline at a defined virtual 3 GHz rate. This is a guest
+counter specification, not a measurement of the device CPU. Desktop behavior
+remains unchanged. The private original-function replay returns 3,000,750,000 Hz
+with 50 us synthetic polling steps (0.025% model quantization), also after QPC
+64-bit wrap, TSC low-word wrap, and a 5-second pause in one calibration sample.
+
+The native test adds four-worker origin/max-CAS contention with mixed ordered,
+late and zero samples, plus QPC/TSC interval and counter-wrap checks. The link
+verifier additionally requires the strong TSC bridge to belong to `dispatch.o`.
+These new native tests must still be compiled/run in the next validation phase;
+the second review did not start an IPA or CI build.
+
+Lifecycle boundaries remain explicit: the continuous counter includes inactive
+time while the guest checkpoint is paused. Mixer-backed and fallback sound
+cursors have different pause behavior; the timer scheduler can emit one extra
+periodic callback after resuming from a stale pre-pause deadline. Those paths
+need a controlled native lifecycle test and device QA. This change does not
+claim that a single isolated 5-second calibration pause proves app background
+or audio correctness.

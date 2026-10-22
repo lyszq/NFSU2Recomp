@@ -40,6 +40,11 @@ class FullLinkTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'wrong owner'):
             verify(map_text.replace('/obj/metal.o', '/obj/NFSU2MetalBridge.o'), nm)
 
+    def test_missing_tsc_backend_is_rejected(self):
+        map_text, nm = self.fixture()
+        with self.assertRaisesRegex(ValueError, 'missing live symbol: rdtsc_shim'):
+            verify(map_text.replace(' _rdtsc_shim', ' _other_counter'), nm)
+
     def test_dead_stripped_entry_is_rejected(self):
         map_text, nm = self.fixture()
         with self.assertRaisesRegex(ValueError, 'missing live'):
