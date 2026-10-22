@@ -1,0 +1,68 @@
+name: Full ARM64 IPA (private input and output)
+
+on:
+  workflow_dispatch:
+  # Allows use on this branch without modifying the default branch. A new
+  # request file revision queues a build; environment approval is still needed.
+  push:
+    branches: [feat/ios-guest-runtime-smoke]
+    paths:
+      - .github/workflows/ios-private-io.yml
+      - .github/private-ios-request.txt
+      - tools/ios_private/public_private_build.py
+      - tools/ios_private/requirements-public-private.lock
+
+permissions: {}
+concurrency:
+  group: full-ios-private-io
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    if: github.repository == 'lyszq/NFSU2Recomp' && github.ref == 'refs/heads/feat/ios-guest-runtime-smoke' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Fetch exact public source without credentials
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git init source
+          git -C source remote add origin https://github.com/lyszq/NFSU2Recomp.git
+          git -C source fetch --depth=1 origin "$SOURCE_SHA"
+          git -C source checkout --detach FETCH_HEAD
+          test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Security contracts with synthetic data only
+        run: PYTHONPATH=source/tools/ios_private python3 -m unittest test_public_private_build
+      - name: Report disabled secret lane explicitly
+        if: vars.PRIVATE_IOS_ENABLED != 'true'
+        run: echo 'Private IO build is DISABLED. Preflight only; no IPA was built.'
+  full-runtime:
+    needs: preflight
+    if: vars.PRIVATE_IOS_ENABLED == 'true'
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    environment: private-ios-build
+    steps:
+      - name: Fetch approved exact public source without credentials
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          git init "$RUNNER_TEMP/ios-private-controller"
+          git -C "$RUNNER_TEMP/ios-private-controller" remote add origin https://github.com/lyszq/NFSU2Recomp.git
+          git -C "$RUNNER_TEMP/ios-private-controller" fetch --depth=1 origin "$SOURCE_SHA"
+          git -C "$RUNNER_TEMP/ios-private-controller" checkout --detach FETCH_HEAD
+          test "$(git -C "$RUNNER_TEMP/ios-private-controller" rev-parse HEAD)" = "$SOURCE_SHA"
+      - name: Build with private IO and private diagnostics
+        env:
+          PRIVATE_IOS_TOKEN: ${{ secrets.PRIVATE_IOS_TOKEN }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: python3 "$RUNNER_TEMP/ios-private-controller/tools/ios_private/public_private_build.py"
+      - name: Remove temporary confidential build directory on cancellation
+        if: always()
+        shell: bash
+        run: |
+          # Fixed runner-temp children only. No game data is stored in workspace.
+          rm -rf -- "$RUNNER_TEMP/nfs-private-build" "$RUNNER_TEMP/ios-private-controller"
