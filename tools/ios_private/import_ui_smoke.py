@@ -21,7 +21,6 @@ TEST_TIMEOUT_SECONDS = 240
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from simulator_smoke import (  # noqa: E402
-    boot_and_install,
     capture,
     run_tests,
     select_device,
@@ -58,7 +57,7 @@ def _run_logged(command: list[str], log_path: Path, timeout: int,
 
 
 def select(out: Path) -> dict[str, str]:
-    """Choose an available iPad runtime matching the active simulator SDK."""
+    """Choose an available iPad simulator matching the active simulator SDK."""
     inventory = json.loads(capture("xcrun", "simctl", "list", "devices", "available", "-j"))
     sdk_version = capture("xcrun", "--sdk", "iphonesimulator", "--show-sdk-version")
     device = select_device(inventory, sdk_version)
@@ -146,20 +145,70 @@ def _capture_simulator_screen(udid: str, destination: Path) -> str | None:
         return str(exc)
 
 
-def _boot_and_install_clean(device: str, app: Path) -> None:
-    """Use the shared boot helper, clearing only this app before its install."""
-    def clean_install_runner(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
-        if command[:3] == ["xcrun", "simctl", "install"]:
-            subprocess.run(["xcrun", "simctl", "uninstall", device, BUNDLE],
-                           check=False, timeout=60, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL)
-        return subprocess.run(command, **kwargs)
+def _run_simulator_command(
+    command: list[str],
+    log_path: Path,
+    timeout: int,
+    *,
+    runner=None,
+    check: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run one bounded simctl command and keep its output for setup failures."""
+    run_command = runner or subprocess.run
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as log:
+        log.write("$ " + json.dumps(command) + "\n")
+        try:
+            result = run_command(command, text=True, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as exc:
+            output = exc.stdout or exc.output or ""
+            if isinstance(output, bytes):
+                output = output.decode("utf-8", errors="replace")
+            if output:
+                log.write(output)
+                if not output.endswith("\n"):
+                    log.write("\n")
+            message = f"simulator command exceeded its {timeout}-second bound; see {log_path}"
+            log.write(message + "\n")
+            raise TimeoutError(message) from exc
+        output = result.stdout or ""
+        log.write(output)
+        if output and not output.endswith("\n"):
+            log.write("\n")
+    if check and result.returncode != 0:
+        raise RuntimeError(
+            f"simulator command failed with exit code {result.returncode}; see {log_path}"
+        )
+    return result
 
-    boot_and_install(device, app, runner=clean_install_runner)
+
+def _boot_and_install(udid: str, app: Path, log_path: Path, *, runner=None) -> None:
+    """Boot the selected CI simulator and install the app once, without terminating it."""
+    _run_simulator_command(["xcrun", "simctl", "boot", udid], log_path, 180,
+                           runner=runner, check=False)
+    _run_simulator_command(["xcrun", "simctl", "bootstatus", udid, "-b"], log_path, 600,
+                           runner=runner)
+    _run_simulator_command(["xcrun", "simctl", "install", udid, str(app)], log_path, 180,
+                           runner=runner)
+
+
+def _simulator_state(udid: str) -> str | None:
+    try:
+        inventory = json.loads(capture("xcrun", "simctl", "list", "devices", "-j"))
+        for devices in inventory.get("devices", {}).values():
+            for device in devices:
+                if device.get("udid") == udid:
+                    return str(device.get("state", "unknown"))
+        return "not listed"
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        return f"unavailable: {exc}"
+
+
 
 
 def run(device_json: Path, derived: Path, out: Path) -> dict[str, object]:
-    """Run XCTest on a clean app container and verify first-launch Documents setup."""
+    """Run XCTest on the selected CI simulator and verify Documents setup."""
     device = _read_device(device_json)
     derived = derived.resolve()
     out = _prepare_dir(out)
@@ -171,6 +220,7 @@ def run(device_json: Path, derived: Path, out: Path) -> dict[str, object]:
     result_path = out / "ImportPickerSmoke.xcresult"
     prior_run_outputs = [path for path in (
         result_path,
+        out / "simulator-setup.log",
         out / "simulator-test.log",
         out / "simulator-screen.png",
         out / "import-ui-smoke-report.json",
@@ -179,19 +229,16 @@ def run(device_json: Path, derived: Path, out: Path) -> dict[str, object]:
         raise FileExistsError("preserving prior run outputs: " + ", ".join(map(str, prior_run_outputs)))
 
     started = time.monotonic()
-    test_error: str | None = None
-    container: Path | None = None
+    setup_error: str | None = None
+    xctest_error: str | None = None
+    container_error: str | None = None
+    simulator_state: str | None = None
     screenshot_path = out / "simulator-screen.png"
     screenshot_error: str | None = None
     folder_exists = False
     guide_exists = False
-    app_container_reset = False
-
-    # Remove only this app's simulator container before installing so the test
-    # observes a real first launch rather than a folder left by an earlier run.
-    _boot_and_install_clean(device["udid"], app)
-    app_container_reset = True
-
+    app_install_succeeded = False
+    ui_test_passed = False
     command = [
         "xcodebuild", "test-without-building",
         "-xctestrun", str(xctestruns[0]),
@@ -202,51 +249,76 @@ def run(device_json: Path, derived: Path, out: Path) -> dict[str, object]:
         "-resultBundlePath", str(result_path),
     ]
     try:
-        run_tests(command, out / "simulator-test.log", timeout=TEST_TIMEOUT_SECONDS)
-    except TimeoutError:
-        test_error = f"UI test exceeded its {TEST_TIMEOUT_SECONDS}-second bound; see simulator-test.log"
-    except (subprocess.CalledProcessError, OSError) as exc:
-        test_error = f"{type(exc).__name__}: {exc}"
-    finally:
+        _boot_and_install(device["udid"], app, out / "simulator-setup.log")
+        app_install_succeeded = True
         try:
-            container = Path(capture(
-                "xcrun", "simctl", "get_app_container", device["udid"], BUNDLE, "data"
-            ))
-            documents = container / "Documents"
-            folder_exists = (documents / "Game Import").is_dir()
-            guide_exists = (documents / "NFSU2 Import Guide.txt").is_file()
-        except (OSError, subprocess.SubprocessError) as exc:
-            if test_error is None:
-                test_error = f"Could not inspect first-launch app container: {exc}"
+            run_tests(command, out / "simulator-test.log", timeout=TEST_TIMEOUT_SECONDS)
+            ui_test_passed = True
+        except TimeoutError:
+            xctest_error = f"UI test exceeded its {TEST_TIMEOUT_SECONDS}-second bound; see simulator-test.log"
+        except (subprocess.CalledProcessError, OSError) as exc:
+            xctest_error = f"{type(exc).__name__}: {exc}"
+    except Exception as exc:
+        setup_error = f"{type(exc).__name__}: {exc}"
+    finally:
+        simulator_state = _simulator_state(device["udid"])
+        if app_install_succeeded:
+            try:
+                container = Path(capture(
+                    "xcrun", "simctl", "get_app_container", device["udid"], BUNDLE, "data"
+                ))
+                documents = container / "Documents"
+                folder_exists = (documents / "Game Import").is_dir()
+                guide_exists = (documents / "NFSU2 Import Guide.txt").is_file()
+            except (OSError, subprocess.SubprocessError) as exc:
+                container_error = str(exc)
         screenshot_error = _capture_simulator_screen(device["udid"], screenshot_path)
-        subprocess.run(["xcrun", "simctl", "terminate", device["udid"], BUNDLE],
-                       check=False, timeout=30, stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL)
+
+    validation_error = None
+    if not folder_exists or not guide_exists:
+        validation_error = "first-launch Game Import folder or root guide is missing"
+    overall_passed = (
+        ui_test_passed
+        and setup_error is None
+        and xctest_error is None
+        and container_error is None
+        and validation_error is None
+    )
+    test_error = setup_error or xctest_error
 
     report: dict[str, object] = {
         "schema_version": 1,
         "test": "production executable picker cancel and reopen",
-        "ui_test_passed": test_error is None,
+        "overall_passed": overall_passed,
+        "ui_test_passed": ui_test_passed,
         "simulator_name": device["name"],
         "simulator_runtime": device["runtime"],
         "simulator_udid": device["udid"],
         "host_architecture": device["host_arch"],
-        "app_container_reset_before_first_launch": app_container_reset,
+        "app_container_reset_before_first_launch": False,
+        "clean_app_container_assumption": "fresh GitHub-hosted runner per CI job; no simulator erase or app uninstall",
+        "app_installed_once": app_install_succeeded,
+        "simulator_state_after_test": simulator_state,
         "first_launch_documents_game_import_folder_present": folder_exists,
         "first_launch_documents_root_guide_present": guide_exists,
         "files_app_visibility_checked": False,
         "real_executable_or_game_assets_used": False,
         "gameplay_or_full_runtime_claimed": False,
         "elapsed_seconds": round(time.monotonic() - started, 3),
-        "xctest_log": str(out / "simulator-test.log"),
+        "setup_log": str(out / "simulator-setup.log"),
+        "xctest_log": str(out / "simulator-test.log") if (out / "simulator-test.log").exists() else None,
         "xcresult": str(result_path) if result_path.exists() else None,
         "simulator_screenshot": str(screenshot_path) if screenshot_path.exists() else None,
         "screenshot_error": screenshot_error,
         "test_error": test_error,
+        "setup_error": setup_error,
+        "xctest_error": xctest_error,
+        "container_error": container_error,
+        "validation_error": validation_error,
     }
     report_path = out / "import-ui-smoke-report.json"
     report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-    if test_error or not folder_exists or not guide_exists:
+    if not overall_passed:
         raise RuntimeError(f"import UI smoke did not pass; inspect {report_path}")
     print(f"PASS | picker cancel/reopen and first-launch Files folder setup on {device['name']}")
     return report

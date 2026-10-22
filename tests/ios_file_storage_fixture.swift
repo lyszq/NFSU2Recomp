@@ -148,6 +148,23 @@ private func testInvalidExecutableLeavesPrivateDataUntouched(at root: URL) throw
                "Size failure copied assets before authenticating SPEED2.EXE")
 }
 
+private func testSharedFolderDiscovery(at root: URL) throws {
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let empty = try findSharedGameFolder(in: root)
+    try expect(empty == nil, "An empty Files handoff should not select a game folder")
+    let first = root.appendingPathComponent("My Game", isDirectory: true)
+    try write(makeExecutable(), to: first.appendingPathComponent("SPEED2.EXE"))
+    let selected = try findSharedGameFolder(in: root)
+    try expect(selected?.path == first.path, "A complete folder copied under Game Import should be discovered")
+    let second = root.appendingPathComponent("Other Game", isDirectory: true)
+    try write(makeExecutable(), to: second.appendingPathComponent("SPEED2.EXE"))
+    try expectFailure({ _ = try findSharedGameFolder(in: root) },
+                      "Multiple candidate game folders should request a clear choice")
+    try write(makeExecutable(), to: root.appendingPathComponent("SPEED2.EXE"))
+    let direct = try findSharedGameFolder(in: root)
+    try expect(direct?.path == root.path, "Direct EXE and asset placement should select Game Import itself")
+}
+
 private func testSymbolicLinksAreSkipped(at root: URL) throws {
     let executable = makeExecutable()
     let source = root.appendingPathComponent("source", isDirectory: true)
@@ -185,6 +202,7 @@ struct IOSFileStorageFixture {
         let assetCount = try testMergePreservesAndCopies(at: root.appendingPathComponent("merge-case", isDirectory: true))
         try testInvalidExecutableLeavesPrivateDataUntouched(at: root.appendingPathComponent("invalid-case", isDirectory: true))
         try testSymbolicLinksAreSkipped(at: root.appendingPathComponent("symlink-case", isDirectory: true))
+        try testSharedFolderDiscovery(at: root.appendingPathComponent("discovery-case", isDirectory: true))
 
         print("PASS: Files bootstrap, existing-data preservation, hash/size rejection, nested copies, symlink skipping, and session-state guard (\(assetCount) staged assets).")
     }

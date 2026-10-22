@@ -166,6 +166,14 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  test-import-ui:
+    name: iPad Simulator document picker and Files handoff (no game input)
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen for the diagnostic UI harness
+        run: brew install xcodegen
       - name: Build document-picker regression on an SDK-matched iPad Simulator
         run: |
           set -euo pipefail
