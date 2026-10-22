@@ -47,6 +47,7 @@ __attribute__((weak)) void perflog_event(int k, uint64_t ns, uint64_t bytes) { (
 #include <pthread.h>
 #include <time.h>
 #include <stdlib.h>
+#include "metal_framebuffer_pool.h"
 
 #if !TARGET_OS_IPHONE
 static NSWindow        *g_win;
@@ -891,8 +892,9 @@ static id<MTLBuffer>              g_mtlvb;
  * 2026-10-13).  Olculdu: yarista 9000 karenin 6472'sinde tampon, onceki
  * kare GPU'da bitmeden eziliyordu; 1046'sinda yerlesim de kaymisti.
  * Artik her kare GPU'su BITMIS bir takim alir; tamamlanma isleyicisi geri
- * verir.  Dogruluk takim SAYISINA degil semafora bagli: hepsi ucustaysa
- * fb_acquire GPU'yu bekler.  Uc takim olcume dayaniyor: yarista 8000 kare,
+ * verir.  Dogruluk takim SAYISINA degil semafora bagli: masaustunde
+ * fb_acquire GPU'yu bekler; iOS ana thread'i dolu halkada beklemeden dener.
+ * Uc takim olcume dayaniyor: yarista 8000 kare,
  * iki kosu, 0 bekleme (2+ kare ayni anda ucusta: gorunur pencerede 6/9000,
  * saydam test penceresinde 2292/7600 -- ucuncu takim bunu karsiliyor).
  * Tek istisna makine uykudayken (kapak kapali, DarkWake): GPU durdugu icin
@@ -903,7 +905,29 @@ static _Atomic int           g_fb_busy[NFB];
 static dispatch_semaphore_t  g_fb_sem;
 static _Atomic unsigned long g_fb_overlap = 0, g_fb_wait = 0;
 static _Atomic unsigned long long g_fb_wait_ns = 0;
+#if TARGET_OS_IPHONE
+static _Atomic unsigned g_fb_gpu_busy_skips = 0;
+static _Atomic unsigned g_fb_lease_failures = 0;
+static _Atomic unsigned g_fb_command_buffer_failures = 0;
+
+static unsigned fb_diag_inc_saturated(_Atomic unsigned *counter){
+    unsigned old = atomic_load_explicit(counter, memory_order_relaxed);
+    while (old < 0x7fffffffu){
+        if (atomic_compare_exchange_weak_explicit(counter, &old, old + 1u,
+                                                   memory_order_relaxed,
+                                                   memory_order_relaxed))
+            return old + 1u;
+    }
+    return old;
+}
+
+static int fb_try_acquire(void){
+    return nfs_metal_fb_try_acquire(g_fb_sem, g_fb_busy, NFB, &g_fb_overlap);
+}
+#endif
+
 static int fb_acquire(void){
+    if (!g_fb_sem) return -1;
     if (dispatch_semaphore_wait(g_fb_sem, DISPATCH_TIME_NOW) != 0){
         struct timespec w0, w1; clock_gettime(CLOCK_MONOTONIC, &w0);
         atomic_fetch_add(&g_fb_wait, 1ul);          /* hepsi GPU'da: biri bitene kadar bekle */
@@ -919,11 +943,23 @@ static int fb_acquire(void){
         if (atomic_load(&g_fb_busy[i])) any = 1;
     }
     if (any) atomic_fetch_add(&g_fb_overlap, 1ul);  /* eskiden bu karede tampon ezilirdi */
+    if (!got){
+        /* Keep the semaphore credit if the owner table and semaphore disagree. */
+        dispatch_semaphore_signal(g_fb_sem);
+        return -1;
+    }
     return got - 1;                                 /* semafor en az bir bos takim garanti eder */
 }
 static void fb_release(int i){
     atomic_store(&g_fb_busy[i], 0);
     dispatch_semaphore_signal(g_fb_sem);
+}
+
+static void metal_rearm_pending_if_ready(void){
+    pthread_mutex_lock(&g_qlock);
+    if (g_ready >= 0)
+        atomic_store_explicit(&g_frame_pending, 1, memory_order_release);
+    pthread_mutex_unlock(&g_qlock);
 }
 /* Takim tamponlari sabit MAXV/MAXRV/MAXKB boyunda DEGIL, karenin ihtiyacina
  * gore buyur.  Paylasimli tampon GPU'da bir kez kullanildi mi TAMAMI ayak
@@ -5132,7 +5168,41 @@ int metal_render_frame(void){
                 pthread_mutex_lock(&g_qlock); have_new = (g_ready >= 0);
                 pthread_mutex_unlock(&g_qlock);
                 if (!have_new && atomic_load(&g_frame_pending)) g_skip_empty++;
-                if (have_new && atomic_exchange(&g_frame_pending, 0)){
+                if (have_new && atomic_load_explicit(&g_frame_pending, memory_order_acquire)){
+#if TARGET_OS_IPHONE
+                    /* CADisplayLink runs on UIKit's main thread. Never wait there
+                     * for a GPU-owned buffer: leave the pending frame untouched so
+                     * the next display tick can retry after a completion releases one. */
+                    int fbi = fb_try_acquire();
+                    if (fbi < 0){
+                        if (fbi == -1){
+                            unsigned busy = fb_diag_inc_saturated(&g_fb_gpu_busy_skips);
+                            if (busy <= 5u)
+                                fprintf(stderr, "metal: iOS GPU buffer ring busy; pending frame retained for retry (skip %u)\n",
+                                        busy);
+                        } else {
+                            unsigned failures = fb_diag_inc_saturated(&g_fb_lease_failures);
+                            if (failures <= 5u)
+                                fprintf(stderr, "metal: iOS framebuffer lease unavailable; pending frame retained for retry (%u failures)\n",
+                                        failures);
+                        }
+                        return 0;
+                    }
+#else
+                    /* Preserve desktop behavior: an exhausted ring still waits for GPU completion. */
+                    int fbi = fb_acquire();
+                    if (fbi < 0){
+                        metal_rearm_pending_if_ready();
+                        return 0;
+                    }
+#endif
+                    /* Only consume the pending bit after an owner is secured. If
+                     * another renderer already took it, return the unused lease. */
+                    if (!atomic_exchange_explicit(&g_frame_pending, 0, memory_order_acq_rel)){
+                        fb_release(fbi);
+                        metal_rearm_pending_if_ready();
+                        return 0;
+                    }
                     struct timespec _d0,_d1; clock_gettime(CLOCK_MONOTONIC,&_d0);
                     id<CAMetalDrawable> d = [g_layer nextDrawable];
                     clock_gettime(CLOCK_MONOTONIC,&_d1);
@@ -5142,14 +5212,28 @@ int metal_render_frame(void){
                     if (d){
                         struct timespec _e0; clock_gettime(CLOCK_MONOTONIC,&_e0);
                         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+#if TARGET_OS_IPHONE
+                        if (!cb){
+                            unsigned failures = fb_diag_inc_saturated(&g_fb_command_buffer_failures);
+                            if (failures <= 5u)
+                                fprintf(stderr, "metal: iOS command buffer unavailable; pending frame retained for retry (%u failures)\n",
+                                        failures);
+                            fb_release(fbi);
+                            metal_rearm_pending_if_ready();
+                            return 0;
+                        }
+#else
+                        if (!cb){
+                            fb_release(fbi);
+                            metal_rearm_pending_if_ready();
+                            return 0;
+                        }
+#endif
                         pp_begin(atomic_load(&g_frames_drawn) + 1);
                         int ab_count = 0;
                         g_ab_mode = ab_frame(atomic_load(&g_frames_drawn) + 1, &ab_count);
                         int ab_mode = g_ab_mode;
                         int abt_cnt = 0, abt_mode = abt_frame(atomic_load(&g_frames_drawn) + 1, &abt_cnt);
-                        /* GPU'nun hala okuyor olabilecegi tamponun ustune yazma:
-                         * bu kare icin bos bir takim al (kilidi tutmadan bekle). */
-                        int fbi = fb_acquire();
                         pthread_mutex_lock(&g_qlock);
                         int rb = g_ready;
                         g_enc_rb = rb;
@@ -6412,10 +6496,8 @@ int metal_render_frame(void){
                         if (miss < 5u || ((miss + 1u) % 120u) == 0u)
                             fprintf(stderr, "metal: CAMetalLayer nextDrawable returned nil; retrying pending frame (%u)\n",
                                     miss + 1u);
-                        pthread_mutex_lock(&g_qlock);
-                        if (g_ready >= 0)
-                            atomic_store_explicit(&g_frame_pending, 1, memory_order_release);
-                        pthread_mutex_unlock(&g_qlock);
+                        fb_release(fbi);
+                        metal_rearm_pending_if_ready();
                         return 0;
                     }
                     return 1;

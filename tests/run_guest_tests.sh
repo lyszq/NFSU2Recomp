@@ -6,6 +6,13 @@ mkdir -p "$DEST"
 CC="${CC:-clang}"
 FLAGS=(-O2 -std=gnu11 -Wall -Wextra -Werror -Iruntime -fno-strict-aliasing -pthread)
 LIBS=(-lm)
+# Exercise the production file import with synthetic guest memory. The legacy
+# implementation retains its production warning flags; the fixture is strict.
+"$CC" -O2 -std=gnu11 -Iruntime -fno-strict-aliasing -pthread \
+  -c runtime/fileio.c -o "$DEST/full-fileio.o"
+"$CC" "${FLAGS[@]}" "$DEST/full-fileio.o" tests/win32_full_path_test.c \
+  -o "$DEST/win32-full-path-test"
+"$DEST/win32-full-path-test"
 "$CC" "${FLAGS[@]}" tests/win32_exit_scope_test.c -o "$DEST/win32-exit-scope-test"
 "$DEST/win32-exit-scope-test"
 "$CC" "${FLAGS[@]}" tests/win32_guest_thread_resources_test.c -o "$DEST/win32-guest-thread-resources-test"
@@ -71,15 +78,22 @@ done
   ios/NFSU2iOS/Native/GuestSmoke.c ios/tests/smoke_cli.c -o "$DEST/nfsu2-smoke"
 "$DEST/nfsu2-smoke"
 if [[ "$(uname -s)" == Darwin ]]; then
+  "$CC" "${FLAGS[@]}" tests/metal_framebuffer_pool_test.c -o "$DEST/metal-framebuffer-pool-test"
+  "$DEST/metal-framebuffer-pool-test"
   python3 tests/ios_file_storage_test.py "$DEST"
   python3 tools/ios_private/typecheck_full_ui.py
   # Compile the production thread/timer call paths, including iOS-only branches.
   # This uses authored source only; no generated game functions or input EXE.
   "$CC" -O2 -std=gnu11 -Iruntime -fno-strict-aliasing -DNFS_FULL_RUNTIME=1 \
     -c runtime/win32_ext.c -o "$DEST/win32-ext-macos.o"
+  "$CC" -O2 -std=gnu11 -Iruntime -fno-strict-aliasing -DNFS_FULL_RUNTIME=1 \
+    -c runtime/win32.c -o "$DEST/win32-macos.o"
   xcrun --sdk iphoneos clang -O2 -std=gnu11 -Iruntime -fno-strict-aliasing \
     -arch arm64 -miphoneos-version-min=16.0 -DNFS_FULL_RUNTIME=1 \
     -c runtime/win32_ext.c -o "$DEST/win32-ext-ios-arm64.o"
+  xcrun --sdk iphoneos clang -O2 -std=gnu11 -Iruntime -fno-strict-aliasing \
+    -arch arm64 -miphoneos-version-min=16.0 -DNFS_FULL_RUNTIME=1 \
+    -c runtime/win32.c -o "$DEST/win32-ios-arm64.o"
   echo 'PASS | production Win32 thread/timer source compiles for macOS and iOS ARM64'
   "$CC" -O2 -std=gnu11 -fobjc-arc -Iruntime -fno-strict-aliasing \
     -DNFS_FULL_RUNTIME=1 -DNFS_ENHANCED=0 -DNFSU2_LEGACY_METAL_INPUT=1 \

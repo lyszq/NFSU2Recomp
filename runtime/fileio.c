@@ -1,6 +1,8 @@
 /* Guest dosya G/C -> POSIX.  Windows yollarini oyun dizinine esler,
  * buyuk/kucuk harf duyarsiz cozumleme yapar.                          */
 #include "cpu.h"
+#include "guest_memory.h"
+#include "win32_full_path.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +19,7 @@ static uint64_t now_ns_io(void){
 }
 
 void mem_commit(uint32_t,uint32_t);
+void win32_set_last_error(CPU *, uint32_t);
 
 static char g_root[1024] = ".";
 static char g_cwd_rel[512] = "";           /* oyun icindeki gecerli dizin */
@@ -173,9 +176,120 @@ static int find_next(FH *f, char *nm, size_t nsz){
     return 0;
 }
 
+/* Read a guest ANSI string without touching uncommitted guest memory. Check
+ * at 16 KiB granularity, then scan only the committed chunk for its NUL. */
+static int full_path_read_guest_string(uint32_t address, char *buffer,
+                                       size_t capacity, uint32_t *error){
+    size_t copied = 0;
+    if (!address || !buffer || !capacity){
+        *error = WIN32_FULL_PATH_ERROR_INVALID_PARAMETER;
+        return 0;
+    }
+    while (copied < capacity){
+        uint64_t current = (uint64_t)address + copied;
+        if (current > UINT32_MAX){
+            *error = WIN32_FULL_PATH_ERROR_NOACCESS;
+            return 0;
+        }
+        size_t within = (size_t)((uint32_t)current & (GUEST_MEMORY_GRANULE - 1u));
+        size_t chunk = GUEST_MEMORY_GRANULE - within;
+        if (chunk > capacity - copied) chunk = capacity - copied;
+        const char *guest = (const char *)guest_memory_pointer((uint32_t)current,
+                                                               chunk, 0);
+        if (!guest){
+            *error = WIN32_FULL_PATH_ERROR_NOACCESS;
+            return 0;
+        }
+        const char *nul = (const char *)memchr(guest, '\0', chunk);
+        size_t bytes = nul ? (size_t)(nul - guest) : chunk;
+        memcpy(buffer + copied, guest, bytes);
+        copied += bytes;
+        if (nul){
+            buffer[copied] = '\0';
+            return 1;
+        }
+    }
+    *error = WIN32_FULL_PATH_ERROR_FILENAME_EXCED_RANGE;
+    return 0;
+}
+
+/* GetFullPathNameA contract: success returns path bytes excluding NUL;
+ * undersized buffers return required bytes including NUL. The path namespace
+ * is lexical and guest-only; it never resolves against the host filesystem. */
+static uint32_t fileio_get_full_path_name_a(CPU *c){
+    uint32_t arguments[4];
+    uint32_t error = WIN32_FULL_PATH_ERROR_INVALID_PARAMETER;
+    uint32_t input_address, capacity, output_address, file_part_address;
+    uint8_t *frame;
+    char path[WIN32_FULL_PATH_STORAGE];
+    Win32FullPathInfo info;
+
+    if (!c){
+        return 0;
+    }
+    frame = (uint8_t *)guest_memory_pointer(c->esp, sizeof arguments, 0);
+    if (!frame){
+        win32_set_last_error(c, WIN32_FULL_PATH_ERROR_NOACCESS);
+        return 0;
+    }
+    memcpy(arguments, frame, sizeof arguments);
+    input_address = arguments[0];
+    capacity = arguments[1];
+    output_address = arguments[2];
+    file_part_address = arguments[3];
+
+    if (!input_address){
+        win32_set_last_error(c, WIN32_FULL_PATH_ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (!full_path_read_guest_string(input_address, path, sizeof path, &error)){
+        win32_set_last_error(c, error);
+        return 0;
+    }
+    if (!win32_full_path_normalize(path, path, &info, &error)){
+        win32_set_last_error(c, error);
+        return 0;
+    }
+
+    uint32_t required = (uint32_t)(info.length + 1u);
+    if (capacity < required){
+        return required;
+    }
+    if (!output_address){
+        win32_set_last_error(c, WIN32_FULL_PATH_ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    char *output = (char *)guest_memory_pointer(output_address, required, 1);
+    uint32_t *file_part_output = NULL;
+    if (!output){
+        win32_set_last_error(c, WIN32_FULL_PATH_ERROR_NOACCESS);
+        return 0;
+    }
+    if (file_part_address){
+        file_part_output = (uint32_t *)guest_memory_pointer(file_part_address,
+                                                             sizeof(uint32_t), 1);
+        if (!file_part_output){
+            win32_set_last_error(c, WIN32_FULL_PATH_ERROR_NOACCESS);
+            return 0;
+        }
+    }
+
+    memcpy(output, path, required);
+    if (file_part_output){
+        uint32_t file_part = info.has_file_part
+            ? output_address + (uint32_t)info.file_part_offset : 0u;
+        memcpy(file_part_output, &file_part, sizeof file_part);
+    }
+    return (uint32_t)info.length;
+}
+
 int fileio_call(CPU *c, const char *n, uint32_t *out){
     uint32_t r = 0;
-    if (!strcmp(n,"CreateFileA")){
+    if (!strcmp(n,"GetFullPathNameA")){
+        r = fileio_get_full_path_name_a(c);
+    }
+    else if (!strcmp(n,"CreateFileA")){
         uint32_t pn=A(c,0), access=A(c,1), disp=A(c,4);
         char real[1024];
         int flags;

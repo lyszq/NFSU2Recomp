@@ -2,6 +2,7 @@
 #include <stdatomic.h>
 #include "enhance.h"
 #include "cpu.h"
+#include "guest_memory.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@ void mem_commit(uint32_t,uint32_t);
 void guest_backtrace(CPU*,int);
 int win32_ext_call(CPU*, const char*, uint32_t*);
 void guest_fair_yield(void);
+void guest_note_import(CPU*, const char*, unsigned);
 int fileio_call(CPU*, const char*, uint32_t*);
 void fileio_report(void);
 uint64_t win32_ext_threads(void);
@@ -40,6 +42,26 @@ void com_init(void);
 int g_bt_on = 0;
 
 #define IMP_MAGIC 0xF0000000u
+
+/* Preserve Win32's per-thread error state for checked host bridges. A missing
+ * TEB must never manufacture a guest mapping solely to store an error. */
+static _Thread_local uint32_t g_last_error_fallback;
+static void *last_error_slot(CPU *c, int write_access){
+    if (!c || !c->fs_base || (uint64_t)c->fs_base + 0x38u > GUEST_MEMORY_SIZE)
+        return NULL;
+    return guest_memory_pointer(c->fs_base + 0x34u, 4u, write_access);
+}
+void win32_set_last_error(CPU *c, uint32_t value){
+    g_last_error_fallback = value;
+    void *slot = last_error_slot(c, 1);
+    if (slot) memcpy(slot, &value, sizeof value);
+}
+uint32_t win32_get_last_error(CPU *c){
+    uint32_t value = g_last_error_fallback;
+    void *slot = last_error_slot(c, 0);
+    if (slot) memcpy(&value, slot, sizeof value);
+    return value;
+}
 
 /* --- guest heap: baslikli bump ayirici (HeapSize/ReAlloc icin boyut saklar) --- */
 #define HEAP_BASE 0x10000000u
@@ -295,6 +317,7 @@ int win32_call(CPU *c, uint32_t idx){
     int handled = 1;
     const char *n = e->name;
     uint32_t r = 0;
+    guest_note_import(c, n, (unsigned)e->nargs);
 
     /* QueryPerformanceCounter en sik cagri (kare sinirlayici); ad zincirinin
      * ~20 strcmp'ini atlamak icin import indisi ilk eslesmede onbellege alinir. */
@@ -410,8 +433,8 @@ int win32_call(CPU *c, uint32_t idx){
         if (!r) r = 1u; }
     else if (!strcmp(n,"GetCurrentProcessId"))   r = 100;
     else if (!strcmp(n,"GetCurrentProcess"))     r = 0xffffffffu;
-    else if (!strcmp(n,"GetLastError"))          r = 0;
-    else if (!strcmp(n,"SetLastError"))          r = 0;
+    else if (!strcmp(n,"GetLastError"))          r = win32_get_last_error(c);
+    else if (!strcmp(n,"SetLastError")){ win32_set_last_error(c, ARG(c,0)); r = 0; }
     else if (!strcmp(n,"GetTickCount")) r = host_ms();
     else if (!strcmp(n,"QueryPerformanceFrequency")){ uint32_t p=ARG(c,0); if(p){MR32(p)=1000000;MR32(p+4)=0;} r=1; }
     else if (!strcmp(n,"SetUnhandledExceptionFilter")) r = 0;

@@ -52,7 +52,7 @@ It never overwrites `private-input-v1`. Failure releases may contain private dia
 logs; they never receive a downloadable IPA unless the link/package gates passed.
 `receipt.json` records completion, exact source/run/attempt and SHA-256 values for the
 IPA and diagnostics. GitHub's returned asset digests are also checked. Generated C
-is deleted, not archived. Source and package versions currently remain 0.22.0/build29.
+is deleted, not archived. The current full target is 0.23.0/build30.
 
 ## One-time setup
 

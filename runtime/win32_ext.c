@@ -1,6 +1,7 @@
 /* Win32 katmani - 2. tur: registry, pencere, senkronizasyon, thread */
 #include <strings.h>
 #include "cpu.h"
+#include "guest_memory.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -18,6 +19,7 @@
 
 #if NFS_FULL_RUNTIME
 extern void nfs_game_session_checkpoint(void);
+extern long metal_frames(void);
 #endif
 
 void dispatch_indirect(CPU*,uint32_t);
@@ -65,34 +67,236 @@ static _Thread_local void *tl_obj = 0;   /* bu thread'in nesnesi */
 CPU *g_all_cpus[MAXCPUS];
 uint32_t g_all_tids[MAXCPUS];
 int g_all_n = 0;
+typedef struct {
+    CPU *cpu;
+    const char *api;
+    uint32_t return_ip;
+    uint32_t args[4];
+    unsigned nargs, valid_args, args_captured;
+} CpuImportDiag;
+static CpuImportDiag g_cpu_import_diag[MAXCPUS];
+static _Thread_local int tl_diag_slot = -1;
+
+static uint32_t cpu_tid_checked(CPU *c){
+    if (!c || !c->fs_base) return 0;
+    uint64_t address = (uint64_t)c->fs_base + 0x24u;
+    if (address > UINT32_MAX - 3u) return 0;
+    const uint32_t *p = (const uint32_t *)guest_memory_pointer(
+        (uint32_t)address, sizeof(*p), 0);
+    uint32_t tid = 0;
+    if (p) memcpy(&tid, p, sizeof(tid));
+    return tid;
+}
+
 static void reg_cpu(CPU *c){
     int free_slot = -1;
     for (int i=0;i<g_all_n;i++){
-        if (g_all_cpus[i] == c) return;
+        if (g_all_cpus[i] == c){ tl_diag_slot = i; return; }
         if (!g_all_cpus[i] && free_slot < 0) free_slot = i;
     }
     if (free_slot >= 0){
         g_all_cpus[free_slot] = c;
-        g_all_tids[free_slot] = c->fs_base ? MR32(c->fs_base+0x24) : 0;
+        g_all_tids[free_slot] = cpu_tid_checked(c);
+        memset(&g_cpu_import_diag[free_slot], 0, sizeof(g_cpu_import_diag[free_slot]));
+        g_cpu_import_diag[free_slot].cpu = c;
+        tl_diag_slot = free_slot;
         return;
     }
     if (g_all_n < MAXCPUS){
         g_all_cpus[g_all_n] = c;
-        g_all_tids[g_all_n] = c->fs_base ? MR32(c->fs_base+0x24) : 0;
+        g_all_tids[g_all_n] = cpu_tid_checked(c);
+        memset(&g_cpu_import_diag[g_all_n], 0, sizeof(g_cpu_import_diag[g_all_n]));
+        g_cpu_import_diag[g_all_n].cpu = c;
+        tl_diag_slot = g_all_n;
         g_all_n++;
     }
 }
+
+static int import_args_are_interesting(const char *name){
+    if (!name || !name[0]) return 0;
+    switch (name[0]){
+        case 'W': return !strncmp(name, "Wait", 4);
+        case 'E': return !strcmp(name, "EnterCriticalSection");
+        case 'L': return !strcmp(name, "LeaveCriticalSection");
+        case 'T': return !strcmp(name, "TryEnterCriticalSection");
+        case 'S': return !strcmp(name, "Sleep") || !strcmp(name, "SleepEx") ||
+                         !strcmp(name, "SetEvent");
+        case 'G': return !strcmp(name, "GetFullPathNameA");
+        case 'V': return !strcmp(name, "VirtualProtect");
+        case 'C': return !strcmp(name, "CreateFileA") ||
+                         !strcmp(name, "CreateFileW") ||
+                         !strcmp(name, "CreateThread");
+        case 'R': return !strcmp(name, "ReleaseMutex") ||
+                         !strcmp(name, "ReleaseSemaphore") ||
+                         !strcmp(name, "ResetEvent");
+        default: return 0;
+    }
+}
+
+/* Called by the import dispatcher while the guest lock is held, after it
+ * removes the stdcall return address. At that point ESP points at argument 0.
+ * The API name points into the immutable generated import table. A TLS slot
+ * avoids a CPU-table scan per import; only selected APIs take one checked
+ * guest-memory span for up to four argument values. */
+void guest_note_import(CPU *c, const char *name, unsigned nargs){
+    int slot = tl_diag_slot;
+    if (!c || tl_cpu != c || slot < 0 || slot >= MAXCPUS ||
+        g_all_cpus[slot] != c || g_cpu_import_diag[slot].cpu != c) return;
+
+    CpuImportDiag *diag = &g_cpu_import_diag[slot];
+    diag->api = name ? name : "?";
+    diag->return_ip = c->eip;
+    diag->nargs = nargs;
+    diag->valid_args = 0;
+    diag->args_captured = 0;
+
+    if (import_args_are_interesting(name)){
+        unsigned count = nargs < 4u ? nargs : 4u;
+        diag->args_captured = 1;
+        uint64_t bytes = (uint64_t)count * sizeof(uint32_t);
+        uint64_t end = (uint64_t)c->esp + bytes;
+        if (count && end <= (uint64_t)UINT32_MAX + 1ull){
+            const uint32_t *p = (const uint32_t *)guest_memory_pointer(
+                c->esp, bytes, 0);
+            if (p){
+                memcpy(diag->args, p, (size_t)bytes);
+                diag->valid_args = (1u << count) - 1u;
+            }
+        }
+    }
+}
+
 static void unreg_cpu(CPU *c){
     if (!c) return;
     pthread_mutex_lock(&g_guest);
     for (int i=0;i<g_all_n;i++) if (g_all_cpus[i] == c){
         g_all_cpus[i] = 0;
         g_all_tids[i] = 0;
+        memset(&g_cpu_import_diag[i], 0, sizeof(g_cpu_import_diag[i]));
     }
     if (g_cur_cpu == c) g_cur_cpu = 0;
     if (tl_cpu == c) tl_cpu = 0;
+    tl_diag_slot = -1;
     pthread_mutex_unlock(&g_guest);
 }
+
+static uint64_t diagnostic_wall_ms(void){
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0 || ts.tv_sec < 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
+#if NFS_FULL_RUNTIME
+#define STALL_TEXT_BASE 0x00401000u
+#define STALL_TEXT_SIZE 0x00381af1u
+#define STALL_MAX_STACK_WORDS 32u
+#define STALL_MAX_CANDIDATES 8u
+
+static uint64_t diagnostic_mono_us(void){
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0 || ts.tv_sec < 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+/* Bounded stack inspection: read each word through the checked guest-memory
+ * accessor, keep only values inside the guest code range, and never read code
+ * bytes or dereference candidate addresses. These are candidates, not a full
+ * unwound trace (x86 stack arguments may also resemble code addresses). */
+static void print_stack_candidates(CPU *c){
+    unsigned found = 0;
+    fprintf(stderr, " stack-candidates=");
+    for (unsigned word=0; c && word<STALL_MAX_STACK_WORDS &&
+         found<STALL_MAX_CANDIDATES; ++word){
+        uint64_t address = (uint64_t)c->esp + (uint64_t)word * sizeof(uint32_t);
+        if (address > UINT32_MAX - 3u) break;
+        const uint32_t *p = (const uint32_t *)guest_memory_pointer(
+            (uint32_t)address, sizeof(*p), 0);
+        if (!p) continue;
+        uint32_t value;
+        memcpy(&value, p, sizeof(value));
+        if (value >= STALL_TEXT_BASE &&
+            (uint64_t)value < (uint64_t)STALL_TEXT_BASE + STALL_TEXT_SIZE){
+            fprintf(stderr, "%s%08x", found ? "," : "", value);
+            found++;
+        }
+    }
+    if (!found) fprintf(stderr, "none");
+}
+
+static void dump_stall_cpus(long frames, uint64_t stalled_us, unsigned dump_no){
+    uint64_t wall_ms = diagnostic_wall_ms();
+    fprintf(stderr, "[nfsu2-stall] wall_ms=%llu frames=%ld stalled_ms=%llu dump=%u/4 cpus=%d\n",
+            (unsigned long long)wall_ms, frames,
+            (unsigned long long)(stalled_us / 1000ull), dump_no, g_all_n);
+    for (int i=0; i<g_all_n; ++i){
+        CPU *c = g_all_cpus[i];
+        if (!c) continue;
+        CpuImportDiag *diag = &g_cpu_import_diag[i];
+        uint32_t tid = cpu_tid_checked(c);
+        if (!tid) tid = g_all_tids[i];
+        fprintf(stderr,
+                "  cpu[%d] tid=%u eip=%08x esp=%08x ebp=%08x last=%s ra=%08x nargs=%u args=",
+                i, tid, c->eip, c->esp, c->ebp,
+                (diag->cpu == c && diag->api) ? diag->api : "<none>",
+                (diag->cpu == c) ? diag->return_ip : 0u,
+                (diag->cpu == c) ? diag->nargs : 0u);
+        if (diag->cpu == c){
+            if (!diag->args_captured){
+                fputs("<not-captured>", stderr);
+            } else {
+                unsigned count = diag->nargs < 4u ? diag->nargs : 4u;
+                if (count && !diag->valid_args){
+                    fputs("<invalid>", stderr);
+                } else {
+                    for (unsigned a=0; a<count; ++a){
+                        if (a) fputc(',', stderr);
+                        if (diag->valid_args & (1u << a))
+                            fprintf(stderr, "%08x", diag->args[a]);
+                    }
+                }
+            }
+        } else {
+            fputs("<unavailable>", stderr);
+        }
+        print_stack_candidates(c);
+        fputc('\n', stderr);
+    }
+    fflush(stderr);
+}
+
+/* Called only from the existing 400-WaitForSingleObject diagnostic point,
+ * with the guest lock held. The Metal frame counter is atomic; CPU snapshots
+ * therefore never run on the UI/render timer thread. A progress change resets
+ * the episode and its four-dump cap. */
+static void stall_checkpoint(void){
+    static long observed_frames = -1;
+    static uint64_t last_progress_us = 0;
+    static uint64_t next_dump_us = 0;
+    static unsigned dumps = 0;
+    uint64_t now_us = diagnostic_mono_us();
+    long frames = metal_frames();
+    if (frames <= 0){
+        observed_frames = -1;
+        last_progress_us = 0;
+        next_dump_us = 0;
+        dumps = 0;
+        return;
+    }
+    if (observed_frames != frames || !last_progress_us){
+        observed_frames = frames;
+        last_progress_us = now_us;
+        next_dump_us = now_us + 3000000ull;
+        dumps = 0;
+        return;
+    }
+    if (dumps < 4u && now_us >= next_dump_us){
+        ++dumps;
+        dump_stall_cpus(frames, now_us - last_progress_us, dumps);
+        next_dump_us = now_us + 3000000ull;
+    }
+}
+#endif
+
 /* --- buyuk kilidin (GIL) TUTMA SURESI olcumu --------------------------
  * Guest thread'i Win32 cagrisi yapmadigi surece GIL'i birakmaz; uzun bir
  * hesaplama (ornek: ses akisi cozme) diger thread'leri aclikta birakir.
@@ -794,9 +998,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
     else if (!strcmp(n,"SetEvent")){ Obj*o=obj_get(A(c,0));
         { uint32_t h=A(c,0);
           if (h>=H_BASE && h<H_BASE+64){ g_wstat[h-H_BASE].sets++;
-            g_wstat[h-H_BASE].setter_tid =
-                (c->fs_base && mem_is_committed(c->fs_base+0x24u))
-                ? MR32(c->fs_base+0x24u) : 0u; } }
+            g_wstat[h-H_BASE].setter_tid = cur_tid(c); } }
         if(o){ pthread_mutex_lock(&o->mtx); o->signaled=1; pthread_cond_broadcast(&o->cv); pthread_mutex_unlock(&o->mtx);} r=1; }
     else if (!strcmp(n,"ResetEvent")){ Obj*o=obj_get(A(c,0));
         if(o){ pthread_mutex_lock(&o->mtx); o->signaled=0; pthread_mutex_unlock(&o->mtx);} r=1; }
@@ -824,19 +1026,36 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
     else if (!strcmp(n,"WaitForSingleObject")){
         Obj*o=obj_get(A(c,0)); uint32_t ms=A(c,1);
         { uint32_t h=A(c,0);
-          uint32_t tid = (c->fs_base && mem_is_committed(c->fs_base+0x24u))
-                         ? MR32(c->fs_base+0x24u) : 0u;
+          uint32_t tid = cur_tid(c);
           if (h>=H_BASE && h<H_BASE+64){ g_wstat[h-H_BASE].waits++;
                                          g_wstat[h-H_BASE].waiter_tid = tid; }
           static int sh=0;
           if (++sh % 400 == 0){
-            fprintf(stderr,"  [olay] handle  tur  sinyal  bekleme  SetEvent  bekleyen-tid\n");
-            for (int i=0;i<64;i++) if (g_wstat[i].waits || g_wstat[i].sets)
-                fprintf(stderr, "         h%-4d %3d %6d %8llu %9llu  tid=%u\n", i,
-                        g_obj[i].kind, g_obj[i].signaled,
+            fprintf(stderr,"  [olay] wall_ms=%llu handle tur sinyal bekleme SetEvent bekleyen-tid setter-tid owner rec state\n",
+                    (unsigned long long)diagnostic_wall_ms());
+            for (int i=0;i<64;i++) if (g_wstat[i].waits || g_wstat[i].sets){
+                int kind = g_obj[i].kind;
+                int signaled = -1, manual = -1, locked = 0;
+                uint32_t owner = 0; int rec = 0;
+                if (kind && pthread_mutex_trylock(&g_obj[i].mtx) == 0){
+                    locked = 1;
+                    signaled = g_obj[i].signaled;
+                    manual = g_obj[i].manual;
+                    owner = g_obj[i].owner_tid;
+                    rec = g_obj[i].rec;
+                    pthread_mutex_unlock(&g_obj[i].mtx);
+                }
+                const char *state = !kind ? "missing" : locked ? "ok" : "busy";
+                fprintf(stderr, "         h%-4d %3d %6d %8llu %9llu  tid=%u set=%u owner=%u rec=%d manual=%d state=%s\n", i,
+                        kind, signaled,
                         (unsigned long long)g_wstat[i].waits,
                         (unsigned long long)g_wstat[i].sets,
-                        g_wstat[i].waiter_tid);
+                        g_wstat[i].waiter_tid, g_wstat[i].setter_tid,
+                        owner, rec, manual, state);
+            }
+#if NFS_FULL_RUNTIME
+            stall_checkpoint();
+#endif
           } }
         if(!o){ r=0; }
         else if (o->kind == OB_MUTEX){
