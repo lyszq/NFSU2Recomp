@@ -131,7 +131,7 @@ static inline int win32_full_path_normalize(const char *input,
     }
 
     if (relative && !win32_full_path_append_segment(
-            normalized, &length, WIN32_FULL_PATH_CWD + 3u,
+            normalized, &length, &WIN32_FULL_PATH_CWD[3],
             sizeof(WIN32_FULL_PATH_CWD) - 4u)) {
         if (error) *error = WIN32_FULL_PATH_ERROR_FILENAME_EXCED_RANGE;
         return 0;
