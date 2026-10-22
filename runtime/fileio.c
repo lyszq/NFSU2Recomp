@@ -2,9 +2,13 @@
  * buyuk/kucuk harf duyarsiz cozumleme yapar.                          */
 #include "cpu.h"
 #include "guest_memory.h"
+#include "fileio.h"
 #include "win32_full_path.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
@@ -27,10 +31,284 @@ uint64_t g_file_open=0, g_file_fail=0, g_file_read=0, g_bytes_read=0;
 uint64_t g_overlapped_reads=0;
 static int g_empty_next = 0;
 
+/* Directory-component results are only useful when the directory itself has
+ * not changed. Keep a bounded cache and validate every hit against the
+ * parent's identity and nanosecond timestamps. Files can still be added or
+ * removed by the game, another thread, or the user while a session runs. */
+#define FILEIO_CASE_PARENT_CAP 1024u
+#define FILEIO_CASE_NAME_CAP 256u
+#define FILEIO_CASE_ACTUAL_CAP 1024u
+typedef struct {
+    int valid;
+    char parent[FILEIO_CASE_PARENT_CAP];
+    char folded_name[FILEIO_CASE_NAME_CAP];
+    char actual_name[FILEIO_CASE_NAME_CAP];
+    int found;
+    dev_t dev;
+    ino_t ino;
+    int64_t mtime_sec;
+    long mtime_nsec;
+    int64_t ctime_sec;
+    long ctime_nsec;
+    uint64_t age;
+} FileioCaseEntry;
+
+static pthread_mutex_t g_fileio_case_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+static FileioCaseEntry g_fileio_case_cache[FILEIO_CASE_CACHE_CAPACITY];
+static uint64_t g_fileio_case_cache_age;
+static _Atomic uint64_t g_fileio_case_cache_scans;
+static _Atomic uint64_t g_fileio_case_cache_hits;
+static _Atomic uint64_t g_fileio_case_cache_invalidations;
+static _Atomic uint64_t g_fileio_snapshot_read_calls;
+static _Atomic uint64_t g_fileio_snapshot_read_bytes;
+
+#if defined(__APPLE__)
+#define FILEIO_STAT_MTIME_SEC(st_) ((st_)->st_mtimespec.tv_sec)
+#define FILEIO_STAT_MTIME_NSEC(st_) ((st_)->st_mtimespec.tv_nsec)
+#define FILEIO_STAT_CTIME_SEC(st_) ((st_)->st_ctimespec.tv_sec)
+#define FILEIO_STAT_CTIME_NSEC(st_) ((st_)->st_ctimespec.tv_nsec)
+#else
+#define FILEIO_STAT_MTIME_SEC(st_) ((st_)->st_mtim.tv_sec)
+#define FILEIO_STAT_MTIME_NSEC(st_) ((st_)->st_mtim.tv_nsec)
+#define FILEIO_STAT_CTIME_SEC(st_) ((st_)->st_ctim.tv_sec)
+#define FILEIO_STAT_CTIME_NSEC(st_) ((st_)->st_ctim.tv_nsec)
+#endif
+
+static int fileio_case_fold(const char *name, char folded[FILEIO_CASE_NAME_CAP]){
+    size_t length = strlen(name);
+    if (!length || length >= FILEIO_CASE_NAME_CAP) return 0;
+    for (size_t i = 0; i < length; i++)
+        folded[i] = (char)tolower((unsigned char)name[i]);
+    folded[length] = '\0';
+    return 1;
+}
+
+static int fileio_case_stat_matches(const FileioCaseEntry *entry,
+                                    const struct stat *st){
+    return entry->dev == st->st_dev && entry->ino == st->st_ino &&
+           entry->mtime_sec == (int64_t)FILEIO_STAT_MTIME_SEC(st) &&
+           entry->mtime_nsec == (long)FILEIO_STAT_MTIME_NSEC(st) &&
+           entry->ctime_sec == (int64_t)FILEIO_STAT_CTIME_SEC(st) &&
+           entry->ctime_nsec == (long)FILEIO_STAT_CTIME_NSEC(st);
+}
+
+static void fileio_case_cache_store(const char *parent, const char *folded,
+                                    const char *actual, int found,
+                                    const struct stat *st){
+    if (strlen(parent) >= FILEIO_CASE_PARENT_CAP) return;
+    if (found && (!actual || strlen(actual) >= FILEIO_CASE_NAME_CAP)) return;
+
+    pthread_mutex_lock(&g_fileio_case_cache_lock);
+    size_t slot = FILEIO_CASE_CACHE_CAPACITY;
+    size_t first_free = FILEIO_CASE_CACHE_CAPACITY;
+    size_t oldest = FILEIO_CASE_CACHE_CAPACITY;
+    uint64_t oldest_age = UINT64_MAX;
+    for (size_t i = 0; i < FILEIO_CASE_CACHE_CAPACITY; i++){
+        FileioCaseEntry *entry = &g_fileio_case_cache[i];
+        if (entry->valid && strcmp(entry->parent, parent) == 0 &&
+            strcmp(entry->folded_name, folded) == 0){
+            slot = i;
+            break;
+        }
+        if (!entry->valid){
+            if (first_free == FILEIO_CASE_CACHE_CAPACITY) first_free = i;
+            continue;
+        }
+        if (entry->age < oldest_age){ oldest_age = entry->age; oldest = i; }
+    }
+    if (slot == FILEIO_CASE_CACHE_CAPACITY)
+        slot = first_free < FILEIO_CASE_CACHE_CAPACITY ? first_free : oldest;
+    if (slot < FILEIO_CASE_CACHE_CAPACITY){
+        FileioCaseEntry *entry = &g_fileio_case_cache[slot];
+        memset(entry, 0, sizeof(*entry));
+        snprintf(entry->parent, sizeof(entry->parent), "%s", parent);
+        snprintf(entry->folded_name, sizeof(entry->folded_name), "%s", folded);
+        if (found) snprintf(entry->actual_name, sizeof(entry->actual_name), "%s", actual);
+        entry->found = found;
+        entry->dev = st->st_dev;
+        entry->ino = st->st_ino;
+        entry->mtime_sec = (int64_t)FILEIO_STAT_MTIME_SEC(st);
+        entry->mtime_nsec = (long)FILEIO_STAT_MTIME_NSEC(st);
+        entry->ctime_sec = (int64_t)FILEIO_STAT_CTIME_SEC(st);
+        entry->ctime_nsec = (long)FILEIO_STAT_CTIME_NSEC(st);
+        entry->age = ++g_fileio_case_cache_age;
+        entry->valid = 1;
+    }
+    pthread_mutex_unlock(&g_fileio_case_cache_lock);
+}
+
+/* Return 1 when a cached or freshly scanned answer is available, 0 when the
+ * caller should use its uncached fallback, and -1 when the parent could not
+ * be opened. Filesystem work stays outside the cache lock. */
+static int fileio_case_cache_resolve(const char *parent, const char *wanted,
+                                     char *actual, size_t actual_size,
+                                     int *out_found){
+    char folded[FILEIO_CASE_NAME_CAP];
+    int cacheable = strlen(parent) < FILEIO_CASE_PARENT_CAP &&
+                    fileio_case_fold(wanted, folded);
+    struct stat before;
+    if (stat(parent, &before) != 0) return 0;
+
+    if (cacheable){
+        pthread_mutex_lock(&g_fileio_case_cache_lock);
+        for (size_t i = 0; i < FILEIO_CASE_CACHE_CAPACITY; i++){
+            FileioCaseEntry *entry = &g_fileio_case_cache[i];
+            if (!entry->valid || strcmp(entry->parent, parent) != 0 ||
+                strcmp(entry->folded_name, folded) != 0) continue;
+            if (fileio_case_stat_matches(entry, &before)){
+                entry->age = ++g_fileio_case_cache_age;
+                *out_found = entry->found;
+                if (entry->found)
+                    snprintf(actual, actual_size, "%s", entry->actual_name);
+                pthread_mutex_unlock(&g_fileio_case_cache_lock);
+                atomic_fetch_add_explicit(&g_fileio_case_cache_hits, 1u,
+                                          memory_order_relaxed);
+                return 1;
+            }
+            entry->valid = 0;
+            atomic_fetch_add_explicit(&g_fileio_case_cache_invalidations, 1u,
+                                      memory_order_relaxed);
+            break;
+        }
+        pthread_mutex_unlock(&g_fileio_case_cache_lock);
+    }
+
+    DIR *directory = opendir(parent);
+    if (!directory) return -1;
+    atomic_fetch_add_explicit(&g_fileio_case_cache_scans, 1u,
+                              memory_order_relaxed);
+    int found = 0;
+    char matched[FILEIO_CASE_ACTUAL_CAP] = "";
+    struct dirent *entry;
+    while ((entry = readdir(directory)) != NULL){
+        if (strcasecmp(entry->d_name, wanted) == 0){
+            size_t length = strlen(entry->d_name);
+            if (length < sizeof(matched)){
+                memcpy(matched, entry->d_name, length + 1u);
+                found = 1;
+            }
+            break;
+        }
+    }
+    closedir(directory);
+
+    struct stat after;
+    if (cacheable && stat(parent, &after) == 0 &&
+        before.st_dev == after.st_dev && before.st_ino == after.st_ino &&
+        FILEIO_STAT_MTIME_SEC(&before) == FILEIO_STAT_MTIME_SEC(&after) &&
+        FILEIO_STAT_MTIME_NSEC(&before) == FILEIO_STAT_MTIME_NSEC(&after) &&
+        FILEIO_STAT_CTIME_SEC(&before) == FILEIO_STAT_CTIME_SEC(&after) &&
+        FILEIO_STAT_CTIME_NSEC(&before) == FILEIO_STAT_CTIME_NSEC(&after))
+        fileio_case_cache_store(parent, folded, matched, found, &after);
+
+    *out_found = found;
+    if (found) snprintf(actual, actual_size, "%s", matched);
+    return 1;
+}
+
+static void fileio_case_cache_clear(void){
+    pthread_mutex_lock(&g_fileio_case_cache_lock);
+    uint64_t invalidated = 0;
+    for (size_t i = 0; i < FILEIO_CASE_CACHE_CAPACITY; i++)
+        if (g_fileio_case_cache[i].valid) invalidated++;
+    memset(g_fileio_case_cache, 0, sizeof(g_fileio_case_cache));
+    pthread_mutex_unlock(&g_fileio_case_cache_lock);
+    atomic_fetch_add_explicit(&g_fileio_case_cache_invalidations, invalidated,
+                              memory_order_relaxed);
+}
+
+static void fileio_case_cache_invalidate_parent(const char *parent){
+    uint64_t invalidated = 0;
+    pthread_mutex_lock(&g_fileio_case_cache_lock);
+    for (size_t i = 0; i < FILEIO_CASE_CACHE_CAPACITY; i++)
+        if (g_fileio_case_cache[i].valid &&
+            strcmp(g_fileio_case_cache[i].parent, parent) == 0){
+            g_fileio_case_cache[i].valid = 0;
+            invalidated++;
+        }
+    pthread_mutex_unlock(&g_fileio_case_cache_lock);
+    atomic_fetch_add_explicit(&g_fileio_case_cache_invalidations, invalidated,
+                              memory_order_relaxed);
+}
+
+static void fileio_case_cache_invalidate_path(const char *path){
+    char parent[FILEIO_CASE_PARENT_CAP];
+    size_t length = strlen(path);
+    if (!length || length >= sizeof(parent)) return;
+    memcpy(parent, path, length + 1u);
+    char *slash = strrchr(parent, '/');
+    if (!slash) return;
+    if (slash == parent) slash[1] = '\0';
+    else *slash = '\0';
+    fileio_case_cache_invalidate_parent(parent);
+}
+
+/* Read-side diagnostics are fixed for the lifetime of the process. Resolve
+ * the mute filter once instead of calling getenv (which takes a libc lock)
+ * for each file-read chunk. */
+typedef struct {
+    char *file_filter;
+    long exact_size;
+    long minimum_size;
+    int enabled;
+    int readlog;
+} FileioMuteOptions;
+static pthread_once_t g_fileio_mute_once = PTHREAD_ONCE_INIT;
+static FileioMuteOptions g_fileio_mute_options;
+
+/* Launch-time diagnostic environment is treated as immutable after the first
+ * file read. Keep a process-lifetime copy of the full configured filter. */
+static void fileio_load_mute_options(void){
+    const char *file_filter = getenv("MUTEFILE");
+    const char *exact_size = getenv("MUTESIZE");
+    const char *minimum_size = getenv("MUTEMIN");
+    g_fileio_mute_options.readlog = getenv("READLOG") != NULL;
+    if (file_filter && *file_filter){
+        size_t length = strlen(file_filter);
+        g_fileio_mute_options.file_filter = malloc(length + 1u);
+        if (g_fileio_mute_options.file_filter){
+            memcpy(g_fileio_mute_options.file_filter, file_filter, length + 1u);
+            g_fileio_mute_options.enabled = 1;
+        }
+    }
+    g_fileio_mute_options.exact_size = exact_size ? atol(exact_size) : 0;
+    g_fileio_mute_options.minimum_size = minimum_size ? atol(minimum_size) : 0;
+}
+
+static int fileio_should_mute_read(const char *path, uint32_t requested,
+                                   ssize_t bytes_read){
+    if (bytes_read <= 0 || !g_fileio_mute_options.enabled ||
+        !strstr(path, g_fileio_mute_options.file_filter)) return 0;
+    if (g_fileio_mute_options.minimum_size)
+        return (long)requested >= g_fileio_mute_options.minimum_size;
+    return !g_fileio_mute_options.exact_size ||
+           (long)requested == g_fileio_mute_options.exact_size;
+}
+
+static int fileio_readlog_enabled(void){
+    pthread_once(&g_fileio_mute_once, fileio_load_mute_options);
+    return g_fileio_mute_options.readlog;
+}
+
+void fileio_perf_snapshot(FileioPerfSnapshot *snapshot){
+    if (!snapshot) return;
+    snapshot->case_cache_hits = atomic_load_explicit(&g_fileio_case_cache_hits,
+                                                    memory_order_relaxed);
+    snapshot->directory_scans = atomic_load_explicit(&g_fileio_case_cache_scans,
+                                                      memory_order_relaxed);
+    snapshot->cache_invalidations = atomic_load_explicit(
+        &g_fileio_case_cache_invalidations, memory_order_relaxed);
+    snapshot->read_calls = atomic_load_explicit(&g_fileio_snapshot_read_calls,
+                                                memory_order_relaxed);
+    snapshot->read_bytes = atomic_load_explicit(&g_fileio_snapshot_read_bytes,
+                                                memory_order_relaxed);
+}
+
 void fileio_set_root(const char *exe_path){
     strncpy(g_root, exe_path, sizeof g_root - 1);
     char *slash = strrchr(g_root, '/');
     if (slash) *slash = 0; else strcpy(g_root, ".");
+    fileio_case_cache_clear();
     fprintf(stderr,"dosya: oyun kok dizini = %s\n", g_root);
 }
 
@@ -44,7 +322,9 @@ static void mkparents(const char *path){
     char tmp[1024]; snprintf(tmp, sizeof tmp, "%s", path);
     for (char *q = tmp + 1; *q; q++){
         if (*q != '/') continue;
-        *q = 0; mkdir(tmp, 0755); *q = '/';
+        *q = 0;
+        if (mkdir(tmp, 0755) == 0) fileio_case_cache_invalidate_path(tmp);
+        *q = '/';
     }
 }
 
@@ -73,13 +353,27 @@ static int resolve_in(const char *root, const char *win, char *out, size_t outsz
         if (missing){ size_t l=strlen(cur); snprintf(cur+l,sizeof cur-l,"/%s",tok); continue; }
         char cand[1024]; snprintf(cand,sizeof cand,"%s/%s",cur,tok);
         if (stat(cand,&st)==0){ snprintf(cur,sizeof cur,"%s",cand); continue; }
-        DIR *d = opendir(cur); int found=0;
-        if (d){ struct dirent *e;
-            while ((e=readdir(d))){
-                if (!strcasecmp(e->d_name, tok)){
-                    snprintf(cand,sizeof cand,"%s/%s",cur,e->d_name);
-                    found=1; break; } }
-            closedir(d); }
+        int found=0;
+        char actual[FILEIO_CASE_ACTUAL_CAP];
+        int case_result = fileio_case_cache_resolve(cur, tok, actual,
+                                                    sizeof actual, &found);
+        if (case_result == 0){
+            DIR *d = opendir(cur);
+            if (d){
+                atomic_fetch_add_explicit(&g_fileio_case_cache_scans, 1u,
+                                          memory_order_relaxed);
+                struct dirent *e;
+                while ((e=readdir(d))){
+                    if (!strcasecmp(e->d_name, tok)){
+                        snprintf(actual,sizeof actual,"%s",e->d_name);
+                        found=1; break; } }
+                closedir(d); }
+        }
+        if (found){
+            int candidate_length = snprintf(cand, sizeof cand, "%s/%s", cur, actual);
+            if (candidate_length < 0 || (size_t)candidate_length >= sizeof(cand))
+                found = 0;
+        }
         if (found) snprintf(cur,sizeof cur,"%s",cand);
         else { snprintf(cand,sizeof cand,"%s/%s",cur,tok);
                snprintf(cur,sizeof cur,"%s",cand); missing=1; }
@@ -99,9 +393,10 @@ static int resolve_in(const char *root, const char *win, char *out, size_t outsz
  * eskisi gibi tek kokte kalir. */
 static char g_wroot[1024] = "";
 void fileio_set_write_root(const char *dir){
-    if (!dir || !*dir){ g_wroot[0] = 0; return; }
+    if (!dir || !*dir){ g_wroot[0] = 0; fileio_case_cache_clear(); return; }
     snprintf(g_wroot, sizeof g_wroot, "%s", dir);
     mkparents(g_wroot); mkdir(g_wroot, 0755);
+    fileio_case_cache_clear();
     fprintf(stderr,"dosya: kayit dizini = %s\n", g_wroot);
 }
 /* Okuma: yazma kokunde varsa orasi, yoksa oyun koku. */
@@ -120,6 +415,7 @@ static int resolve_w(const char *win, char *out, size_t outsz){
 static int copy_file(const char *a, const char *b){
     FILE *fa = fopen(a, "rb"); if (!fa) return 0;
     mkparents(b);
+    fileio_case_cache_invalidate_path(b);
     FILE *fb = fopen(b, "wb"); if (!fb){ fclose(fa); return 0; }
     char bufr[65536]; size_t k;
     while ((k = fread(bufr, 1, sizeof bufr, fa)) > 0) fwrite(bufr, 1, k, fb);
@@ -301,7 +597,10 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
             ok = resolve_w(GS(pn), real, sizeof real);
             if (!(flags & O_TRUNC)) copy_up(GS(pn), real);
         } else ok = resolve(GS(pn), real, sizeof real);
-        if (flags & O_CREAT) mkparents(real);
+        if (flags & O_CREAT){
+            mkparents(real);
+            fileio_case_cache_invalidate_path(real);
+        }
         /* Dil eki geri dusumu: bu surumde film yolunda "_fr.vp6" soneki
          * gomulu ama klasorde "_en" dosyalari var.  Istenen yoksa
          * "_en" ve eksiz surumu dene.                                   */
@@ -372,7 +671,9 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
         if(!f||f->fd<0){ if(pnr) MR32(pnr)=0; r=0; }
         else { if(len) mem_commit(buf,len);
                ssize_t got;
-               uint64_t _rd0 = now_ns_io();
+               /* This once-only snapshot initializes all read diagnostics. */
+               int _readlog = fileio_readlog_enabled();
+               uint64_t _rd0 = _readlog ? now_ns_io() : 0;
                if (ov && mem_is_committed(ov+19)){
                    uint64_t off = (uint64_t)MR32(ov+8) | ((uint64_t)MR32(ov+12) << 32);
                    got = pread(f->fd, g_mem+buf, len, (off_t)off);
@@ -381,13 +682,6 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
                    MR32(ov+4) = (uint32_t)got;          /* InternalHigh = okunan */
                    uint32_t hev = MR32(ov+16);
                    if (hev){ void win32_signal_event(uint32_t); win32_signal_event(hev); }
-                   { const char *mf2 = getenv("MUTEFILE");
-                     const char *ms2 = getenv("MUTESIZE");
-                     const char *mn2 = getenv("MUTEMIN");
-                     long msz2 = ms2 ? atol(ms2) : 0, mmin2 = mn2 ? atol(mn2) : 0;
-                     if (mf2 && *mf2 && got > 0 && strstr(f->path, mf2)
-                         && (mmin2 ? ((long)len >= mmin2) : (!msz2 || (long)len == msz2)))
-                         memset(g_mem+buf, 0, (size_t)got); }
                    g_overlapped_reads++;
                } else if (f->empty){
                    got = 0;                       /* aninda dosya sonu */
@@ -400,22 +694,22 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
                 * efekti kaliyor mu, bunu nesnel olcmek icin.  Dosya sonu
                 * dondurmuyoruz ki akis mantigi normal calismaya devam
                 * etsin -- yalnizca icerik sessizlesir. */
-               { const char *mf = getenv("MUTEFILE");
-                 const char *ms = getenv("MUTESIZE");
-                 const char *mn = getenv("MUTEMIN");
-                 long msz = ms ? atol(ms) : 0, mmin = mn ? atol(mn) : 0;
-                 if (mf && *mf && got > 0 && strstr(f->path, mf)
-                     && (mmin ? ((long)len >= mmin) : (!msz || (long)len == msz)))
-                     memset(g_mem+buf, 0, (size_t)got); }
+               if (fileio_should_mute_read(f->path, len, got))
+                   memset(g_mem+buf, 0, (size_t)got);
                if(pnr) MR32(pnr)=(uint32_t)got;
-               if (getenv("READLOG")){
+               if (_readlog){
                    const char *bn = strrchr(f->path,'/'); bn = bn?bn+1:f->path;
                    double audio_time(void);
                    fprintf(stderr,"  [okuma] t=%8.3f %-28s istenen=%-9u alinan=%-9ld sure=%.2f ms\n",
                            audio_time(), bn, len, (long)got,
                            (double)(now_ns_io() - _rd0)/1e6);
                }
-               g_file_read++; g_bytes_read += (uint64_t)got; r=1; }
+               g_file_read++; g_bytes_read += (uint64_t)got;
+               atomic_fetch_add_explicit(&g_fileio_snapshot_read_calls, 1u,
+                                         memory_order_relaxed);
+               atomic_fetch_add_explicit(&g_fileio_snapshot_read_bytes,
+                                         (uint64_t)got, memory_order_relaxed);
+               r=1; }
     }
     else if (!strcmp(n,"GetOverlappedResult")){
         /* (hFile, lpOverlapped, lpNumberOfBytesTransferred, bWait) */
@@ -467,6 +761,7 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
     else if (!strcmp(n,"SetFileAttributesA")) r=1;
     else if (!strcmp(n,"DeleteFileA")){
         char real[1024]; resolve_w(GS(A(c,0)), real, sizeof real);
+        fileio_case_cache_invalidate_path(real);
         r = (unlink(real)==0);
     }
     else if (!strcmp(n,"SHGetFolderPathA")){
@@ -479,6 +774,7 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
     else if (!strcmp(n,"CreateDirectoryA")){
         char real[1024]; resolve_w(GS(A(c,0)), real, sizeof real);
         mkparents(real);
+        fileio_case_cache_invalidate_path(real);
         r = (mkdir(real,0755)==0 || errno==EEXIST);
     }
     else if (!strcmp(n,"MoveFileA")){
@@ -486,7 +782,11 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
         mkparents(b);
         /* Kaynak oyun kokundeyse (salt okunur) tasima yerine kopyala. */
         if (g_wroot[0] && strncmp(a, g_wroot, strlen(g_wroot)) != 0) r = (uint32_t)copy_file(a, b);
-        else r = (rename(a,b)==0);
+        else {
+            fileio_case_cache_invalidate_path(a);
+            fileio_case_cache_invalidate_path(b);
+            r = (rename(a,b)==0);
+        }
     }
     else if (!strcmp(n,"CopyFileA")){
         char a[1024],b[1024]; resolve(GS(A(c,0)),a,sizeof a); resolve_w(GS(A(c,1)),b,sizeof b);

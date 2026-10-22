@@ -31,7 +31,9 @@ def policy():
 class Boundaries(unittest.TestCase):
     def test_forks_prs_untrusted_refs_and_debug_fail_closed(self):
         build.validate_context(context())
-        for key, value in [("GITHUB_REPOSITORY", "attacker/fork"), ("GITHUB_EVENT_NAME", "pull_request_target"),
+        for key, value in [("GITHUB_REPOSITORY", "attacker/fork"),
+                           ("GITHUB_REPOSITORY", "lyszq/NFSU2Recomp"),
+                           ("GITHUB_EVENT_NAME", "pull_request_target"),
                            ("GITHUB_EVENT_NAME", "pull_request"), ("GITHUB_EVENT_NAME", "workflow_run"),
                            ("GITHUB_REF", "refs/pull/1/merge"), ("SOURCE_SHA", "main"),
                            ("GITHUB_SHA", "b" * 40), ("RUNNER_ENVIRONMENT", "self-hosted"),
@@ -39,6 +41,15 @@ class Boundaries(unittest.TestCase):
                            ("GITHUB_WORKFLOW_REF", "attacker@main")]:
             with self.subTest(key=key, value=value), self.assertRaises(build.ClosedError):
                 build.validate_context(dict(context(), **{key: value}))
+
+    def test_renamed_public_repository_keeps_private_destination(self):
+        self.assertEqual(build.PUBLIC, "lyszq/NFSU2Recomp-iOS")
+        self.assertEqual(build.PRIVATE, "lyszq/NFSU2Recomp-ios-private")
+        self.assertEqual(build.PRIVATE_ID, 1427055553)
+        workflow = (Path(__file__).resolve().parents[2] /
+                    ".github/workflows/ios-private-io.yml").read_text()
+        self.assertIn("github.repository == 'lyszq/NFSU2Recomp-iOS'", workflow)
+        self.assertEqual(workflow.count("https://github.com/lyszq/NFSU2Recomp-iOS.git"), 2)
 
     def test_environment_owner_review_and_exact_branch_required(self):
         branches = {"branch_policies": [{"name": build.BRANCH, "type": "branch"}]}

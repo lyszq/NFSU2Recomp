@@ -1,6 +1,7 @@
 #import "NFSU2GameSession.h"
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static void copy_text(char *destination, size_t capacity, const char *source) {
@@ -19,11 +20,15 @@ static void copy_text(char *destination, size_t capacity, const char *source) {
 #import <fcntl.h>
 #import <unistd.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "cpu.h"
 #include "decls.h"
 #include "guest_bootstrap.h"
 #include "metal.h"
+#include "gfx.h"
+#include "audio.h"
+#include "fileio.h"
 #include "NFSU2InputBridge.h"
 
 extern void dispatch_init(void);
@@ -68,6 +73,46 @@ static dispatch_queue_t session_log_queue(void) {
                                       DISPATCH_QUEUE_SERIAL);
     });
     return queue;
+}
+
+/* Called by the UIKit status timer on the render thread. Capture counters here
+ * (the PSO cache belongs to this thread), then write only the captured values
+ * on the existing log queue. No per-frame files or audio-callback IO. */
+static void log_performance_if_due(void) {
+    if (!pthread_main_np()) return;
+    static uint64_t origin_us, last_us;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return;
+    uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    if (last_us && now_us >= last_us && now_us - last_us < 10000000ull) return;
+    if (!origin_us || now_us < origin_us) origin_us = now_us;
+    last_us = now_us;
+    uint64_t elapsed_ms = (now_us - origin_us) / 1000ull;
+    uint64_t pso_lookups = 0, pso_hits = 0, pso_probes = 0, pso_compile_ns = 0;
+    unsigned pso_entries = 0;
+    metal_pipeline_cache_snapshot(&pso_lookups, &pso_hits, &pso_probes,
+                                  &pso_compile_ns, &pso_entries);
+    FileioPerfSnapshot io = {0};
+    fileio_perf_snapshot(&io);
+    AudioSnapshot audio = {0};
+    int audio_ready = audio_snapshot(&audio);
+    dispatch_async(session_log_queue(), ^{
+        fprintf(stderr,
+                "runtime performance: elapsed_ms=%llu pso_lookups=%llu pso_hits=%llu "
+                "pso_probes=%llu pso_compile_ms=%.3f pso_entries=%u "
+                "io_cache_hits=%llu io_scans=%llu io_invalidations=%llu io_reads=%llu io_bytes=%llu "
+                "audio_snapshot=%d audio_active=%llu audio_plays=%llu audio_reissues=%llu "
+                "audio_stops=%llu audio_writes=%llu audio_hw_rate=%u; cumulative counters\n",
+                (unsigned long long)elapsed_ms, (unsigned long long)pso_lookups,
+                (unsigned long long)pso_hits, (unsigned long long)pso_probes,
+                (double)pso_compile_ns / 1000000.0, pso_entries,
+                (unsigned long long)io.case_cache_hits, (unsigned long long)io.directory_scans,
+                (unsigned long long)io.cache_invalidations, (unsigned long long)io.read_calls,
+                (unsigned long long)io.read_bytes, audio_ready,
+                (unsigned long long)audio.active_buffers, (unsigned long long)audio.plays,
+                (unsigned long long)audio.reissues, (unsigned long long)audio.stops,
+                (unsigned long long)audio.write_calls, audio.hardware_rate);
+    });
 }
 
 static NSString *runtime_log_path(void) {
@@ -331,6 +376,7 @@ void nfs_game_session_get_status(char *diagnostic, size_t diagnostic_capacity) {
     /* This getter is polled from the main-thread status timer. Keep filesystem
      * writes off both UIKit and the lifecycle lock while retaining the evidence.
      */
+    log_performance_if_due();
     if (log_changed) {
         dispatch_async(session_log_queue(), ^{
             fprintf(stderr,
@@ -428,6 +474,9 @@ int nfs_game_session_start(const char *executable_path,
 
     /* Capture subsequent runtime stderr in an append-only, user-accessible file. */
     nfs_game_session_prepare_log();
+    /* Existing bounded diagnostics correlate long serialized guest holds with
+     * audio producer gaps. This process-only default respects an explicit override. */
+    setenv("GILLOG", "500", 0);
 
     if (!metal_available() || !metal_window_ready()) {
         return fail_session(ENODEV,

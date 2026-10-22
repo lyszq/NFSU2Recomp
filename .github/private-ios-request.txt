@@ -1,2 +1,2 @@
-Public runner / private IO request 2026-10-22T14:21:00+00:00 - v0.24 reviewed QPC and TSC fixes
+Public runner / private IO request 2026-10-22T16:32:30+00:00 - v0.25 audio cursor and nominal pitch fixes; measured PSO and file lookup optimizations; renamed public repository
 Owner-reviewed environment required.

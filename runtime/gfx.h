@@ -3,6 +3,7 @@
  * UZAYINDA (clip space) olur; perspektif bolmesini rasterlestirici yapar. */
 #ifndef GFX_H
 #define GFX_H
+#include <stdint.h>
 /* DIKKAT: doku koordinatlari asama basina DORT bilesen tasir.
  * Onceden yalnizca .xy tasiniyordu; oysa oyunun kose gölgelendiricileri
  * PROJEKSIYONLU koordinat uretiyor (olculdu: oT1.x/y/z = dot(v0, c4..c6),
@@ -16,4 +17,8 @@ typedef struct {
 } TVert;
 
 void metal_draw_tv(const TVert *tv, unsigned nverts, unsigned prim, unsigned tex);
+/* Main render-thread only: snapshots cumulative PSO lookup counters. */
+void metal_pipeline_cache_snapshot(uint64_t *lookups, uint64_t *hits,
+                                   uint64_t *probes, uint64_t *compiled_ns,
+                                   unsigned *entries);
 #endif

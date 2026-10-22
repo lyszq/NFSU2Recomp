@@ -48,6 +48,7 @@ __attribute__((weak)) void perflog_event(int k, uint64_t ns, uint64_t bytes) { (
 #include <time.h>
 #include <stdlib.h>
 #include "metal_framebuffer_pool.h"
+#include "metal_pipeline_cache.h"
 
 #if !TARGET_OS_IPHONE
 static NSWindow        *g_win;
@@ -4562,6 +4563,26 @@ void metal_early_init(void){
 #endif
 static struct { uint64_t key; id<MTLRenderPipelineState> pso; } g_psocache[MAXPSO];
 static unsigned g_pson = 0;
+_Static_assert(MAXPSO <= UINT16_MAX, "PSO cache index + 1 must fit in uint16_t");
+#define PSO_MAP_CAPACITY (MAXPSO * 2u)
+/* Dense PSO entries keep their insertion order; the separate index makes
+ * repeated draw-state lookups bounded and leaves compile/cache capacity alone. */
+static uint16_t g_psomap[PSO_MAP_CAPACITY];
+static int g_psomap_degraded = 0;
+static uint64_t g_pso_lookups = 0;
+static uint64_t g_pso_hits = 0;
+static uint64_t g_pso_probes = 0;
+static uint64_t g_pso_compiled_ns = 0;
+
+void metal_pipeline_cache_snapshot(uint64_t *lookups, uint64_t *hits,
+                                   uint64_t *probes, uint64_t *compiled_ns,
+                                   unsigned *entries){
+    if (lookups) *lookups = g_pso_lookups;
+    if (hits) *hits = g_pso_hits;
+    if (probes) *probes = g_pso_probes;
+    if (compiled_ns) *compiled_ns = g_pso_compiled_ns;
+    if (entries) *entries = g_pson;
+}
 
 static MTLBlendFactor d3d_blend(unsigned f, int is_alpha){
     (void)is_alpha;
@@ -4600,8 +4621,28 @@ static MTLBlendOperation d3d_blendop(unsigned op){
 }
 
 static id<MTLRenderPipelineState> pso_for(uint64_t key){
-    for (unsigned i = 0; i < g_pson; i++)
-        if (g_psocache[i].key == key) return g_psocache[i].pso;
+    ++g_pso_lookups;
+    if (!g_psomap_degraded){
+        size_t lookup_probes = 0;
+        uint16_t cached = nfs_pipeline_cache_find(g_psomap, PSO_MAP_CAPACITY,
+                                                  &g_psocache[0].key,
+                                                  sizeof g_psocache[0], g_pson,
+                                                  key, &lookup_probes, NULL);
+        g_pso_probes += lookup_probes;
+        if (cached){
+            ++g_pso_hits;
+            return g_psocache[(unsigned)cached - 1u].pso;
+        }
+    } else {
+        /* Defensive fallback if the index invariant is ever broken. */
+        for (unsigned i = 0; i < g_pson; i++){
+            ++g_pso_probes;
+            if (g_psocache[i].key == key){
+                ++g_pso_hits;
+                return g_psocache[i].pso;
+            }
+        }
+    }
     if (!g_lib || g_pson >= MAXPSO) return g_pso;
 
     /* anahtar: karisim(0..19) | ps<<20 | vs<<32 | (HD) msaa<<48 | G<<49 | log2(ornek)<<50
@@ -4653,13 +4694,32 @@ static id<MTLRenderPipelineState> pso_for(uint64_t key){
 #endif
 
     NSError *e2 = nil;
-    struct timespec _o0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_o0);
+    struct timespec _o0, _o1;
+    clock_gettime(CLOCK_MONOTONIC, &_o0);
     id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:pd error:&e2];
-    if (g_perflog){ struct timespec _o1; clock_gettime(CLOCK_MONOTONIC, &_o1);
-        perflog_event(PL_PSO, (uint64_t)(_o1.tv_sec - _o0.tv_sec) * 1000000000ull + (uint64_t)_o1.tv_nsec - (uint64_t)_o0.tv_nsec, 0); }
+    clock_gettime(CLOCK_MONOTONIC, &_o1);
+    uint64_t compile_ns = (uint64_t)(_o1.tv_sec - _o0.tv_sec) * 1000000000ull +
+                          (uint64_t)_o1.tv_nsec - (uint64_t)_o0.tv_nsec;
+    g_pso_compiled_ns += compile_ns;
+    if (g_perflog) perflog_event(PL_PSO, compile_ns, 0);
     if (!ps) return g_pso;
     g_psocache[g_pson].key = key;
     g_psocache[g_pson].pso = ps;
+    if (!g_psomap_degraded){
+        uint16_t existing = 0;
+        int inserted = nfs_pipeline_cache_insert(g_psomap, PSO_MAP_CAPACITY,
+                                                  &g_psocache[0].key,
+                                                  sizeof g_psocache[0], g_pson + 1u,
+                                                  key, (uint16_t)(g_pson + 1u),
+                                                  &existing, NULL, NULL);
+        if (inserted == NFS_PIPELINE_CACHE_DUPLICATE && existing &&
+            existing <= g_pson)
+            return g_psocache[(unsigned)existing - 1u].pso;
+        if (inserted != NFS_PIPELINE_CACHE_INSERTED){
+            g_psomap_degraded = 1;
+            fprintf(stderr, "metal: PSO hash index unavailable; falling back to dense lookup\n");
+        }
+    }
     g_pson++;
     return ps;
 }

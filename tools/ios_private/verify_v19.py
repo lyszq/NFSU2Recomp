@@ -36,7 +36,7 @@ client = GitHub('NFSU2Recomp-ios-private')
 client.private()
 private = client.api(f'/repos/{client.repository}/actions/runs/{a.run}')
 jobs = client.api(f'/repos/{client.repository}/actions/runs/{a.run}/jobs')['jobs']
-public = client.api(f'/repos/lyszq/NFSU2Recomp/actions/runs/{a.public_run}')
+public = client.api(f'/repos/lyszq/NFSU2Recomp-iOS/actions/runs/{a.public_run}')
 assert private['conclusion'] == public['conclusion'] == 'success'
 assert public['head_sha'] == a.source and all(j['conclusion'] == 'success' for j in jobs)
 workflow = client.api(f'/repos/{client.repository}/contents/.github/workflows/ios-private.yml?ref={private["head_sha"]}')
@@ -109,7 +109,7 @@ for required_doc_text in (
         'QueryPerformanceFrequency', 'QueryPerformanceCounter',
         'GetTickCount', 'GetCurrentProcess', 'sixteen synthetic corruptions'):
     assert required_doc_text in startup_doc
-assert client.api('/repos/lyszq/NFSU2Recomp/git/ref/heads/main')['object']['sha'] == 'e38069b79c096bd86ea55e4e8e50dec73bb093fa'
+assert client.api('/repos/lyszq/NFSU2Recomp-iOS/git/ref/heads/main')['object']['sha'] == 'e38069b79c096bd86ea55e4e8e50dec73bb093fa'
 for name in ('private-evidence.txt', 'private-linux-evidence.txt'):
     evidence = (a.delivery / name).read_text()
     assert 'FAIL |' not in evidence and 'DIFF |' not in evidence
@@ -184,7 +184,7 @@ report = dict(version='0.19.0', build='26', source_commit=a.source,
               physical_device_test='pending', previous_confirmed_device_version='0.17.0',
               previous_confirmed_device='iPad / iPadOS 26.3 / 16 KiB pages',
               live_input_device_test='v0.16 hover PASS; touch not separately reported; v0.18/v0.19 live input not reported', game_boot=False, gameplay=False,
-              public_main=client.api('/repos/lyszq/NFSU2Recomp/git/ref/heads/main')['object']['sha'],
+              public_main=client.api('/repos/lyszq/NFSU2Recomp-iOS/git/ref/heads/main')['object']['sha'],
               working_tree_clean=not subprocess.check_output(['git','status','--porcelain'],cwd=ROOT,text=True).strip())
 (a.delivery / 'BUILD-VERIFICATION.json').write_text(json.dumps(report,indent=2)+'\n',encoding='utf-8')
 print(json.dumps(report,indent=2))

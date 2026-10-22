@@ -2,8 +2,9 @@
  *
  * CoreAudio / RemoteIO / DirectSound emulasyon katmani arayuzu.
  * EA Trax (muzik akisi), SFX (ses efektleri), ve motor sesleri icin
- * dusuk gecikmeli, cift tamponlu (ring buffer) ve ornekleme hizi
- * uyarlamali (44.1 kHz / 48 kHz) ses mimarisi.
+ * 44.1 kHz / 48 kHz donanim cikis hizina uyumlanan ses katmani. Uretim
+ * karistiricisi konuk PCM'ini dogrudan okur; ring-buffer API'si su an render
+ * yolunda kullanilmaz.
  */
 
 #ifndef NFSU2_AUDIO_H
@@ -24,9 +25,22 @@ extern "C" {
 #define AUDIO_MAX_BUFFERS     128
 #define AUDIO_RING_FRAMES     8192u     /* Lock-free ring buffer boyutu (2'nin kuvveti) */
 
-/* --- Kilit-Serbest (Lock-Free) SPSC Dairesel Tampon (Ring Buffer) ---
- * Real-time CoreAudio render is parcacigi ile oyun thread'ini birbirinden
- * tamamen ayirir (priority inversion ve ses teklemelerini onler). */
+/* IDirectSoundBuffer::GetStatus result bits used by the COM adapter. */
+#define AUDIO_STATUS_PLAYING  0x00000001u
+#define AUDIO_STATUS_LOOPING  0x00000004u
+
+/* Small nonblocking aggregate for the app's bounded audio diagnostics. */
+typedef struct {
+    uint64_t active_buffers;
+    uint64_t plays;
+    uint64_t reissues;
+    uint64_t stops;
+    uint64_t write_calls;
+    uint32_t hardware_rate;
+} AudioSnapshot;
+
+/* --- Kilit-Serbest SPSC Dairesel Tampon yardimcisi ---
+ * Bu API mevcut production render yolundan bagimsizdir. */
 typedef struct {
     int16_t        *buffer;             /* Interleaved 16-bit PCM stereo */
     size_t          capacity_frames;    /* 2'nin kuvveti */
@@ -51,10 +65,14 @@ int      audio_is_active(void);
 int      audio_register(uint32_t data, uint32_t bytes, uint32_t rate, uint32_t chans, uint32_t bits);
 void     audio_play(int id, int loop);
 void     audio_stop(int id);
+int      audio_set_position(int id, uint32_t byte_pos);
+uint32_t audio_status(int id);
+int      audio_snapshot(AudioSnapshot *out);
 uint32_t audio_cursor(int id);
 void     audio_cursors(int id, uint32_t *play, uint32_t *write);
 void     audio_set_volume(int id, long millibel);
 void     audio_set_freq(int id, uint32_t hz);
+uint32_t audio_get_freq(int id);
 int      audio_duplicate(int src);
 void     audio_note_write(int id, uint32_t end_off);
 void     audio_note_write_stat(int id, uint32_t n, int nonzero);

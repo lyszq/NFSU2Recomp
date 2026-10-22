@@ -1,8 +1,9 @@
 /* NFSU2 iOS Port - CoreAudio / RemoteIO / DirectSound Audio Layer
  *
  * EA Trax (interaktif muzik akisi), SFX (ses efektleri), ve motor sesleri
- * icin dusuk gecikmeli, kilit-serbest cift tamponlu (ring buffer) ve
- * dinamik donanim ornekleme hizina (44.1 kHz / 48 kHz) uyarlanabilen mimari.
+ * icin iOS CoreAudio cikis yolu. Uretim karistiricisi PCM'i konuk belleginden
+ * dogrudan okur ve tampon durumunu g_slock ile korur; ring-buffer yardimcilari
+ * su anda uretim render yoluna bagli degildir.
  *
  * iOS AVAudioSession ve RemoteIO AudioUnit yasam dongusu:
  * - Kesintiler (AVAudioSessionInterruptionNotification): Arama / Alarm sirasinda
@@ -12,10 +13,11 @@
  *   ve tampon boyutu calisma aninda yeniden yapilandirilir.
  * - Medya sifirlama (AVAudioSessionMediaServicesWereResetNotification): audiod
  *   cokerse AudioUnit bastan olusturulur.
- * - Real-time thread priority inversion korumasi: au_cb asla bekletici kilit
- *   tutmaz; kilit-serbest ring buffer ve atomik bayraklar uzerinden calisir.
+ * - au_cb -> mix_into -> mix_chunk yolu g_slock alir; uretim callback'i
+ *   kilit-serbest degildir ve tanilama aciksa dosyaya yazabilir.
  */
 
+#ifndef NFSU2_AUDIO_CORE_TEST
 #import <AudioToolbox/AudioToolbox.h>
 #import <AudioUnit/AudioUnit.h>
 #include <TargetConditionals.h>
@@ -23,6 +25,10 @@
 #if TARGET_OS_IPHONE
 #import <AVFoundation/AVFoundation.h>
 #import <UIKit/UIKit.h>
+#endif
+#else
+/* Compile the exact production mixer/API as C for deterministic host tests. */
+#define TARGET_OS_IPHONE 0
 #endif
 
 #include "audio.h"
@@ -32,25 +38,31 @@
 #include <stdio.h>
 #include <pthread.h>
 #include <math.h>
+#include <time.h>
 #include <stdatomic.h>
 
 extern uint8_t *g_mem;
-uint64_t host_us(void);          /* oyunun SANAL saati (kare basina 16.67 ms) */
+uint64_t host_us(void);          /* iOS: continuous monotonic; desktop: legacy virtual clock */
 
 /* --- Donanim ve Durum Degiskenleri --- */
 static atomic_uint_fast32_t g_hw_rate        = AUDIO_DEFAULT_RATE; /* 44100 veya 48000 Hz */
 static atomic_bool          g_audio_suspended   = false;
 static atomic_bool          g_audio_reconfiguring = false;
 static atomic_bool          g_audio_on          = false;
-static int                  g_backend           = 0;     /* 1 = AudioUnit, 2 = AudioQueue */
 
-/* Oyun ses verisini kendi sanal zamaninda uretir; karistirici ise gercek
+/* Legacy desktop policy: oyun ses verisini kendi sanal zamaninda uretir; karistirici ise gercek
  * zamanda tuketiyordu. Emulator 60 fps altina dusunce sesin kesilmesini
  * onlemek icin tuketimi oyunun uretim hizina baglayan servo (PLL). */
 static double g_rate_ratio = 1.0;
 static int    g_sync_mode  = -1;      /* SNDSYNC: 1 = oyun hizina bagla */
 
 static void update_rate_ratio(void){
+#if TARGET_OS_IPHONE || defined(NFSU2_AUDIO_CORE_TEST)
+    /* iOS guest time is continuous monotonic time now. Audio output runs at
+     * the hardware clock, so do not let a virtual-clock servo pitch-shift it. */
+    g_sync_mode = 1;
+    g_rate_ratio = 1.0;
+#else
     if (g_sync_mode < 0){
         const char *e = getenv("SNDSYNC");
         g_sync_mode = (e && *e) ? (*e != '0') : 1;      /* varsayilan: acik */
@@ -71,6 +83,7 @@ static void update_rate_ratio(void){
         }
     }
     lv = vus; lr = rus;
+#endif
 }
 
 #define OUT_CH     AUDIO_OUT_CHANNELS
@@ -89,7 +102,7 @@ typedef struct {
     double   trim;            /* hiz duzeltmesi (servo) */
     double   target;          /* kilitlenecek dolgu orani (uyarlanir) */
     double   freq;            /* SetFrequency orani (1.0 = ozgun hiz) */
-    uint64_t plays, stops, wr_bytes, wr_calls, wr_nonzero;
+    uint64_t plays, stops, reissues, wr_bytes, wr_calls, wr_nonzero;
     uint64_t over;            /* yaziciyi gectigimiz geri-cagirma sayisi */
 } SndBuf;
 
@@ -97,13 +110,17 @@ static SndBuf g_snd[MAXSND];
 static int    g_sndn = 1;                    /* 0 = gecersiz kimlik */
 static pthread_mutex_t g_slock = PTHREAD_MUTEX_INITIALIZER;
 
+static int                  g_backend = 0;   /* 1 = AudioUnit, 2 = AudioQueue */
+static unsigned             g_au_slice = 0;  /* Geri cagirma basina gerceklesen kare */
+#ifndef NFSU2_AUDIO_CORE_TEST
 static AudioQueueRef        g_q;
 static AudioQueueBufferRef  g_qb[NBUF];
 static AudioUnit            g_au = NULL;     /* Dusuk gecikmeli RemoteIO */
-static unsigned             g_au_slice = 0;  /* Geri cagirma basina gerceklesen kare */
+#endif
 
 static uint64_t g_mixed_frames = 0, g_active_peak = 0;
 static uint64_t g_replay = 0, g_reissue = 0, g_starved = 0, g_worst_gap_us = 0;
+static uint64_t g_late_callbacks = 0;
 static uint64_t g_out_frames = 0, g_out_zero = 0, g_gap_cb = 0;
 
 /* Tani dosyalari */
@@ -111,8 +128,19 @@ static FILE *g_dump = NULL;      /* SNDDUMP=<yol> : ham s16le stereo */
 static FILE *g_csv  = NULL;      /* SNDCSV=<yol>  : geri-cagirma basina durum */
 static uint64_t g_cb_no = 0;
 
+static void audio_count(uint64_t *counter){
+    if (*counter != UINT64_MAX) (*counter)++;
+}
+
+static void audio_add(uint64_t *counter, uint64_t amount){
+    if (UINT64_MAX - *counter < amount) *counter = UINT64_MAX;
+    else *counter += amount;
+}
+
 /* --- Kilit-Serbest (Lock-Free) SPSC Dairesel Tampon Uygulamasi --- */
+#ifndef NFSU2_AUDIO_CORE_TEST
 static AudioRingBuffer g_stream_rb;
+#endif
 
 bool audio_ringbuf_init(AudioRingBuffer *rb, size_t capacity_frames, uint32_t channels){
     if (!rb || (capacity_frames & (capacity_frames - 1)) != 0) return false;
@@ -215,7 +243,7 @@ int audio_register(uint32_t data, uint32_t bytes, uint32_t rate,
         b->chans = chans; b->bits = bits;
         b->used = 1; b->playing = 0; b->loop = 0; b->cursor = 0.0; b->vol = 1.f;
         b->wpos = 0; b->wseen = 0; b->trim = 1.0; b->target = 0.0; b->over = 0;
-        b->freq = 1.0; b->plays = b->stops = 0;
+        b->freq = 1.0; b->plays = b->stops = b->reissues = 0;
         b->wr_bytes = b->wr_calls = b->wr_nonzero = 0;
         fprintf(stderr, "  [ses] tampon #%d: %u Hz, %u kanal, %u bit, %u bayt (%.2f sn)\n",
                 id, rate, chans, bits, bytes,
@@ -229,12 +257,14 @@ void audio_play(int id, int loop){
     if (id <= 0 || id >= MAXSND) return;
     pthread_mutex_lock(&g_slock);
     if (g_snd[id].used){
-        /* Calan akis tamponunda imleci SIFIRLAMA; dur-basla teklemelerini engeller */
-        if (!g_snd[id].playing){ g_snd[id].cursor = 0.0; g_replay++; }
-        else g_reissue++;
+        /* DirectSound Play baslangic imlecinden devam eder. Stop sonrasinda
+         * imlec korunur; dogal one-shot sonu zaten mix_into tarafindan 0'a
+         * alindigi icin tamamlanmis bir ses sonraki Play'de bastan baslar. */
+        if (!g_snd[id].playing) audio_count(&g_replay);
+        else { audio_count(&g_reissue); audio_count(&g_snd[id].reissues); }
         g_snd[id].playing = 1;
         g_snd[id].loop = loop;
-        g_snd[id].plays++;
+        audio_count(&g_snd[id].plays);
     }
     pthread_mutex_unlock(&g_slock);
 }
@@ -242,8 +272,56 @@ void audio_play(int id, int loop){
 void audio_stop(int id){
     if (id <= 0 || id >= MAXSND) return;
     pthread_mutex_lock(&g_slock);
-    if (g_snd[id].used){ g_snd[id].playing = 0; g_snd[id].stops++; }
+    if (g_snd[id].used){ g_snd[id].playing = 0; audio_count(&g_snd[id].stops); }
     pthread_mutex_unlock(&g_slock);
+}
+
+int audio_set_position(int id, uint32_t byte_pos){
+    if (id <= 0 || id >= MAXSND) return 0;
+    int ok = 0;
+    pthread_mutex_lock(&g_slock);
+    SndBuf *b = &g_snd[id];
+    uint32_t bpf = b->chans * (b->bits / 8u);
+    if (b->used && b->bytes && bpf && byte_pos < b->bytes){
+        b->cursor = (double)byte_pos / (double)bpf;
+        ok = 1;
+    }
+    pthread_mutex_unlock(&g_slock);
+    return ok;
+}
+
+uint32_t audio_status(int id){
+    if (id <= 0 || id >= MAXSND) return 0;
+    uint32_t status = 0;
+    pthread_mutex_lock(&g_slock);
+    const SndBuf *b = &g_snd[id];
+    if (b->used && b->playing){
+        status = AUDIO_STATUS_PLAYING;
+        if (b->loop) status |= AUDIO_STATUS_LOOPING;
+    }
+    pthread_mutex_unlock(&g_slock);
+    return status;
+}
+
+/* One short try-lock keeps diagnostics from waiting behind the real-time
+ * mixer. Return zero when a coherent buffer snapshot is not immediately
+ * available; callers can simply skip that sample. */
+int audio_snapshot(AudioSnapshot *out){
+    if (!out || pthread_mutex_trylock(&g_slock) != 0) return 0;
+    AudioSnapshot snap = {0};
+    for (int i = 1; i < g_sndn; i++){
+        const SndBuf *b = &g_snd[i];
+        if (!b->used) continue;
+        if (b->playing) audio_add(&snap.active_buffers, 1);
+        audio_add(&snap.plays, b->plays);
+        audio_add(&snap.reissues, b->reissues);
+        audio_add(&snap.stops, b->stops);
+        audio_add(&snap.write_calls, b->wr_calls);
+    }
+    snap.hardware_rate = audio_get_hardware_rate();
+    *out = snap;
+    pthread_mutex_unlock(&g_slock);
+    return 1;
 }
 
 void audio_note_write(int id, uint32_t end_off){
@@ -260,9 +338,9 @@ void audio_note_write_stat(int id, uint32_t n, int nonzero){
     if (id <= 0 || id >= MAXSND) return;
     pthread_mutex_lock(&g_slock);
     if (g_snd[id].used){
-        g_snd[id].wr_calls++;
-        g_snd[id].wr_bytes += n;
-        if (nonzero) g_snd[id].wr_nonzero++;
+        audio_count(&g_snd[id].wr_calls);
+        audio_add(&g_snd[id].wr_bytes, n);
+        if (nonzero) audio_count(&g_snd[id].wr_nonzero);
     }
     pthread_mutex_unlock(&g_slock);
 }
@@ -282,6 +360,19 @@ void audio_set_freq(int id, uint32_t hz){
     pthread_mutex_unlock(&g_slock);
 }
 
+uint32_t audio_get_freq(int id){
+    if (id <= 0 || id >= MAXSND) return 0;
+    uint32_t hz = 0;
+    pthread_mutex_lock(&g_slock);
+    const SndBuf *b = &g_snd[id];
+    if (b->used && b->rate){
+        double actual = (double)b->rate * b->freq;
+        if (actual > 0.0 && actual < 4294967295.0) hz = (uint32_t)llround(actual);
+    }
+    pthread_mutex_unlock(&g_slock);
+    return hz;
+}
+
 int audio_duplicate(int src){
     if (src <= 0 || src >= MAXSND) return 0;
     int id = 0;
@@ -291,7 +382,7 @@ int audio_duplicate(int src){
         g_snd[id] = g_snd[src];
         g_snd[id].playing = 0; g_snd[id].cursor = 0.0; g_snd[id].trim = 1.0;
         g_snd[id].target = 0.0; g_snd[id].over = 0;
-        g_snd[id].plays = g_snd[id].stops = 0;
+        g_snd[id].plays = g_snd[id].stops = g_snd[id].reissues = 0;
         g_snd[id].wr_bytes = g_snd[id].wr_calls = g_snd[id].wr_nonzero = 0;
     }
     pthread_mutex_unlock(&g_slock);
@@ -351,18 +442,11 @@ int audio_is_suspended(void){
     return atomic_load_explicit(&g_audio_suspended, memory_order_relaxed);
 }
 
-/* --- Karistirici (Mixer) Cekirdegi ---
- * Dinamik Donanim Hizina (44.1 kHz / 48 kHz) Dogrusal Ara-Degerleme (Linear Interpolation)
- * ile yuksek kaliteli resample yapar; motor sesi ve EA Trax'te aliasing'i onler. */
-static void mix_into(int16_t *out, unsigned frames){
+/* --- Karistirici (Mixer) Cekirdegi --- */
+static void mix_chunk(int16_t *out, unsigned frames, uint32_t hw_rate){
     static float acc[FRAMES * OUT_CH];
-    if (frames > FRAMES) frames = FRAMES;
     memset(acc, 0, sizeof(float) * frames * OUT_CH);
     uint64_t active = 0;
-    update_rate_ratio();
-
-    uint32_t hw_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
-    if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
 
     pthread_mutex_lock(&g_slock);
     for (int i = 1; i < g_sndn; i++){
@@ -374,7 +458,9 @@ static void mix_into(int16_t *out, unsigned frames){
         uint32_t nsrc = b->bytes / bpf;
         if (!nsrc) continue;
 
-        /* Oynatma imlecini oyunun YAZMA imlecine kilitle (PLL / Servo) */
+        /* Eski masaustu backend'i icin yazma imleci servosu. iOS'ta guest
+         * saati/sahibi belirsiz yazma konumu pitch'i degistirmemeli. */
+#if !TARGET_OS_IPHONE && !defined(NFSU2_AUDIO_CORE_TEST)
         if (b->wseen){
             uint32_t bpf2 = b->chans * (b->bits/8u);
             uint32_t pbyte = ((uint32_t)(b->cursor * (double)bpf2)) % b->bytes;
@@ -382,7 +468,7 @@ static void mix_into(int16_t *out, unsigned frames){
             double frac = (double)avail / (double)b->bytes;
             double want;
             if (frac > 0.85){
-                b->over++;
+                audio_count(&b->over);
                 want = 0.94;
             } else {
                 if (b->target <= 0.0) b->target = frac;
@@ -398,8 +484,11 @@ static void mix_into(int16_t *out, unsigned frames){
             b->trim += (1.0 - b->trim) * 0.08;
         }
         if (b->trim < 0.5 || b->trim > 2.0) b->trim = 1.0;
+#else
+        b->trim = 1.0;
+#endif
 
-        /* Dinamik adim: Kaynak Frekans / Donanim Cikis Frekansi * Senkron * Servo * Pitch */
+        /* Adim: kaynak/donanim orani * saat orani * servo * SetFrequency. */
         double step = ((double)b->rate / (double)hw_rate) * g_rate_ratio * b->trim * b->freq;
         active++;
 
@@ -467,6 +556,22 @@ static void mix_into(int16_t *out, unsigned frames){
     if (g_dump) fwrite(out, sizeof(int16_t), (size_t)frames * OUT_CH, g_dump);
 }
 
+/* AudioUnit may request more than FRAMES despite MaximumFramesPerSlice. Mix
+ * the complete request in bounded chunks instead of leaving the tail stale. */
+static void mix_into(int16_t *out, unsigned frames){
+    if (!out || !frames) return;
+    update_rate_ratio();
+    uint32_t hw_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
+    if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
+    while (frames){
+        unsigned chunk = frames > FRAMES ? FRAMES : frames;
+        mix_chunk(out, chunk, hw_rate);
+        out += (size_t)chunk * OUT_CH;
+        frames -= chunk;
+    }
+}
+
+#ifndef NFSU2_AUDIO_CORE_TEST
 static uint64_t now_us_a(void){
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
@@ -487,7 +592,8 @@ static void cb(void *ud, AudioQueueRef q, AudioQueueBufferRef buf){
     static uint64_t last = 0;
     uint64_t now = now_us_a();
     uint64_t budget = (uint64_t)FRAMES * 1000000ull / (uint64_t)hw_rate;
-    if (last && now - last > budget * (uint64_t)NBUF) g_starved++;
+    if (last && now - last > budget * (uint64_t)NBUF) audio_count(&g_starved);
+    if (last && now - last > budget * 2u) audio_count(&g_late_callbacks);
     if (last){ uint64_t d = now - last; if (d > g_worst_gap_us) g_worst_gap_us = d; }
     last = now;
 
@@ -496,8 +602,8 @@ static void cb(void *ud, AudioQueueRef q, AudioQueueBufferRef buf){
     AudioQueueEnqueueBuffer(q, buf, 0, NULL);
 }
 
-/* RemoteIO AudioUnit Render Geri Cagirmasi (Ana Dusuk Gecikmeli Yol)
- * Priority Inversion Korumasi: Asla bekletici kilit almaz veya sistem cagrilarina takilmaz. */
+/* RemoteIO AudioUnit render callback. mix_into/mix_chunk reads guest PCM and
+ * takes g_slock, so this is not a lock-free callback path. */
 static OSStatus au_cb(void *ud, AudioUnitRenderActionFlags *flags,
                       const AudioTimeStamp *ts, UInt32 bus, UInt32 nframes,
                       AudioBufferList *abl){
@@ -515,11 +621,17 @@ static OSStatus au_cb(void *ud, AudioUnitRenderActionFlags *flags,
 
     static uint64_t last = 0;
     uint64_t now = now_us_a();
-    if (last){ uint64_t d = now - last; if (d > g_worst_gap_us) g_worst_gap_us = d; }
+    uint32_t hw_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
+    if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
+    uint64_t budget = (uint64_t)nframes * 1000000ull / (uint64_t)hw_rate;
+    if (last){
+        uint64_t d = now - last;
+        if (d > g_worst_gap_us) g_worst_gap_us = d;
+        if (budget && d > budget * 2u) audio_count(&g_late_callbacks);
+    }
     last = now;
 
     int16_t *out = (int16_t *)abl->mBuffers[0].mData;
-    if (nframes > (UInt32)FRAMES) nframes = (UInt32)FRAMES;
     if (nframes > g_au_slice) g_au_slice = nframes;
 
     mix_into(out, (unsigned)nframes);
@@ -835,6 +947,9 @@ void audio_init(void){
     uint32_t hw_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
     if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
 
+#if TARGET_OS_IPHONE
+    fprintf(stderr, "audio policy: iOS nominal sample rate; explicit DirectSound frequency; cursor-preserving Play\n");
+#endif
     { const char *d = getenv("SNDDUMP");
       if (d && *d){ g_dump = fopen(d, "wb");
           fprintf(stderr, "ses: cikis dokumu -> %s (%d Hz s16le %d kanal)\n", d, hw_rate, OUT_CH); } }
@@ -902,6 +1017,7 @@ void audio_shutdown(void){
     audio_ringbuf_destroy(&g_stream_rb);
     g_backend = 0;
 }
+#endif /* !NFSU2_AUDIO_CORE_TEST */
 
 void audio_report(void){
     if (g_dump){ fflush(g_dump); fclose(g_dump); g_dump = NULL; }
@@ -915,10 +1031,14 @@ void audio_report(void){
             hw_rate,
             (unsigned long long)g_mixed_frames,
             (unsigned long long)g_active_peak, g_sndn - 1);
-    fprintf(stderr, "  ses Play cagrisi  : %llu bastan basladi, %llu zaten caliyordu\n",
+    fprintf(stderr, "  ses Play cagrisi  : %llu durduktan/ilk kez basladi, %llu zaten caliyordu\n",
             (unsigned long long)g_replay, (unsigned long long)g_reissue);
+#if TARGET_OS_IPHONE || defined(NFSU2_AUDIO_CORE_TEST)
+    fprintf(stderr, "  ses hiz politikasi: iOS nominal ornekleme hizi; pitch yalniz SetFrequency\n");
+#else
     fprintf(stderr, "  ses hiz orani    : %.3f (oyun sanal zamani / gercek zaman)%s\n",
             g_rate_ratio, g_sync_mode ? "" : "  [SNDSYNC=0: kapali]");
+#endif
     fprintf(stderr, "  ses veri boslugu  : ornek %.1f%% sessiz, %llu geri-cagirmanin cogu bos\n",
             g_out_frames ? 100.0*(double)g_out_zero/(double)g_out_frames : 0.0,
             (unsigned long long)g_gap_cb);
@@ -926,11 +1046,13 @@ void audio_report(void){
     for (int i = 1; i < g_sndn; i++){
         SndBuf *b = &g_snd[i];
         if (!b->used) continue;
-        fprintf(stderr, "   #%-3d %6u Hz %uch %5.2f sn  Play=%-4llu Stop=%-4llu  "
+        fprintf(stderr, "   #%-3d %6u Hz %uch %5.2f sn  Play=%-4llu Stop=%-4llu "
+                "Reissue=%-4llu  "
                 "yazma=%llu (%llu dolu, %.1f KB)  %s\n",
                 i, b->rate, b->chans,
                 (double)b->bytes/(double)(b->rate*b->chans*(b->bits/8u)),
                 (unsigned long long)b->plays, (unsigned long long)b->stops,
+                (unsigned long long)b->reissues,
                 (unsigned long long)b->wr_calls, (unsigned long long)b->wr_nonzero,
                 b->wr_bytes/1024.0, b->playing ? "CALIYOR" : "durdu");
     }
@@ -949,4 +1071,6 @@ void audio_report(void){
             " (tampon %.1f ms)\n",
             (unsigned long long)g_starved, g_worst_gap_us/1000.0,
             (double)FRAMES*NBUF*1000.0/(double)hw_rate);
+    fprintf(stderr, "  gec AudioUnit/Queue callback : %llu (2 dilimden uzun aralik)\n",
+            (unsigned long long)g_late_callbacks);
 }

@@ -1,5 +1,10 @@
 # Full iOS runtime: public compute, private input and output
 
+The canonical public repository is `lyszq/NFSU2Recomp-iOS` (repository ID
+`1426968128`), renamed on 2026-10-22. The private destination remains
+`lyszq/NFSU2Recomp-ios-private` with its existing immutable ID and purpose marker.
+Repository guards and credential-free clone URLs use the new public name.
+
 This additional lane builds the existing complete runtime on a standard public
 `macos-15-intel` runner. It preserves the public smoke tests, the private workflows,
 the private repository visibility, and the default branch. The app remains unsigned:
@@ -52,7 +57,7 @@ It never overwrites `private-input-v1`. Failure releases may contain private dia
 logs; they never receive a downloadable IPA unless the link/package gates passed.
 `receipt.json` records completion, exact source/run/attempt and SHA-256 values for the
 IPA and diagnostics. GitHub's returned asset digests are also checked. Generated C
-is deleted, not archived. The current full target is 0.24.0/build31.
+is deleted, not archived. The current full target is 0.25.0/build32.
 
 ## One-time setup
 

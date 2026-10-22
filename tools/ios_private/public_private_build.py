@@ -22,7 +22,7 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-PUBLIC = "lyszq/NFSU2Recomp"
+PUBLIC = "lyszq/NFSU2Recomp-iOS"
 PRIVATE = "lyszq/NFSU2Recomp-ios-private"
 PRIVATE_ID = 1427055553
 MARKER = "Dedicated private native iOS build control for NFSU2Recomp"
@@ -268,7 +268,7 @@ class Builder:
         # Use the existing package inspector unchanged; never weaken historical
         # private-Actions provenance verification to accept this new lane.
         from verify_full_package import inspect_package
-        info, binary_bytes, segments = inspect_package(ipa, source, version="0.24.0", build="31")
+        info, binary_bytes, segments = inspect_package(ipa, source, version="0.25.0", build="32")
         report = {"source_sha": source, "ipa_sha256": sha256(ipa), "binary_sha256": hashlib.sha256(binary_bytes).hexdigest(),
                   "version": info["CFBundleShortVersionString"], "build": info["CFBundleVersion"], "segments": segments}
         (self.evidence / "package-verification.json").write_text(json.dumps(report, indent=2) + "\n")

@@ -9,6 +9,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include "audio.h"
 
 /* getenv() her cagrida ortam dizisini TARAR ve kilit alir.  Cizim basina
  * calisan yollarda (ornegin SetVertexShaderConstantF icindeki "PDLIST"
@@ -63,6 +64,8 @@ void     metal_get_cursor(int *x, int *y);
 #define COM_MAGIC 0xE0000000u
 #define COM_BASE  0x30000000u
 #define COM_MAX   0x38000000u
+#define DSERR_INVALIDPARAM 0x80070057u
+#define DSERR_INVALIDCALL  0x88780032u
 static uint32_t com_ptr = COM_BASE;
 static uint32_t com_alloc(uint32_t n){
     n=(n+15)&~15u;
@@ -140,15 +143,6 @@ static uint32_t g_d3d9=0, g_dev=0, g_cur_decl=0, g_cur_fvf=0, g_cur_tex=0;
 static VSProg  *g_vsprog[MAXVS];
 static unsigned g_vsprogn = 1;          /* 0 = "shader yok" */
 void mprot_arm(uint32_t);
-/* CoreAudio cikisi (runtime/audio.m) */
-int      audio_register(uint32_t data, uint32_t bytes, uint32_t rate,
-                        uint32_t chans, uint32_t bits);
-void     audio_play(int id, int loop);
-void     audio_stop(int id);
-uint32_t audio_cursor(int id);
-void     audio_set_volume(int id, long millibel);
-void     audio_init(void);
-void     audio_report(void);
 void cov_reset(void);
 static VSConst  g_vsk;                  /* c#/i#/b# sabit dosyasi */
 static unsigned g_cur_vs = 0;
@@ -462,6 +456,8 @@ enum {
     MID_Capture,
     MID_GetFunction,
     MID_GetDeclaration,
+    MID_SetCurrentPosition,
+    MID_GetFrequency,
     MID__count
 };
 static const char *const g_midname[MID__count] = {
@@ -593,6 +589,8 @@ static const char *const g_midname[MID__count] = {
     "Capture",
     "GetFunction",
     "GetDeclaration",
+    "SetCurrentPosition",
+    "GetFrequency",
 };
 static int mid_resolve(const char *nm){
     for (int i = 1; i < MID__count; i++)
@@ -3781,11 +3779,40 @@ int com_call(CPU *c, uint32_t magic){
             if(self && MR32(self+28)) audio_set_volume((int)MR32(self+28), (long)(int32_t)A(c,1));
             r=0; }
         else if (MID(SetFrequency)){
-            if(self && MR32(self+28)){ void audio_set_freq(int, uint32_t);
-                                       audio_set_freq((int)MR32(self+28), A(c,1)); }
+            if(self && MR32(self+28)) audio_set_freq((int)MR32(self+28), A(c,1));
             r=0; }
+        else if (MID(SetCurrentPosition)){
+            uint32_t pos = A(c,1);
+            uint32_t sid = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
+            if (!self || pos >= sz){ r=DSERR_INVALIDPARAM; }
+            else if (!sid){ r=DSERR_INVALIDCALL; }
+            else if (!audio_set_position((int)sid, pos)){ r=DSERR_INVALIDPARAM; }
+            else {
+                uint32_t actual = audio_cursor((int)sid);
+                MR32(self+16)=actual;
+                r=0;
+            }
+        }
+        else if (MID(GetFrequency)){
+            uint32_t p=A(c,1), hz=0;
+            uint32_t sid = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
+            if (sid) hz=audio_get_freq((int)sid);
+            else if (self && MR32(self+20)) hz=MR32(self+20)/4u;
+            if (!hz) hz=44100u;
+            if(p){ mem_commit(p,4); MR32(p)=hz; }
+            r=0;
+        }
         else if (MID(GetStatus)){
-            uint32_t p=A(c,1); if(p){mem_commit(p,4); MR32(p)= (self&&MR32(self+12))?1u:0u;} r=0; }
+            uint32_t p=A(c,1), status=0;
+            uint32_t sid = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
+            if (sid) status=audio_status((int)sid);
+            else if (self && MR32(self+12)) status=AUDIO_STATUS_PLAYING;
+            if (self){
+                MR32(self+12)=(status & AUDIO_STATUS_PLAYING) ? 1u : 0u;
+                if (!(status & AUDIO_STATUS_PLAYING)) MR32(self+24)=0;
+            }
+            if(p){mem_commit(p,4); MR32(p)=status;}
+            r=0; }
         else if (MID(GetCurrentPosition)){
             int break_gcp = 0;
             /* Oynatma imleci GECEN ZAMANA gore ilerler (sahte sabit adim
@@ -3797,21 +3824,27 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t playing = self ? MR32(self+12) : 0;
             uint32_t t0 = self ? MR32(self+24) : 0;
             uint64_t now = host_us();
-            if (playing && !t0){ t0 = (uint32_t)(now/1000ull); if(self) MR32(self+24)=t0; }
             uint32_t pos = 0;
-            /* Karistiriciya kayitliysa GERCEK oynatma imlecini kullan:
-             * oyunun akis (streaming) mantigi yazdigi yeri buna gore
-             * seciyor; tahmini saatle gercek calma ayrisirsa ses bozulur. */
+            /* Registered buffers report the mixer's rendered cursor rather
+             * than an estimate derived from the guest clock. */
             { uint32_t sid = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
-              if (sid && playing){
+              if (sid){
                   uint32_t rp=0, rw=0;
-                  void audio_cursors(int, uint32_t*, uint32_t*);
+                  uint32_t status=audio_status((int)sid);
                   audio_cursors((int)sid, &rp, &rw);
                   if (p1){ mem_commit(p1,4); MR32(p1)=rp; }
                   if (p2){ mem_commit(p2,4); MR32(p2)=rw; }
-                  if (self) MR32(self+16)=rp;
+                  if (self){
+                      MR32(self+16)=rp;
+                      MR32(self+12)=(status & AUDIO_STATUS_PLAYING) ? 1u : 0u;
+                      if (!(status & AUDIO_STATUS_PLAYING)) MR32(self+24)=0;
+                  }
                   r=0; break_gcp = 1;
               } }
+            if (!break_gcp && playing && !t0){
+                t0 = (uint32_t)(now/1000ull);
+                if (self) MR32(self+24)=t0;
+            }
             if (!break_gcp && playing && t0){
                 uint64_t ms = (now/1000ull) - (uint64_t)t0;
                 uint64_t byt = ms * (uint64_t)bps / 1000ull;

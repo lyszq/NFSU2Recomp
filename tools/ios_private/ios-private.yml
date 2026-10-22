@@ -28,7 +28,7 @@ jobs:
           set -euo pipefail
           test "$(gh api "repos/$GH_REPO" --jq .private)" = true
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git clone --filter=blob:none --no-checkout https://github.com/lyszq/NFSU2Recomp.git "$RUNNER_TEMP/source"
+          git clone --filter=blob:none --no-checkout https://github.com/lyszq/NFSU2Recomp-iOS.git "$RUNNER_TEMP/source"
           cd "$RUNNER_TEMP/source"
           git fetch --depth=1 origin "$SOURCE_SHA"
           git checkout --detach FETCH_HEAD
@@ -80,7 +80,7 @@ jobs:
           set -euo pipefail
           test "$(gh api "repos/$GH_REPO" --jq .private)" = true
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
-          git clone --filter=blob:none --no-checkout https://github.com/lyszq/NFSU2Recomp.git "$RUNNER_TEMP/source"
+          git clone --filter=blob:none --no-checkout https://github.com/lyszq/NFSU2Recomp-iOS.git "$RUNNER_TEMP/source"
           cd "$RUNNER_TEMP/source"
           git fetch --depth=1 origin "$SOURCE_SHA"
           git checkout --detach FETCH_HEAD

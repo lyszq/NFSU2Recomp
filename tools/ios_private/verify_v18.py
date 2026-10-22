@@ -217,7 +217,7 @@ def main():
 
     private_jobs = []
     private_url = f"https://github.com/lyszq/NFSU2Recomp-ios-private/actions/runs/{args.run}"
-    public_url = f"https://github.com/lyszq/NFSU2Recomp/actions/runs/{args.public_run}"
+    public_url = f"https://github.com/lyszq/NFSU2Recomp-iOS/actions/runs/{args.public_run}"
     private_control_sha = ""
     artifacts_list = []
     public_main = PUBLIC_MAIN_SHA
@@ -230,7 +230,7 @@ def main():
         private = client.api(f'/repos/{client.repository}/actions/runs/{args.run}')
         jobs_data = client.api(f'/repos/{client.repository}/actions/runs/{args.run}/jobs')
         jobs = jobs_data['jobs']
-        public = client.api(f'/repos/lyszq/NFSU2Recomp/actions/runs/{args.public_run}')
+        public = client.api(f'/repos/lyszq/NFSU2Recomp-iOS/actions/runs/{args.public_run}')
 
         assert private['conclusion'] == public['conclusion'] == 'success', (
             f"Workflows did not both succeed: private={private.get('conclusion')}, public={public.get('conclusion')}"
@@ -263,7 +263,7 @@ def main():
         )
 
         # Verify public repo main branch is untouched
-        main_ref = client.api('/repos/lyszq/NFSU2Recomp/git/ref/heads/main')
+        main_ref = client.api('/repos/lyszq/NFSU2Recomp-iOS/git/ref/heads/main')
         public_main = main_ref['object']['sha']
         assert public_main == PUBLIC_MAIN_SHA, f"Public main branch unexpected SHA: {public_main}"
 

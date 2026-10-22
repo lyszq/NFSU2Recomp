@@ -81,13 +81,13 @@ def main():
     p.add_argument('--public-run',type=int,required=True)
     p.add_argument('--replay-run',type=int)
     p.add_argument('--replay-source')
-    p.add_argument('--version', default='0.24.0')
-    p.add_argument('--build', default='31')
+    p.add_argument('--version', default='0.25.0')
+    p.add_argument('--build', default='32')
     a=p.parse_args()
     client=GitHub('NFSU2Recomp-ios-private'); client.private()
     base='/repos/'+client.repository
     private=client.api(base+'/actions/runs/'+str(a.run))
-    public=client.api('/repos/lyszq/NFSU2Recomp/actions/runs/'+str(a.public_run))
+    public=client.api('/repos/lyszq/NFSU2Recomp-iOS/actions/runs/'+str(a.public_run))
     jobs=client.api(base+'/actions/runs/'+str(a.run)+'/jobs')['jobs']
     replay = None
     if public['conclusion']!='success' or public['head_sha']!=a.source:
@@ -146,7 +146,7 @@ def main():
     actual=verify((a.delivery/'full-runtime-link-map.txt').read_text(),(a.delivery/'full-runtime-nm.txt').read_text())
     if actual['strong_symbols']!=report['strong_symbols'] or actual['shard_object_count']!=128:
         raise ValueError('independent linkage verification differs')
-    main_sha=client.api('/repos/lyszq/NFSU2Recomp/git/ref/heads/main')['object']['sha']
+    main_sha=client.api('/repos/lyszq/NFSU2Recomp-iOS/git/ref/heads/main')['object']['sha']
     if main_sha!='e38069b79c096bd86ea55e4e8e50dec73bb093fa': raise ValueError('preserved main changed')
     tracked=subprocess.check_output(['git','ls-files','--','gen/*','out/*','*.exe','*.EXE','*.ipa'],cwd=ROOT,text=True)
     if tracked.strip(): raise ValueError('confidential inputs/outputs tracked in public source')

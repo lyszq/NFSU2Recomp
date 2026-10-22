@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   preflight:
-    if: github.repository == 'lyszq/NFSU2Recomp' && github.ref == 'refs/heads/feat/ios-guest-runtime-smoke' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: github.repository == 'lyszq/NFSU2Recomp-iOS' && github.ref == 'refs/heads/feat/ios-guest-runtime-smoke' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-24.04
     steps:
       - name: Fetch exact public source without credentials
@@ -28,7 +28,7 @@ jobs:
         run: |
           set -euo pipefail
           git init source
-          git -C source remote add origin https://github.com/lyszq/NFSU2Recomp.git
+          git -C source remote add origin https://github.com/lyszq/NFSU2Recomp-iOS.git
           git -C source fetch --depth=1 origin "$SOURCE_SHA"
           git -C source checkout --detach FETCH_HEAD
           test "$(git -C source rev-parse HEAD)" = "$SOURCE_SHA"
@@ -51,7 +51,7 @@ jobs:
           set -euo pipefail
           umask 077
           git init "$RUNNER_TEMP/ios-private-controller"
-          git -C "$RUNNER_TEMP/ios-private-controller" remote add origin https://github.com/lyszq/NFSU2Recomp.git
+          git -C "$RUNNER_TEMP/ios-private-controller" remote add origin https://github.com/lyszq/NFSU2Recomp-iOS.git
           git -C "$RUNNER_TEMP/ios-private-controller" fetch --depth=1 origin "$SOURCE_SHA"
           git -C "$RUNNER_TEMP/ios-private-controller" checkout --detach FETCH_HEAD
           test "$(git -C "$RUNNER_TEMP/ios-private-controller" rev-parse HEAD)" = "$SOURCE_SHA"

@@ -94,7 +94,7 @@ def main():
             raise ValueError("unsupported EXE; no upload performed")
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True, cwd=ROOT).strip()
     client = GitHub(args.repository)
-    if client.api("/repos/lyszq/NFSU2Recomp/commits/" + sha)["sha"] != sha:
+    if client.api("/repos/lyszq/NFSU2Recomp-iOS/commits/" + sha)["sha"] != sha:
         raise ValueError("source commit must be pushed to the public code repository first")
     try:
         client.private()

@@ -8,6 +8,10 @@ FLAGS=(-O2 -std=gnu11 -Wall -Wextra -Werror -Iruntime -fno-strict-aliasing -pthr
 LIBS=(-lm)
 "$CC" "${FLAGS[@]}" tests/win32_runtime_clock_test.c -o "$DEST/win32-runtime-clock-test"
 "$DEST/win32-runtime-clock-test"
+"$CC" "${FLAGS[@]}" tests/audio_core_test.c -o "$DEST/audio-core-test" "${LIBS[@]}"
+"$DEST/audio-core-test"
+"$CC" "${FLAGS[@]}" tests/metal_pipeline_cache_test.c -o "$DEST/metal-pipeline-cache-test"
+"$DEST/metal-pipeline-cache-test"
 # Exercise the production file import with synthetic guest memory. The legacy
 # implementation retains its production warning flags; the fixture is strict.
 "$CC" -O2 -std=gnu11 -Iruntime -fno-strict-aliasing -pthread \
@@ -15,6 +19,9 @@ LIBS=(-lm)
 "$CC" "${FLAGS[@]}" "$DEST/full-fileio.o" tests/win32_full_path_test.c \
   -o "$DEST/win32-full-path-test"
 "$DEST/win32-full-path-test"
+"$CC" "${FLAGS[@]}" "$DEST/full-fileio.o" tests/fileio_case_cache_test.c \
+  -o "$DEST/fileio-case-cache-test"
+"$DEST/fileio-case-cache-test"
 "$CC" "${FLAGS[@]}" tests/win32_exit_scope_test.c -o "$DEST/win32-exit-scope-test"
 "$DEST/win32-exit-scope-test"
 "$CC" "${FLAGS[@]}" tests/win32_guest_thread_resources_test.c -o "$DEST/win32-guest-thread-resources-test"
@@ -108,6 +115,17 @@ if [[ "$(uname -s)" == Darwin ]]; then
     -DNFS_FULL_RUNTIME=1 -DNFS_ENHANCED=0 -DNFSU2_LEGACY_METAL_INPUT=1 \
     -c runtime/metal.m -o "$DEST/metal-ios-arm64.o"
   echo 'PASS | production Metal source compiles for macOS and iOS ARM64'
+  "$CC" -O2 -std=gnu11 -fobjc-arc -Iruntime -fno-strict-aliasing \
+    -DNFS_FULL_RUNTIME=1 -c runtime/audio.m -o "$DEST/audio-macos.o"
+  xcrun --sdk iphoneos clang -O2 -std=gnu11 -fobjc-arc -Iruntime \
+    -fno-strict-aliasing -arch arm64 -miphoneos-version-min=16.0 \
+    -DNFS_FULL_RUNTIME=1 -c runtime/audio.m -o "$DEST/audio-ios-arm64.o"
+  "$CC" -O2 -std=gnu11 -Iruntime -fno-strict-aliasing \
+    -DNFS_FULL_RUNTIME=1 -DNFS_ENHANCED=0 -c runtime/com.c -o "$DEST/com-macos.o"
+  xcrun --sdk iphoneos clang -O2 -std=gnu11 -Iruntime \
+    -fno-strict-aliasing -arch arm64 -miphoneos-version-min=16.0 \
+    -DNFS_FULL_RUNTIME=1 -DNFS_ENHANCED=0 -c runtime/com.c -o "$DEST/com-ios-arm64.o"
+  echo 'PASS | production DirectSound COM and audio sources compile for macOS and iOS ARM64'
   "$CC" "${FLAGS[@]}" -DNFS_FULL_RUNTIME=1 runtime/mem.c runtime/guest_memory.c runtime/guest_pe.c \
     tests/full_pe_adapter_test.c -o "$DEST/full-pe-adapter-test"
   "$DEST/full-pe-adapter-test"
