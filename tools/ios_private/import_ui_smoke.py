@@ -58,12 +58,23 @@ def _run_logged(command: list[str], log_path: Path, timeout: int,
 
 def select(out: Path) -> dict[str, str]:
     """Choose an available iPad simulator matching the active simulator SDK."""
-    inventory = json.loads(capture("xcrun", "simctl", "list", "devices", "available", "-j"))
     sdk_version = capture("xcrun", "--sdk", "iphonesimulator", "--show-sdk-version")
-    device = select_device(inventory, sdk_version)
-    device["host_arch"] = supported_host_architecture(capture("uname", "-m"))
+    host_arch = supported_host_architecture(capture("uname", "-m"))
+    print(f"Waiting for CoreSimulator inventory (SDK {sdk_version}, {host_arch})", flush=True)
+    # The first simctl call starts CoreSimulatorService on a fresh CI host.
+    # Its startup exceeded the shared 30-second capture bound on the ARM host.
     out = out.resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        inventory = json.loads(subprocess.check_output(
+            ["xcrun", "simctl", "list", "devices", "available", "-j"],
+            text=True, timeout=180))
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        out.write_text(json.dumps({"sdk_version": sdk_version, "host_arch": host_arch,
+                                   "selection_error": str(error)}, indent=2) + "\n", encoding="utf-8")
+        raise
+    device = select_device(inventory, sdk_version)
+    device["host_arch"] = host_arch
     out.write_text(json.dumps(device, indent=2) + "\n", encoding="utf-8")
     print(f"Selected {device['name']} ({device['udid']}) on {device['runtime']}; host {device['host_arch']}")
     return device
