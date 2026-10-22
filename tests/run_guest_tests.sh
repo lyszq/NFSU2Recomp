@@ -71,6 +71,8 @@ done
   ios/NFSU2iOS/Native/GuestSmoke.c ios/tests/smoke_cli.c -o "$DEST/nfsu2-smoke"
 "$DEST/nfsu2-smoke"
 if [[ "$(uname -s)" == Darwin ]]; then
+  python3 tests/ios_file_storage_test.py "$DEST"
+  python3 tools/ios_private/typecheck_full_ui.py
   # Compile the production thread/timer call paths, including iOS-only branches.
   # This uses authored source only; no generated game functions or input EXE.
   "$CC" -O2 -std=gnu11 -Iruntime -fno-strict-aliasing -DNFS_FULL_RUNTIME=1 \

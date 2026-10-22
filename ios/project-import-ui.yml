@@ -1,0 +1,30 @@
+include: project.yml
+
+targets:
+  ImportUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: '16.0'
+    sources:
+      - path: ImportUITests
+    dependencies:
+      - target: NFSU2iOS
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.lyszq.nfsu2ios.import-uitests
+        TEST_TARGET_NAME: NFSU2iOS
+        GENERATE_INFOPLIST_FILE: 'YES'
+        CODE_SIGNING_ALLOWED: 'NO'
+
+schemes:
+  ImportPickerSmoke:
+    build:
+      targets:
+        NFSU2iOS: all
+        ImportUITests: [test]
+    test:
+      config: Release
+      targets:
+        - name: ImportUITests
+          parallelizable: false
+      gatherCoverageData: false

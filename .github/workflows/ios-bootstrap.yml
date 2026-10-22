@@ -62,6 +62,7 @@ on:
       - 'tests/guest_process*'
       - 'tests/guest_time*'
       - 'tests/input_bridge*'
+      - 'tests/ios_file_storage*'
       - 'tests/run_guest_tests.sh'
       - 'tests/ios_startup_probe*'
       - 'tests/fixtures/windows_nls_cp1252.json'
@@ -164,3 +165,29 @@ jobs:
           path: ${{ runner.temp }}/guest-tests.txt
           if-no-files-found: error
           retention-days: 14
+
+      - name: Build document-picker regression on an SDK-matched iPad Simulator
+        run: |
+          set -euo pipefail
+          python3 tools/ios_private/import_ui_smoke.py select --out "$RUNNER_TEMP/import-device.json"
+          python3 tools/ios_private/import_ui_smoke.py build \
+            --device-json "$RUNNER_TEMP/import-device.json" \
+            --derived "$RUNNER_TEMP/ImportUIDerivedData" --out "$RUNNER_TEMP/import-ui-evidence"
+
+      - name: Test Files picker cancel and reopen plus first-launch Documents
+        run: |
+          set -euo pipefail
+          python3 tools/ios_private/import_ui_smoke.py run \
+            --device-json "$RUNNER_TEMP/import-device.json" \
+            --derived "$RUNNER_TEMP/ImportUIDerivedData" --out "$RUNNER_TEMP/import-ui-evidence"
+
+      - name: Upload document-picker UI evidence (no game input)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NFSU2iOS-import-ui-evidence
+          path: |
+            ${{ runner.temp }}/import-device.json
+            ${{ runner.temp }}/import-ui-evidence/
+          if-no-files-found: warn
+          retention-days: 7

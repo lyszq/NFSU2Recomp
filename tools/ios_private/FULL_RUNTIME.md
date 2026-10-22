@@ -96,3 +96,21 @@ nil. The next render tick can retry the ready frame instead of leaving it
 stranded until another guest Present replaces it after its timeout. These
 source changes require a new private full build before they appear in an IPA;
 the delivered v0.21/build28 artifact retains its original compiled source pin.
+
+The v0.22/build29 continuation replaces competing root file importers with one
+request-driven UIKit document picker. The request owns presentation and is
+cleared on selection or cancellation; the existing import methods retain
+security-scoped access until their copies finish. First launch creates
+`Documents/Game Import` and a guide outside that folder, so the Documents
+directory exposed by both sharing keys contains user-visible content. Working
+game files and saves remain at their original Application Support paths.
+`CHECK FILES FOLDER` authenticates a staged executable and copies missing assets
+from that visible handoff; existing working files are kept. Imports stop once
+the authoritative persistent runtime leaves idle.
+
+The public diagnostic UI regression uses the same picker and storage code with
+no game input. It checks picker open/cancel/reopen and first-launch Documents
+creation on an SDK-matched iPad Simulator. Separate native Swift fixtures use
+synthetic files to check preserved data, authentication failures and merging;
+the full Swift UI branch is typechecked for iOS ARM64. These checks do not
+establish physical-device Files visibility or successful game boot.

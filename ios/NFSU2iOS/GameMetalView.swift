@@ -1127,8 +1127,22 @@ public struct GameMetalView: View {
 #if NFS_FULL_RUNTIME
     @State private var startRuntimeRequested = false
     @State private var sessionState = Int32(NFS_GAME_SESSION_IDLE)
-    @State private var chooseGameFolder = false
+    @State private var activeFileImport: GameFileSelectionRequest?
     @State private var sessionStatus = "Game files imported. Start begins one persistent guest session."
+
+    private func completeGameFolderImport(_ request: GameFileSelectionRequest,
+                                          outcome: GameFileSelectionOutcome) {
+        switch (request, outcome) {
+        case (.gameFolder, .selected(let url)):
+            files.importGameAssets(from: url)
+        case (.gameFolder, .failed(let error)):
+            files.assetImportMessage = "Asset folder selection failed: \(error.localizedDescription)"
+        case (.executable, .selected), (.executable, .failed):
+            files.assetImportMessage = "This screen accepts a game folder. Choose SPEED2.EXE from the app setup screen."
+        case (_, .cancelled):
+            break
+        }
+    }
 
     private var runtimeLogURL: URL? {
         var path = [CChar](repeating: 0, count: 2048)
@@ -1216,11 +1230,28 @@ public struct GameMetalView: View {
                     .disabled(files.assetImportRunning)
                     .accessibilityIdentifier("full-runtime-start")
                     Button {
-                        chooseGameFolder = true
+                        activeFileImport = .gameFolder
                     } label: {
                         Label(files.assetImportRunning ? "IMPORTING…" : "IMPORT / RETRY GAME FOLDER", systemImage: "folder.badge.plus")
                     }
-                    .disabled(files.assetImportRunning)
+                    .disabled(files.assetImportRunning || activeFileImport != nil)
+                    .accessibilityIdentifier("select-game-folder")
+                    .accessibilityHint("Opens Files so you can select the full game folder.")
+                    Text("You can also copy the full game folder into Files › On My iPad › NFSU2 iOS › Game Import.")
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.68))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 520)
+                    Button {
+                        files.refreshSharedImport(force: true)
+                    } label: {
+                        Label(files.assetImportRunning ? "CHECKING FILES FOLDER…" : "CHECK FILES FOLDER",
+                              systemImage: files.assetImportRunning ? "hourglass" : "folder")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(files.assetImportRunning || activeFileImport != nil)
+                    .accessibilityIdentifier("check-game-files-folder")
+                    .accessibilityHint("Checks Files, On My iPad, NFSU2 iOS, Game Import for the verified game folder.")
                     Text(files.assetImportMessage)
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.7))
@@ -1255,11 +1286,8 @@ public struct GameMetalView: View {
 #endif
         }
 #if NFS_FULL_RUNTIME
-        .fileImporter(isPresented: $chooseGameFolder, allowedContentTypes: [.folder]) { result in
-            switch result {
-            case .success(let url): files.importGameAssets(from: url)
-            case .failure(let error): files.assetImportMessage = "Asset import failed: \(error.localizedDescription)"
-            }
+        .gameFileImporter(selection: $activeFileImport) { request, outcome in
+            completeGameFolderImport(request, outcome: outcome)
         }
 #endif
         .onAppear {

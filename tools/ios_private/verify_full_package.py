@@ -67,6 +67,9 @@ def inspect_package(ipa, source, version='0.20.0', build='27'):
             raise ValueError('unexpected app identity/version')
         if info.get('NFSRuntimeSourceSHA') != source:
             raise ValueError('app source pin differs from compiled source')
+        if (info.get('UIFileSharingEnabled') is not True or
+                info.get('LSSupportsOpeningDocumentsInPlace') is not True):
+            raise ValueError('Files sharing requires both document sharing flags as booleans')
         binary=z.read('Payload/NFSU2iOS.app/NFSU2iOS')
         return info,binary,inspect_binary(binary)
 
@@ -78,8 +81,8 @@ def main():
     p.add_argument('--public-run',type=int,required=True)
     p.add_argument('--replay-run',type=int)
     p.add_argument('--replay-source')
-    p.add_argument('--version', default='0.21.0')
-    p.add_argument('--build', default='28')
+    p.add_argument('--version', default='0.22.0')
+    p.add_argument('--build', default='29')
     a=p.parse_args()
     client=GitHub('NFSU2Recomp-ios-private'); client.private()
     base='/repos/'+client.repository
