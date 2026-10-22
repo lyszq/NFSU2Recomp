@@ -359,7 +359,9 @@ int main(void) {
         int written = snprintf(host_path + host_length,
                                host_remaining, "/%s", component);
         CHECK(written > 0 && (size_t)written < host_remaining);
-        CHECK(host_mkdirs(host_path));
+        /* Darwin's host PATH_MAX is 1024 too. Prepare only prefixes that fit
+         * the resolver; the remainder is deliberately an invalid guest path. */
+        if (strlen(host_path) < 1024u) CHECK(host_mkdirs(host_path));
         size_t guest_length = strlen(component);
         CHECK(cursor + guest_length + 2u < sizeof(long_guest_path));
         long_guest_path[cursor++] = '\\';
