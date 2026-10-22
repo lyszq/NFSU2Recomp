@@ -29,7 +29,7 @@ jobs:
           git fetch --depth=1 origin "$SOURCE_SHA"
           git checkout --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
-      - name: Configure host and select available iPad Simulator
+      - name: Configure host and select SDK-matched iPad Simulator without booting
         working-directory: ${{ runner.temp }}/source
         run: |
           set -euo pipefail
@@ -54,12 +54,61 @@ jobs:
         working-directory: ${{ runner.temp }}/source/ios
         run: |
           set -euo pipefail
+          HOST_ARCH="$NFS_SIMULATOR_HOST_ARCH"
+          case "$HOST_ARCH" in
+            arm64|x86_64) ;;
+            *) echo "Unsupported Simulator host architecture: $HOST_ARCH"; exit 1 ;;
+          esac
+          {
+            echo "phase=before-build"
+            date -u
+            echo "host_arch=$HOST_ARCH"
+            printf 'logical_cpu_count='
+            sysctl -n hw.ncpu
+            printf 'load_average='
+            sysctl -n vm.loadavg
+            printf 'physical_memory_bytes='
+            sysctl -n hw.memsize
+            vm_stat
+          } > "$RUNNER_TEMP/simulator-host-resources.log"
           xcodegen generate --spec project-full-simulator.yml
           xcodebuild -project NFSU2iOS.xcodeproj -scheme FullRuntimeSmoke -configuration Release \
-            -sdk iphonesimulator -destination "id=$NFS_SIMULATOR_UDID" -jobs 3 \
+            -sdk iphonesimulator -destination 'generic/platform=iOS Simulator' -jobs 3 \
             -derivedDataPath "$RUNNER_TEMP/FullSimulatorDerivedData" \
+            ARCHS="$HOST_ARCH" ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build-for-testing \
             > "$RUNNER_TEMP/simulator-build.log" 2>&1 || { tail -n 120 "$RUNNER_TEMP/simulator-build.log"; exit 1; }
+      - name: Record post-build host resources before Simulator boot
+        if: always()
+        run: |
+          {
+            echo "phase=after-build-before-simulator-boot"
+            date -u
+            echo "host_arch=$NFS_SIMULATOR_HOST_ARCH"
+            printf 'logical_cpu_count='
+            sysctl -n hw.ncpu
+            printf 'load_average='
+            sysctl -n vm.loadavg
+            printf 'physical_memory_bytes='
+            sysctl -n hw.memsize
+            vm_stat
+          } >> "$RUNNER_TEMP/simulator-host-resources.log"
+      - name: Verify all 128 shards and real backends in the Simulator link
+        working-directory: ${{ runner.temp }}/source
+        run: |
+          set -euo pipefail
+          HOST_ARCH="$NFS_SIMULATOR_HOST_ARCH"
+          APP="$RUNNER_TEMP/FullSimulatorDerivedData/Build/Products/Release-iphonesimulator/NFSU2iOS.app"
+          MAP="$RUNNER_TEMP/FullSimulatorDerivedData/Build/Intermediates.noindex/NFSU2iOS.build/Release-iphonesimulator/NFSU2iOS.build/NFSU2iOS-LinkMap-normal-${HOST_ARCH}.txt"
+          test -f "$MAP"
+          test -f "$APP/NFSU2iOS"
+          test "$(xcrun lipo -archs "$APP/NFSU2iOS")" = "$HOST_ARCH"
+          cp "$MAP" "$RUNNER_TEMP/simulator-link-map.txt"
+          xcrun nm -m "$APP/NFSU2iOS" > "$RUNNER_TEMP/simulator-runtime-nm.txt"
+          "$RUNNER_TEMP/private-python/bin/python" tools/ios_private/verify_full_link.py \
+            --map "$MAP" --nm "$RUNNER_TEMP/simulator-runtime-nm.txt" \
+            --binary "$APP/NFSU2iOS" --manifest gen/all/ios-full-manifest.json \
+            --source "$SOURCE_SHA" --out "$RUNNER_TEMP/simulator-link-verification.json"
       - name: Run actual Start and foreground-resume with assets intentionally absent
         working-directory: ${{ runner.temp }}/source
         run: |
@@ -75,6 +124,10 @@ jobs:
           name: NFSU2-full-runtime-private-simulator-evidence
           path: |
             ${{ runner.temp }}/simulator-build.log
+            ${{ runner.temp }}/simulator-host-resources.log
+            ${{ runner.temp }}/simulator-link-map.txt
+            ${{ runner.temp }}/simulator-runtime-nm.txt
+            ${{ runner.temp }}/simulator-link-verification.json
             ${{ runner.temp }}/simulator-device.json
             ${{ runner.temp }}/simulator-provenance.json
             ${{ runner.temp }}/simulator-evidence/

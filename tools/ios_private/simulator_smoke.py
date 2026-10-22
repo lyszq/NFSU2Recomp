@@ -38,6 +38,21 @@ def select_device(inventory, sdk_version=None):
 def capture(*args):
     return subprocess.check_output(args, text=True, timeout=30).strip()
 
+def supported_host_architecture(machine=None):
+    architecture = machine or capture('uname', '-m')
+    if architecture not in ('arm64', 'x86_64'):
+        raise ValueError(f'unsupported iOS Simulator host architecture: {architecture}')
+    return architecture
+
+def boot_and_install(device, app, runner=None):
+    """Boot the selected simulator only after its full-runtime build is ready."""
+    run = runner or subprocess.run
+    run(['xcrun', 'simctl', 'boot', device], check=False, timeout=180)
+    run(['xcrun', 'simctl', 'bootstatus', device, '-b'], check=True, timeout=600)
+    run(['xcrun', 'simctl', 'terminate', device, BUNDLE], check=False,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    run(['xcrun', 'simctl', 'install', device, str(app)], check=True, timeout=60)
+
 def run_tests(command, log_path, timeout=240):
     with log_path.open('w') as log:
         child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT,
@@ -66,9 +81,7 @@ def smoke(a):
     tests = list((a.derived / 'Build/Products').glob('*.xctestrun'))
     if not app.is_dir() or len(tests) != 1:
         raise ValueError('one complete build-for-testing product is required')
-    subprocess.run(['xcrun', 'simctl', 'install', a.device, str(app)], check=True, timeout=60)
-    subprocess.run(['xcrun', 'simctl', 'terminate', a.device, BUNDLE], check=False,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+    boot_and_install(a.device, app)
     container = Path(capture('xcrun', 'simctl', 'get_app_container', a.device, BUNDLE, 'data'))
     game = container / 'Library/Application Support/NFSU2/Game'
     game.mkdir(parents=True, exist_ok=True)
@@ -121,13 +134,14 @@ def main():
         inventory = json.loads(capture('xcrun', 'simctl', 'list', 'devices', 'available', '-j'))
         sdk_version = capture('xcrun', '--sdk', 'iphonesimulator', '--show-sdk-version')
         device = select_device(inventory, sdk_version)
+        host_arch = supported_host_architecture(capture('uname', '-m'))
+        device['host_arch'] = host_arch
         a.out.write_text(json.dumps(device, indent=2) + '\n')
-        subprocess.run(['xcrun', 'simctl', 'boot', device['udid']], check=False, timeout=180)
-        subprocess.run(['xcrun', 'simctl', 'bootstatus', device['udid'], '-b'], check=True, timeout=600)
         print(device['udid'])
         if os.environ.get('GITHUB_ENV'):
             with Path(os.environ['GITHUB_ENV']).open('a') as env:
                 env.write('NFS_SIMULATOR_UDID=' + device['udid'] + '\n')
+                env.write('NFS_SIMULATOR_HOST_ARCH=' + host_arch + '\n')
     else:
         smoke(a)
 

@@ -1,9 +1,14 @@
 import tempfile
 import unittest
+import json
+import os
+import sys
 from pathlib import Path
+from unittest.mock import patch
 import yaml
 from configure_simulator import configure
-from simulator_smoke import select_device
+import simulator_smoke
+from simulator_smoke import boot_and_install, select_device, supported_host_architecture
 from verify_simulator_smoke import inspect
 
 class SimulatorEvidenceTests(unittest.TestCase):
@@ -50,6 +55,41 @@ class SimulatorEvidenceTests(unittest.TestCase):
         device = {'name':'iPad Pro', 'isAvailable':True, 'udid':'12345678-1234-1234-1234-123456789abc'}
         with self.assertRaisesRegex(ValueError, 'matching active SDK'):
             select_device({'devices': {'com.apple.CoreSimulator.SimRuntime.iOS-26-2':[device]}}, '18.5')
+
+    def test_select_command_records_device_and_sdk_without_booting(self):
+        device = {'name':'iPad Pro', 'isAvailable':True, 'udid':'12345678-1234-1234-1234-123456789abc'}
+        inventory = {'devices': {'com.apple.CoreSimulator.SimRuntime.iOS-18-5':[device]}}
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'simulator.json'
+            with patch.object(simulator_smoke, 'capture',
+                              side_effect=[json.dumps(inventory), '18.5', 'x86_64']), \
+                 patch.object(simulator_smoke.subprocess, 'run') as run, \
+                 patch.object(sys, 'argv', ['simulator_smoke.py', 'select', '--out', str(output)]), \
+                 patch.dict(os.environ, {}, clear=True):
+                simulator_smoke.main()
+            run.assert_not_called()
+            selected = json.loads(output.read_text())
+            self.assertEqual(selected['runtime'], 'com.apple.CoreSimulator.SimRuntime.iOS-18-5')
+            self.assertEqual(selected['sdk_version'], '18.5')
+            self.assertEqual(selected['host_arch'], 'x86_64')
+
+    def test_run_phase_waits_for_boot_before_install(self):
+        calls = []
+        app = Path('/private/NFSU2iOS.app')
+        def fake_run(command, **kwargs):
+            calls.append((command, kwargs))
+        boot_and_install('sim-udid', app, runner=fake_run)
+        self.assertEqual([call[0][2] for call in calls],
+                         ['boot', 'bootstatus', 'terminate', 'install'])
+        self.assertEqual(calls[1][0], ['xcrun', 'simctl', 'bootstatus', 'sim-udid', '-b'])
+        self.assertEqual(calls[-1][0],
+                         ['xcrun', 'simctl', 'install', 'sim-udid', str(app)])
+
+    def test_simulator_build_architecture_is_limited_to_supported_hosts(self):
+        self.assertEqual(supported_host_architecture('x86_64'), 'x86_64')
+        self.assertEqual(supported_host_architecture('arm64'), 'arm64')
+        with self.assertRaisesRegex(ValueError, 'unsupported iOS Simulator host architecture'):
+            supported_host_architecture('i386')
 
     def test_bounded_overlay_is_rejected_before_adding_ui_test_target(self):
         with tempfile.TemporaryDirectory() as directory:
