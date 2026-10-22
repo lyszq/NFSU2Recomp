@@ -33,7 +33,7 @@ on:
       - 'runtime/mem.c'
       - 'runtime/win32*'
       - 'runtime/bc_decoder.h'
-      - 'tests/win32_exit_scope*'
+      - 'tests/win32_*'
       - 'tests/bc_decoder*'
       - 'tests/guest_memory*'
       - 'tests/guest_pe*'

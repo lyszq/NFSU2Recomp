@@ -10,6 +10,7 @@
 #include <sys/event.h>
 #include <sched.h>
 #include <TargetConditionals.h>
+#include "win32_guest_thread_resources.h"
 
 #ifndef NFS_FULL_RUNTIME
 #define NFS_FULL_RUNTIME 0
@@ -23,6 +24,8 @@ void dispatch_indirect(CPU*,uint32_t);
 void *win32_exit_scope_enter(jmp_buf *target);
 void win32_exit_scope_leave(void *previous);
 int win32_exit_thread(int code);
+int win32_exit_requested(void);
+void win32_exit_checkpoint(CPU *c);
 void mem_commit(uint32_t,uint32_t);
 uint32_t win32_alloc(uint32_t n, int zero);
 uint32_t res_find(uint32_t,uint32_t,int);
@@ -44,6 +47,7 @@ typedef struct {
 static Obj g_obj[OBJ_MAX];
 static int g_obj_n = 1;
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
+static Win32GuestThreadResourcePool g_guest_thread_resources;
 typedef struct { uint64_t waits, sets; uint32_t waiter_tid, setter_tid; } WStat;
 static WStat g_wstat[64];
 
@@ -62,12 +66,32 @@ CPU *g_all_cpus[MAXCPUS];
 uint32_t g_all_tids[MAXCPUS];
 int g_all_n = 0;
 static void reg_cpu(CPU *c){
-    for (int i=0;i<g_all_n;i++) if (g_all_cpus[i]==c) return;
+    int free_slot = -1;
+    for (int i=0;i<g_all_n;i++){
+        if (g_all_cpus[i] == c) return;
+        if (!g_all_cpus[i] && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0){
+        g_all_cpus[free_slot] = c;
+        g_all_tids[free_slot] = c->fs_base ? MR32(c->fs_base+0x24) : 0;
+        return;
+    }
     if (g_all_n < MAXCPUS){
         g_all_cpus[g_all_n] = c;
         g_all_tids[g_all_n] = c->fs_base ? MR32(c->fs_base+0x24) : 0;
         g_all_n++;
     }
+}
+static void unreg_cpu(CPU *c){
+    if (!c) return;
+    pthread_mutex_lock(&g_guest);
+    for (int i=0;i<g_all_n;i++) if (g_all_cpus[i] == c){
+        g_all_cpus[i] = 0;
+        g_all_tids[i] = 0;
+    }
+    if (g_cur_cpu == c) g_cur_cpu = 0;
+    if (tl_cpu == c) tl_cpu = 0;
+    pthread_mutex_unlock(&g_guest);
 }
 /* --- buyuk kilidin (GIL) TUTMA SURESI olcumu --------------------------
  * Guest thread'i Win32 cagrisi yapmadigi surece GIL'i birakmaz; uzun bir
@@ -305,11 +329,55 @@ static Obj *obj_get(uint32_t h){
 }
 
 /* ---- guest thread ---- */
-#define GTHREAD_STACK 0x00100000u          /* 1 MB */
-static uint32_t g_tstack_next = 0x60000000u;
 uint64_t g_threads_started = 0, g_threads_exited = 0;
 
-typedef struct { uint32_t entry, arg, teb; Obj *ob; } TArg;
+typedef struct {
+    uint32_t entry, arg;
+    Obj *ob;
+    Win32GuestThreadReservation resources;
+} TArg;
+
+typedef struct {
+    Win32GuestThreadReservation resources;
+} TimerThreadStart;
+
+/* g_lock protects pool operations and ownership transitions for suspended
+ * TArgs. Started workers release only after CPU cleanup/unregistration. */
+static void release_failed_start_locked(Win32GuestThreadReservation *resources){
+    if (resources && resources->active)
+        (void)win32_guest_thread_resources_release_failed_start(
+            &g_guest_thread_resources, resources);
+}
+
+static void release_quiesced_locked(Win32GuestThreadReservation *resources){
+    if (resources && resources->active)
+        (void)win32_guest_thread_resources_release_quiesced(
+            &g_guest_thread_resources, resources);
+}
+
+static void prepare_guest_thread_resources(
+    const Win32GuestThreadReservation *resources){
+    mem_commit(resources->teb, WIN32_GUEST_THREAD_TEB_SIZE);
+    /* TEBs are 8 KiB while commits round to 16 KiB; clear exactly this TEB so
+     * its neighbor's half of a committed granule is never overwritten. */
+    memset(g_mem + resources->teb, 0, WIN32_GUEST_THREAD_TEB_SIZE);
+    mem_commit(resources->stack_low, WIN32_GUEST_THREAD_STACK_SIZE);
+    /* A newly created Windows stack is demand-zeroed. Reused guest stack slots
+     * must expose the same initial contents to the next worker. */
+    memset(g_mem + resources->stack_low, 0, WIN32_GUEST_THREAD_STACK_SIZE);
+}
+
+static void discard_failed_thread_start(Obj *o, TArg *t){
+    pthread_mutex_lock(&g_lock);
+    if (o){
+        if (o->pending == t) o->pending = 0;
+        o->started = 0;
+        o->kind = OB_NONE;
+    }
+    if (t) release_failed_start_locked(&t->resources);
+    pthread_mutex_unlock(&g_lock);
+    free(t);
+}
 
 void mem_altstack_install(void);
 /* Konuk thread'leri BUYUK yigin ister: lift edilmis kodda her konuk cagrisi
@@ -348,30 +416,28 @@ static int guest_pthread_create(pthread_t *th, void *(*fn)(void*), void *arg){
 static void *guest_thread_main(void *p){
     mem_altstack_install();
     TArg *t = (TArg*)p;
+    const uint32_t teb = t->resources.teb;
+    const uint32_t stack_lo = t->resources.stack_low;
+    const uint32_t stack_hi = t->resources.stack_high;
     CPU cpu; memset(&cpu,0,sizeof cpu);
     jmp_buf exit_scope;
     void * volatile previous_exit_scope = win32_exit_scope_enter(&exit_scope);
     volatile int guest_lock_held = 0;
     int exit_kind = setjmp(exit_scope);
     if (exit_kind == 0){
-        uint32_t stack_lo, stack_hi;
-        pthread_mutex_lock(&g_lock);
-        stack_lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; stack_hi = g_tstack_next;
-        pthread_mutex_unlock(&g_lock);
-        mem_commit(stack_lo, GTHREAD_STACK);
         cpu.esp = stack_hi - 0x1000u;
         cpu.top = 0; cpu.fcw = 0x037f;
-        cpu.fs_base = t->teb; cpu.gs_base = t->teb;
+        cpu.fs_base = teb; cpu.gs_base = teb;
         /* TEB */
-        MR32(t->teb+0x00)=0xFFFFFFFFu; MR32(t->teb+0x04)=stack_hi; MR32(t->teb+0x08)=stack_lo;
-        MR32(t->teb+0x18)=t->teb; MR32(t->teb+0x24)=t->ob?t->ob->tid:0;
-        MR32(t->teb+0x2C)=t->teb+0x1000u; MR32(t->teb+0x30)=0x00C10000u;
+        MR32(teb+0x00)=0xFFFFFFFFu; MR32(teb+0x04)=stack_hi; MR32(teb+0x08)=stack_lo;
+        MR32(teb+0x18)=teb; MR32(teb+0x24)=t->ob?t->ob->tid:0;
+        MR32(teb+0x2C)=teb+0x1000u; MR32(teb+0x30)=0x00C10000u;
         /* stdcall: arg, sonra donus adresi */
         { CPU *c=&cpu; PUSH32(t->arg); PUSH32(0xDEAD7EADu); }
         __sync_fetch_and_add(&g_threads_started, 1);
         { static int sh=0; if (getenv("VERBOSE") && sh<40){ sh++;
             fprintf(stderr,"      [thread] BASLADI entry=0x%08x arg=0x%08x teb=0x%08x tid=%u\n",
-                    t->entry, t->arg, t->teb, t->ob?t->ob->tid:0); } }
+                    t->entry, t->arg, teb, t->ob?t->ob->tid:0); } }
         tl_obj = t->ob;
         /* tani: thread listelerinde (perflog thread.csv, sample) taninsin */
         { char nm[32]; snprintf(nm, sizeof nm, "konuk %u @%06x", t->ob ? t->ob->tid : 0u, t->entry & 0xFFFFFFu);
@@ -384,8 +450,12 @@ static void *guest_thread_main(void *p){
     }
     if (guest_lock_held){ guest_unlock(); guest_lock_held = 0; }
     win32_exit_scope_leave((void *)previous_exit_scope);
+    unreg_cpu(&cpu);
     if (t->ob){ pthread_mutex_lock(&t->ob->mtx); t->ob->signaled=1;
                 pthread_cond_broadcast(&t->ob->cv); pthread_mutex_unlock(&t->ob->mtx); }
+    pthread_mutex_lock(&g_lock);
+    release_quiesced_locked(&t->resources);
+    pthread_mutex_unlock(&g_lock);
     free(t);
     return 0;
 }
@@ -423,7 +493,12 @@ uint64_t host_us(void);
 static uint64_t now_us(void){ return host_us(); }
 
 static void *timer_thread_main(void *p){
-    (void)p;
+    TimerThreadStart *start = (TimerThreadStart*)p;
+    Win32GuestThreadReservation resources = start->resources;
+    const uint32_t teb = resources.teb;
+    const uint32_t stack_lo = resources.stack_low;
+    const uint32_t stack_hi = resources.stack_high;
+    free(start);
     mem_altstack_install();
     CPU cpu; memset(&cpu,0,sizeof cpu);
     jmp_buf exit_scope;
@@ -431,13 +506,6 @@ static void *timer_thread_main(void *p){
     volatile int guest_lock_held = 0;
     int exit_kind = setjmp(exit_scope);
     if (exit_kind == 0){
-        uint32_t stack_lo, stack_hi, teb;
-        pthread_mutex_lock(&g_lock);
-        stack_lo = g_tstack_next; g_tstack_next += GTHREAD_STACK; stack_hi = g_tstack_next;
-        teb = 0x00C60000u;
-        pthread_mutex_unlock(&g_lock);
-        mem_commit(stack_lo, GTHREAD_STACK);
-        mem_commit(teb, 0x2000);
         cpu.top = 0; cpu.fcw = 0x037f;
         cpu.fs_base = teb; cpu.gs_base = teb;
         MR32(teb+0x00)=0xFFFFFFFFu; MR32(teb+0x04)=stack_hi; MR32(teb+0x08)=stack_lo;
@@ -447,6 +515,10 @@ static void *timer_thread_main(void *p){
         for (;;){
             struct timespec ts = {0, 1000000L};      /* 1 ms */
             nanosleep(&ts, 0);
+            /* Timers may be absent, one-shot, or idle. Observe process exit
+             * outside both the guest lock and timer-table mutex so cleanup
+             * can unwind this worker's own scope safely. */
+            win32_exit_checkpoint(&cpu);
             uint64_t now = now_us();
             for (int i = 0; i < MAXTIMER; i++){
                 uint32_t proc, user, id;
@@ -472,10 +544,12 @@ static void *timer_thread_main(void *p){
         }
     }
     if (guest_lock_held){ guest_unlock(); guest_lock_held = 0; }
+    win32_exit_scope_leave((void *)previous_exit_scope);
+    unreg_cpu(&cpu);
     pthread_mutex_lock(&g_lock);
     g_timer_running = 0;
+    release_quiesced_locked(&resources);
     pthread_mutex_unlock(&g_lock);
-    win32_exit_scope_leave((void *)previous_exit_scope);
     return 0;
 }
 
@@ -777,7 +851,12 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
             } else {
                 struct timespec ts;
                 int timed_out = 0;
-                while (!o->signaled && !timed_out){
+                int process_exit_pending = win32_exit_requested();
+                while (!process_exit_pending && !o->signaled && !timed_out){
+                    if (win32_exit_requested()){
+                        process_exit_pending = 1;
+                        break;
+                    }
                     if (!ms){ timed_out = 1; break; }
                     clock_gettime(CLOCK_REALTIME,&ts);
                     uint32_t wait = (ms==0xFFFFFFFFu)? 2000u : (ms>2000u?2000u:ms);
@@ -785,13 +864,22 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                     if(ts.tv_nsec>=1000000000L){ts.tv_sec++;ts.tv_nsec-=1000000000L;}
                     if (pthread_cond_timedwait(&o->cv,&o->mtx,&ts) != 0 &&
                         ms != 0xFFFFFFFFu) timed_out = 1;
+                    if (win32_exit_requested()){
+                        process_exit_pending = 1;
+                        break;
+                    }
                     if (ms != 0xFFFFFFFFu) break;
                 }
-                if (o->signaled){ o->signaled = 0; o->owner_tid = me; o->rec = 1; r = 0; }
+                if (!process_exit_pending && o->signaled){
+                    o->signaled = 0; o->owner_tid = me; o->rec = 1; r = 0;
+                }
                 else r = 0x102u;                        /* WAIT_TIMEOUT */
             }
+            /* A scope jump is safe only after releasing this object mutex and
+             * restoring the guest lock expected by the worker's cleanup. */
             pthread_mutex_unlock(&o->mtx);
             guest_yield_end();
+            win32_exit_checkpoint(c);
         }
         else {
             guest_yield_begin();
@@ -816,35 +904,63 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                     A(c,0),A(c,1),entry,arg,A(c,4),ptid); } }
         uint32_t h=obj_new(OB_THREAD); Obj*o=obj_get(h);
         static uint32_t next_tid=100;
+        r=0;
         if(o){
-            o->tid = ++next_tid;
-            if(ptid) MR32(ptid)=o->tid;
-            uint32_t teb;
-            pthread_mutex_lock(&g_lock);
-            static uint32_t teb_next = 0x00C20000u;
-            teb = teb_next; teb_next += 0x2000u;
-            pthread_mutex_unlock(&g_lock);
-            mem_commit(teb, 0x2000);
             TArg *t = calloc(1,sizeof *t);
-            t->entry=entry; t->arg=arg; t->teb=teb; t->ob=o;
-            o->pending = t;
-            if (A(c,4) & 0x4u){                 /* CREATE_SUSPENDED */
-                o->started = 0;                 /* ResumeThread bekleyecek */
+            int reserve_rc = ENOMEM;
+            pthread_mutex_lock(&g_lock);
+            if (t) reserve_rc = win32_guest_thread_resources_reserve(
+                &g_guest_thread_resources, &t->resources);
+            pthread_mutex_unlock(&g_lock);
+            if (reserve_rc == 0){
+                t->entry=entry; t->arg=arg; t->ob=o;
+                prepare_guest_thread_resources(&t->resources);
+                o->tid = ++next_tid;
+                if (A(c,4) & 0x4u){             /* CREATE_SUSPENDED */
+                    pthread_mutex_lock(&g_lock);
+                    o->started = 0;
+                    o->pending = t;
+                    pthread_mutex_unlock(&g_lock);
+                    if(ptid) MR32(ptid)=o->tid;
+                    r=h;
+                } else {
+                    /* Claim the TArg before releasing g_lock. CloseHandle can
+                     * then never free it while pthread_create is in flight. */
+                    pthread_mutex_lock(&g_lock);
+                    o->started = 1;
+                    o->pending = 0;
+                    pthread_mutex_unlock(&g_lock);
+                    if (guest_pthread_create(&o->th,guest_thread_main,t)==0){
+                        pthread_detach(o->th);
+                        if(ptid) MR32(ptid)=o->tid;
+                        r=h;
+                    } else discard_failed_thread_start(o,t);
+                }
             } else {
-                if (guest_pthread_create(&o->th,guest_thread_main,t)==0){
-                    o->started=1; o->pending=0; pthread_detach(o->th);
-                } else free(t);
+                free(t);
+                pthread_mutex_lock(&g_lock);
+                o->kind = OB_NONE;
+                pthread_mutex_unlock(&g_lock);
             }
         }
-        r=h; }
+    }
     else if (!strcmp(n,"GetCurrentThread")) r=0xFFFFFFFEu;
     else if (!strcmp(n,"ResumeThread")){
         Obj*o=obj_get(A(c,0));
-        if (o && !o->started && o->pending){
-            if (guest_pthread_create(&o->th,guest_thread_main,o->pending)==0){
-                o->started=1; o->pending=0; pthread_detach(o->th); }
+        TArg *t=0;
+        if (o){
+            pthread_mutex_lock(&g_lock);
+            if (o->kind==OB_THREAD)
+                t=(TArg*)win32_guest_thread_claim_resume(
+                    &o->pending, &o->started);
+            pthread_mutex_unlock(&g_lock);
         }
-        r=1; }
+        r=1;
+        if (t){
+            if (guest_pthread_create(&o->th,guest_thread_main,t)==0)
+                pthread_detach(o->th);
+            else { discard_failed_thread_start(o,t); r=0xFFFFFFFFu; }
+        } }
     else if (!strcmp(n,"SuspendThread")) r=0;
     else if (!strcmp(n,"ExitThread")){
         /* Guest thread'i GERCEKTEN sonlandir. Aksi halde yurutme _endthreadex'ten
@@ -902,7 +1018,23 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         guest_yield_end();
         r=got; }
     else if (!strcmp(n,"SwitchToThread")){ guest_yield_begin(); sched_yield(); guest_yield_end(); r=1; }
-    else if (!strcmp(n,"CloseHandle")) r=1;
+    else if (!strcmp(n,"CloseHandle")){
+        Obj *o=obj_get(A(c,0));
+        TArg *pending=0;
+        if (o){
+            pthread_mutex_lock(&g_lock);
+            if (o->kind==OB_THREAD){
+                pending=(TArg*)win32_guest_thread_claim_close(
+                    &o->pending, &o->started);
+            }
+            if (pending){
+                o->kind=OB_NONE;
+                release_failed_start_locked(&pending->resources);
+            }
+            pthread_mutex_unlock(&g_lock);
+        }
+        free(pending);
+        r=1; }
     else if (!strcmp(n,"DuplicateHandle")){ uint32_t p=A(c,3); if(p) MR32(p)=A(c,1); r=1; }
     else if (!strcmp(n,"SetErrorMode")) r=0;
     else if (!strcmp(n,"GetLogicalDrives")) r=0x0000000Cu;             /* C: ve D: */
@@ -954,26 +1086,45 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
         uint32_t id=0;
         if (proc && !getenv("NOTIMER")){
             pthread_mutex_lock(&g_lock);
+            int timer_ready = 1;
             if (!g_timer_running){
-                g_timer_running = 1;
-                pthread_t th2;
+                TimerThreadStart *start = calloc(1,sizeof *start);
+                int reserve_rc = start
+                    ? win32_guest_thread_resources_reserve(
+                          &g_guest_thread_resources, &start->resources)
+                    : ENOMEM;
+                if (reserve_rc != 0){
+                    free(start);
+                    timer_ready = 0;
+                } else {
+                    prepare_guest_thread_resources(&start->resources);
+                    g_timer_running = 1;
+                    pthread_t th2;
 #if TARGET_OS_IPHONE
-                /* Timer callbacks execute lifted guest functions too. */
-                int timer_rc = guest_pthread_create(&th2, timer_thread_main, 0);
+                    /* Timer callbacks execute lifted guest functions too. */
+                    int timer_rc = guest_pthread_create(&th2, timer_thread_main, start);
 #else
-                int timer_rc = pthread_create(&th2, 0, timer_thread_main, 0);
+                    int timer_rc = pthread_create(&th2, 0, timer_thread_main, start);
 #endif
-                if (timer_rc == 0) pthread_detach(th2);
-                else g_timer_running = 0;
+                    if (timer_rc == 0) pthread_detach(th2);
+                    else {
+                        g_timer_running = 0;
+                        release_failed_start_locked(&start->resources);
+                        free(start);
+                        timer_ready = 0;
+                    }
+                }
             }
-            for (int i=0;i<MAXTIMER;i++){
-                if (g_tm[i].due_us) continue;
-                uint32_t us = delay ? delay*1000u : 1000u;
-                g_tm[i].proc=proc; g_tm[i].user=user;
-                g_tm[i].id = id = g_timer_next_id++;
-                g_tm[i].period_us = (flags & 1u) ? us : 0u;
-                g_tm[i].due_us = now_us() + us;
-                break;
+            if (timer_ready){
+                for (int i=0;i<MAXTIMER;i++){
+                    if (g_tm[i].due_us) continue;
+                    uint32_t us = delay ? delay*1000u : 1000u;
+                    g_tm[i].proc=proc; g_tm[i].user=user;
+                    g_tm[i].id = id = g_timer_next_id++;
+                    g_tm[i].period_us = (flags & 1u) ? us : 0u;
+                    g_tm[i].due_us = now_us() + us;
+                    break;
+                }
             }
             pthread_mutex_unlock(&g_lock);
             { static int sh2=0; if (sh2<3){ sh2++;

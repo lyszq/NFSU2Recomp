@@ -6402,6 +6402,21 @@ int metal_render_frame(void){
                                   while (*q && *q != ',') q++; } }
                         }
                         (void)fno;
+                    } else {
+                        /* A transient nil drawable must not strand g_ready.
+                         * The next display tick retries the same frame; meanwhile
+                         * a guest Present may time out and publish a newer frame. */
+                        static _Atomic unsigned drawable_misses;
+                        unsigned miss = atomic_fetch_add_explicit(&drawable_misses, 1u,
+                                                                  memory_order_relaxed);
+                        if (miss < 5u || ((miss + 1u) % 120u) == 0u)
+                            fprintf(stderr, "metal: CAMetalLayer nextDrawable returned nil; retrying pending frame (%u)\n",
+                                    miss + 1u);
+                        pthread_mutex_lock(&g_qlock);
+                        if (g_ready >= 0)
+                            atomic_store_explicit(&g_frame_pending, 1, memory_order_release);
+                        pthread_mutex_unlock(&g_qlock);
+                        return 0;
                     }
                     return 1;
     }

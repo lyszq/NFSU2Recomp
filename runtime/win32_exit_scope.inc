@@ -41,13 +41,19 @@ void win32_request_process_exit(int code){
     if (g_exit_scope) longjmp(*g_exit_scope, 1);
 }
 
+/* Wait loops that temporarily release the guest lock need a non-jumping
+ * observation point. They can finish releasing their own locks and restore
+ * the GIL before calling win32_exit_checkpoint(). */
+int win32_exit_requested(void){
+    return atomic_load_explicit(&g_process_exit_state, memory_order_acquire) == 2;
+}
+
 /* A child thread that calls ExitProcess cannot jump into the primary worker's
  * stack. Each guest worker observes the request at a transfer boundary and
  * exits through its own scope. */
 void win32_exit_checkpoint(CPU *c){
     (void)c;
-    if (atomic_load_explicit(&g_process_exit_state, memory_order_acquire) == 2 &&
-        g_exit_scope)
+    if (win32_exit_requested() && g_exit_scope)
         longjmp(*g_exit_scope, 1);
 }
 

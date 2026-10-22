@@ -77,3 +77,22 @@ log marker must be present at the actual generated-entry call site. XCUITest
 execution has a 240-second external bound and the disposable app is terminated
 after private log/screenshot capture. This is negative-input Simulator evidence,
 not physical-device ARM64 validation, successful game boot or gameplay.
+
+The post-v21 source continuation bounds the legacy child/timer guest memory
+reservations in a shared pool of 495 pairs. TEBs occupy
+`[0x01000000, 0x013de000)` and one-MiB stacks occupy
+`[0x60100000, 0x7f000000)`, outside the image, heap, COM buffer padding and
+primary stack. Suspended workers reserve before publication; failed starts
+roll back. Completed workers unregister their CPU before releasing their pair;
+reused TEB/TLS and stack contents are cleared. This is a memory reservation
+limit, separate from the unchanged cumulative 511-object legacy handle table.
+It does not establish that the game reaches either limit.
+Idle timers poll process exit without holding runtime locks. Infinite mutex
+waits observe exit without jumping, then release their object lock and restore
+the guest lock before unwinding through their own exit scope.
+
+The renderer also re-arms pending work when `nextDrawable` temporarily returns
+nil. The next render tick can retry the ready frame instead of leaving it
+stranded until another guest Present replaces it after its timeout. These
+source changes require a new private full build before they appear in an IPA;
+the delivered v0.21/build28 artifact retains its original compiled source pin.

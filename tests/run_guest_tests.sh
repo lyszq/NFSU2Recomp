@@ -8,6 +8,8 @@ FLAGS=(-O2 -std=gnu11 -Wall -Wextra -Werror -Iruntime -fno-strict-aliasing -pthr
 LIBS=(-lm)
 "$CC" "${FLAGS[@]}" tests/win32_exit_scope_test.c -o "$DEST/win32-exit-scope-test"
 "$DEST/win32-exit-scope-test"
+"$CC" "${FLAGS[@]}" tests/win32_guest_thread_resources_test.c -o "$DEST/win32-guest-thread-resources-test"
+"$DEST/win32-guest-thread-resources-test"
 "$CC" "${FLAGS[@]}" tests/bc_decoder_test.c -o "$DEST/bc-decoder-test"
 "$DEST/bc-decoder-test"
 "$CC" "${FLAGS[@]}" runtime/guest_dispatch.c tests/guest_dispatch_test.c -o "$DEST/guest-dispatch-test"
@@ -69,6 +71,22 @@ done
   ios/NFSU2iOS/Native/GuestSmoke.c ios/tests/smoke_cli.c -o "$DEST/nfsu2-smoke"
 "$DEST/nfsu2-smoke"
 if [[ "$(uname -s)" == Darwin ]]; then
+  # Compile the production thread/timer call paths, including iOS-only branches.
+  # This uses authored source only; no generated game functions or input EXE.
+  "$CC" -O2 -std=gnu11 -Iruntime -fno-strict-aliasing -DNFS_FULL_RUNTIME=1 \
+    -c runtime/win32_ext.c -o "$DEST/win32-ext-macos.o"
+  xcrun --sdk iphoneos clang -O2 -std=gnu11 -Iruntime -fno-strict-aliasing \
+    -arch arm64 -miphoneos-version-min=16.0 -DNFS_FULL_RUNTIME=1 \
+    -c runtime/win32_ext.c -o "$DEST/win32-ext-ios-arm64.o"
+  echo 'PASS | production Win32 thread/timer source compiles for macOS and iOS ARM64'
+  "$CC" -O2 -std=gnu11 -fobjc-arc -Iruntime -fno-strict-aliasing \
+    -DNFS_FULL_RUNTIME=1 -DNFS_ENHANCED=0 -DNFSU2_LEGACY_METAL_INPUT=1 \
+    -c runtime/metal.m -o "$DEST/metal-macos.o"
+  xcrun --sdk iphoneos clang -O2 -std=gnu11 -fobjc-arc -Iruntime \
+    -fno-strict-aliasing -arch arm64 -miphoneos-version-min=16.0 \
+    -DNFS_FULL_RUNTIME=1 -DNFS_ENHANCED=0 -DNFSU2_LEGACY_METAL_INPUT=1 \
+    -c runtime/metal.m -o "$DEST/metal-ios-arm64.o"
+  echo 'PASS | production Metal source compiles for macOS and iOS ARM64'
   "$CC" "${FLAGS[@]}" -DNFS_FULL_RUNTIME=1 runtime/mem.c runtime/guest_memory.c runtime/guest_pe.c \
     tests/full_pe_adapter_test.c -o "$DEST/full-pe-adapter-test"
   "$DEST/full-pe-adapter-test"
