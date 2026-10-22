@@ -185,7 +185,7 @@ def validate_context(env):
 def child_environment(env, work):
     # Positive allowlist: no PAT, Actions artifact/cache/OIDC/command channels,
     # GITHUB_TOKEN, credentials, PYTHONPATH, shell startup hooks or git config.
-    result = {k: env[k] for k in ("PATH", "DEVELOPER_DIR", "SDKROOT", "SYSTEMROOT") if k in env}
+    result = {k: env[k] for k in ("PATH", "USER", "LOGNAME", "DEVELOPER_DIR", "SDKROOT", "SYSTEMROOT") if k in env}
     for name in ("home", "tmp", "cache", "modules"):
         (work / name).mkdir(exist_ok=True)
     result.update({"HOME": str(work / "home"), "TMPDIR": str(work / "tmp") + "/",
@@ -225,6 +225,10 @@ class Builder:
         # before downloading game input and its output remains private.
         if shutil.which("xcodegen", path=self.env["PATH"]) is None:
             self.run(["brew", "install", "xcodegen"])
+        # Exercise actual project generation before downloading confidential input.
+        # XcodeGen needs USER/LOGNAME even with an isolated HOME. This creates only
+        # ignored diagnostic project/plist files, replaced by the full overlay later.
+        self.run(["xcodegen", "generate", "--spec", "project.yml"], cwd=self.source / "ios")
         self.run(["xcodebuild", "-version"], output="toolchain.txt")
         self.run(["xcrun", "--sdk", "iphoneos", "--show-sdk-version"], output="toolchain.txt")
         return python

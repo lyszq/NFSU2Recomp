@@ -52,12 +52,13 @@ class Boundaries(unittest.TestCase):
 
     def test_child_has_no_secrets_action_channels_or_startup_injection(self):
         with tempfile.TemporaryDirectory() as temp:
-            env = build.child_environment({"PATH": os.environ["PATH"], "PRIVATE_IOS_TOKEN": "canary",
+            env = build.child_environment({"PATH": os.environ["PATH"], "USER": "runner", "LOGNAME": "runner", "PRIVATE_IOS_TOKEN": "canary",
                 "GITHUB_TOKEN": "canary", "ACTIONS_RUNTIME_TOKEN": "canary", "ACTIONS_CACHE_URL": "canary",
                 "GITHUB_ENV": "canary", "GITHUB_OUTPUT": "canary", "GITHUB_STEP_SUMMARY": "canary",
                 "BASH_ENV": "canary", "PYTHONPATH": "canary", "GH_TOKEN": "canary"}, Path(temp))
             self.assertNotIn("canary", env.values())
             self.assertEqual(env["HOME"], str(Path(temp) / "home"))
+            self.assertEqual((env["USER"], env["LOGNAME"]), ("runner", "runner"))
 
     def test_subprocess_output_and_workflow_commands_are_private(self):
         import sys
