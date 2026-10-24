@@ -55,8 +55,29 @@ static int change(uint32_t address, uint64_t size,
     if (protection < GUEST_MEMORY_NONE || protection > GUEST_MEMORY_READ_WRITE)
         return EINVAL;
     if (!size) return 0;
+    uint64_t change_lo = lo;
     pthread_mutex_lock(&mutex);
     if (!g_mem) { rc = ENXIO; goto done; }
+    /* ReadFile and other callers may recommit ranges that are already live.
+     * Keep commit idempotent without repeating mprotect or rewriting the
+     * page maps when every covered granule is already allocated, readable,
+     * and writable. Read-only and inaccessible ranges still take the normal
+     * path below so commit restores their write access. */
+    if (commit && protection == GUEST_MEMORY_READ_WRITE) {
+        int already_writable = 1;
+        for (uint64_t a = lo; a < hi; a += GUEST_MEMORY_GRANULE) {
+            unsigned pg = (unsigned)(a >> 14), i = pg >> 3;
+            uint8_t bit = (uint8_t)(1u << (pg & 7));
+            uint8_t readable = __atomic_load_n(&g_cbits[i], __ATOMIC_RELAXED);
+            if (!(allocated[i] & bit) || !(readable & bit) ||
+                !(writable[i] & bit)) {
+                already_writable = 0;
+                change_lo = a;
+                break;
+            }
+        }
+        if (already_writable) goto done;
+    }
     if (!commit) {
         for (uint64_t a = lo; a < hi; a += GUEST_MEMORY_GRANULE) {
             unsigned pg = (unsigned)(a >> 14);
@@ -68,8 +89,16 @@ static int change(uint32_t address, uint64_t size,
     }
     int prot = protection == GUEST_MEMORY_NONE ? PROT_NONE : PROT_READ;
     if (protection == GUEST_MEMORY_READ_WRITE) prot |= PROT_WRITE;
-    if (mprotect(g_mem + lo, (size_t)(hi - lo), prot)) { rc = errno; goto done; }
-    for (uint64_t a = lo; a < hi; a += GUEST_MEMORY_GRANULE) {
+    /* A commit can overlap a large already-RW prefix (for example, the
+     * monotonic COM resource allocator's 1 MiB write cushion). The scan above
+     * proves that prefix is fully RW while holding mutex, so changing only
+     * the suffix preserves the requested final permissions and avoids
+     * repeating mprotect and bitmap writes for pages that cannot change. */
+    if (mprotect(g_mem + change_lo, (size_t)(hi - change_lo), prot)) {
+        rc = errno;
+        goto done;
+    }
+    for (uint64_t a = change_lo; a < hi; a += GUEST_MEMORY_GRANULE) {
         unsigned pg = (unsigned)(a >> 14), i = pg >> 3;
         uint8_t bit = (uint8_t)(1u << (pg & 7));
         if (!(allocated[i] & bit)) committed += GUEST_MEMORY_GRANULE;

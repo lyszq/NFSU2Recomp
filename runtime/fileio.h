@@ -11,11 +11,15 @@ typedef struct FileioPerfSnapshot {
     uint64_t cache_invalidations;
     uint64_t read_calls;
     uint64_t read_bytes;
+    uint64_t read_commit_ns;
+    uint64_t read_service_ns;
+    uint64_t read_service_max_ns;
 } FileioPerfSnapshot;
 
 /* Cumulative thread-safe counters for optional host-side performance logs.
  * cache_invalidations counts cached entries removed by mutations or root
- * changes; read_calls counts successful ReadFile dispatches. */
+ * changes; read_calls counts successful ReadFile dispatches. Read service time
+ * includes synchronous IO and completion signaling, excluding commit/muting. */
 void fileio_perf_snapshot(FileioPerfSnapshot *snapshot);
 
 #endif

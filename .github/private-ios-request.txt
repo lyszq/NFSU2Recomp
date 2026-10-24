@@ -1,2 +1,2 @@
-Public runner / private IO request 2026-10-22T16:49:00+00:00 - v0.25 portable long-path fixture; native PCM and PSO checks passed on Linux/macOS; final private package request
+Public runner / private IO request 2026-10-24 - v0.26.0 build 33; owner authorized GitHub compilation after five source development rounds. GPUVS startup policy, loading/upload work, guest scheduling and PCM publication changes; native compilation and device performance remain unverified at request time.
 Owner-reviewed environment required.

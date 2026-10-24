@@ -1,8 +1,8 @@
 /* NFSU2 iOS Port - CoreAudio / RemoteIO / DirectSound Audio Layer
  *
  * EA Trax (interaktif muzik akisi), SFX (ses efektleri), ve motor sesleri
- * icin iOS CoreAudio cikis yolu. Uretim karistiricisi PCM'i konuk belleginden
- * dogrudan okur ve tampon durumunu g_slock ile korur; ring-buffer yardimcilari
+ * icin iOS CoreAudio cikis yolu. Uretim karistiricisi host PCM aynasini
+ * g_slock ile koruyarak okur; ring-buffer yardimcilari
  * su anda uretim render yoluna bagli degildir.
  *
  * iOS AVAudioSession ve RemoteIO AudioUnit yasam dongusu:
@@ -89,16 +89,25 @@ static void update_rate_ratio(void){
 #define OUT_CH     AUDIO_OUT_CHANNELS
 #define NBUF       6
 #define FRAMES     2048
+#define WRITE_LEAD_MS 50u
 
 #define MAXSND     AUDIO_MAX_BUFFERS
+#define AUDIO_PCM_MIRROR_LIMIT_BYTES (64ull * 1024ull * 1024ull)
 
 typedef struct {
     uint32_t data, bytes, rate, chans, bits;
+    uint32_t storage_id;      /* ID of the shared guest PCM allocation */
+    uint8_t *pcm;              /* Host-owned mirror, shared by duplicates */
     int      used, playing, loop;
     double   cursor;          /* kaynak ornek cinsinden */
     float    vol;             /* 0..1 */
     uint32_t wpos;            /* oyunun yazdigi son baytin bitisi */
     int      wseen;           /* hic yazma gorduk mu */
+    uint32_t diag_write_end_offset;
+    uint32_t diag_last_write_bytes;
+    int      diag_write_seen;
+    uint64_t diag_write_calls, diag_write_bytes;
+    uint64_t diag_last_write_us, diag_max_write_gap_us;
     double   trim;            /* hiz duzeltmesi (servo) */
     double   target;          /* kilitlenecek dolgu orani (uyarlanir) */
     double   freq;            /* SetFrequency orani (1.0 = ozgun hiz) */
@@ -109,6 +118,16 @@ typedef struct {
 static SndBuf g_snd[MAXSND];
 static int    g_sndn = 1;                    /* 0 = gecersiz kimlik */
 static pthread_mutex_t g_slock = PTHREAD_MUTEX_INITIALIZER;
+static void audio_cursors_locked(const SndBuf *b, uint32_t *play, uint32_t *write);
+/* Mirrors live for the process: COM buffers survive iOS audio restarts, and
+ * this layer has no authoritative final-release hook. */
+static uint64_t g_pcm_mirror_bytes = 0;
+static uint64_t g_pcm_mirror_reserved_bytes = 0;
+static uint64_t g_pcm_publish_calls = 0;
+static uint64_t g_pcm_publish_bytes = 0;
+static uint64_t g_pcm_publish_max_ns = 0;
+static uint64_t g_pcm_rejected_writes = 0;
+static int g_pcm_register_failure_logged = 0;
 
 static int                  g_backend = 0;   /* 1 = AudioUnit, 2 = AudioQueue */
 static unsigned             g_au_slice = 0;  /* Geri cagirma basina gerceklesen kare */
@@ -123,6 +142,20 @@ static uint64_t g_replay = 0, g_reissue = 0, g_starved = 0, g_worst_gap_us = 0;
 static uint64_t g_late_callbacks = 0;
 static uint64_t g_out_frames = 0, g_out_zero = 0, g_gap_cb = 0;
 
+/* The iOS audio callback must not fall back to a library lock for diagnostics.
+ * 64-bit integer atomics are lock-free on the supported arm64 targets. */
+_Static_assert(sizeof(uint_fast64_t) == 8, "audio diagnostics require 64-bit counters");
+_Static_assert(ATOMIC_LONG_LOCK_FREE == 2 && ATOMIC_LLONG_LOCK_FREE == 2 &&
+               ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_BOOL_LOCK_FREE == 2,
+               "audio diagnostics require lock-free integer and boolean atomics");
+static atomic_uint_fast64_t g_cb_count = 0;
+static atomic_uint_fast64_t g_cb_gap_max_us = 0;
+static atomic_uint_fast64_t g_cb_duration_max_us = 0;
+static atomic_uint_fast64_t g_cb_late_count = 0;
+static atomic_uint_fast64_t g_cb_over_budget_count = 0;
+static atomic_uint_fast32_t g_cb_max_frames = 0;
+static atomic_bool g_cb_clock_reset = true;
+
 /* Tani dosyalari */
 static FILE *g_dump = NULL;      /* SNDDUMP=<yol> : ham s16le stereo */
 static FILE *g_csv  = NULL;      /* SNDCSV=<yol>  : geri-cagirma basina durum */
@@ -135,6 +168,37 @@ static void audio_count(uint64_t *counter){
 static void audio_add(uint64_t *counter, uint64_t amount){
     if (UINT64_MAX - *counter < amount) *counter = UINT64_MAX;
     else *counter += amount;
+}
+
+#ifndef NFSU2_AUDIO_CORE_TEST
+static void audio_atomic_max_u64(atomic_uint_fast64_t *counter, uint64_t value){
+    uint_fast64_t seen = atomic_load_explicit(counter, memory_order_relaxed);
+    while (seen < value &&
+           !atomic_compare_exchange_weak_explicit(counter, &seen, (uint_fast64_t)value,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {}
+}
+
+static void audio_atomic_max_u32(atomic_uint_fast32_t *counter, uint32_t value){
+    uint_fast32_t seen = atomic_load_explicit(counter, memory_order_relaxed);
+    while (seen < value &&
+           !atomic_compare_exchange_weak_explicit(counter, &seen, (uint_fast32_t)value,
+                                                  memory_order_relaxed,
+                                                  memory_order_relaxed)) {}
+}
+#endif
+
+/* Monotonic host time for producer and callback diagnostics; never guest/QPC time. */
+static uint64_t audio_monotonic_us(void){
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+}
+
+static uint64_t audio_monotonic_ns(void){
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
 /* --- Kilit-Serbest (Lock-Free) SPSC Dairesel Tampon Uygulamasi --- */
@@ -228,28 +292,112 @@ size_t audio_ringbuf_read(AudioRingBuffer *rb, int16_t *dst, size_t frames){
 
 /* --- DirectSound COM Katmani Fonksiyonlari --- */
 
+static void audio_log_register_failure_once(uint32_t bytes){
+    int should_log = 0;
+    uint64_t mirror_bytes;
+    uint64_t reserved_bytes;
+    pthread_mutex_lock(&g_slock);
+    mirror_bytes = g_pcm_mirror_bytes;
+    reserved_bytes = g_pcm_mirror_reserved_bytes;
+    if (!g_pcm_register_failure_logged){
+        g_pcm_register_failure_logged = 1;
+        should_log = 1;
+    }
+    pthread_mutex_unlock(&g_slock);
+    if (should_log){
+        fprintf(stderr,
+                "  [ses] audio_register failed: PCM mirror budget/allocation/slot limit "
+                "(request=%u, mirrors=%llu, reserved=%llu, cap=%llu bytes)\n",
+                bytes, (unsigned long long)mirror_bytes,
+                (unsigned long long)reserved_bytes,
+                (unsigned long long)AUDIO_PCM_MIRROR_LIMIT_BYTES);
+    }
+}
+
+static void audio_release_mirror_reservation(uint32_t bytes){
+    pthread_mutex_lock(&g_slock);
+    if (g_pcm_mirror_reserved_bytes >= bytes) g_pcm_mirror_reserved_bytes -= bytes;
+    else g_pcm_mirror_reserved_bytes = 0;
+    pthread_mutex_unlock(&g_slock);
+}
+
+int audio_registration_available(uint32_t bytes){
+    pthread_mutex_lock(&g_slock);
+    uint64_t used = g_pcm_mirror_bytes + g_pcm_mirror_reserved_bytes;
+    int available = bytes && g_sndn < MAXSND && used <= AUDIO_PCM_MIRROR_LIMIT_BYTES &&
+                    (uint64_t)bytes <= AUDIO_PCM_MIRROR_LIMIT_BYTES - used;
+    pthread_mutex_unlock(&g_slock);
+    if (!available) audio_log_register_failure_once(bytes);
+    return available;
+}
+
 int audio_register(uint32_t data, uint32_t bytes, uint32_t rate,
                    uint32_t chans, uint32_t bits){
-    if (!data || !bytes) return 0;
+    if (!data || !bytes || !g_mem ||
+        (uint64_t)data + (uint64_t)bytes > 0x100000000ull){
+        audio_log_register_failure_once(bytes);
+        return 0;
+    }
     if (rate < 4000u || rate > 192000u) rate = AUDIO_DEFAULT_RATE;
     if (chans < 1u || chans > 2u) chans = 1u;
     if (bits != 8u && bits != 16u) bits = 16u;
+
+    /* Reserve the bounded process-lifetime mirror budget under the mixer
+     * mutex, then allocate and seed it without holding the callback lock. */
+    int reserved = 0;
     pthread_mutex_lock(&g_slock);
+    uint64_t used = g_pcm_mirror_bytes + g_pcm_mirror_reserved_bytes;
+    if (g_sndn < MAXSND && used <= AUDIO_PCM_MIRROR_LIMIT_BYTES &&
+        (uint64_t)bytes <= AUDIO_PCM_MIRROR_LIMIT_BYTES - used){
+        g_pcm_mirror_reserved_bytes += bytes;
+        reserved = 1;
+    }
+    pthread_mutex_unlock(&g_slock);
+    if (!reserved){
+        audio_log_register_failure_once(bytes);
+        return 0;
+    }
+
+    uint8_t *pcm = (uint8_t *)malloc(bytes);
+    if (!pcm){
+        audio_release_mirror_reservation(bytes);
+        audio_log_register_failure_once(bytes);
+        return 0;
+    }
+    memcpy(pcm, g_mem + data, bytes);
+
     int id = 0;
+    pthread_mutex_lock(&g_slock);
+    if (g_pcm_mirror_reserved_bytes >= bytes) g_pcm_mirror_reserved_bytes -= bytes;
+    else g_pcm_mirror_reserved_bytes = 0;
     if (g_sndn < MAXSND){
         id = g_sndn++;
         SndBuf *b = &g_snd[id];
+        memset(b, 0, sizeof(*b));
         b->data = data; b->bytes = bytes; b->rate = rate;
+        b->storage_id = (uint32_t)id;
+        b->pcm = pcm;
         b->chans = chans; b->bits = bits;
         b->used = 1; b->playing = 0; b->loop = 0; b->cursor = 0.0; b->vol = 1.f;
         b->wpos = 0; b->wseen = 0; b->trim = 1.0; b->target = 0.0; b->over = 0;
+        b->diag_write_end_offset = b->diag_last_write_bytes = 0;
+        b->diag_write_seen = 0;
+        b->diag_write_calls = b->diag_write_bytes = 0;
+        b->diag_last_write_us = b->diag_max_write_gap_us = 0;
         b->freq = 1.0; b->plays = b->stops = b->reissues = 0;
         b->wr_bytes = b->wr_calls = b->wr_nonzero = 0;
-        fprintf(stderr, "  [ses] tampon #%d: %u Hz, %u kanal, %u bit, %u bayt (%.2f sn)\n",
-                id, rate, chans, bits, bytes,
-                (double)bytes / (double)(rate * chans * (bits/8u)));
+        g_pcm_mirror_bytes += bytes;
     }
     pthread_mutex_unlock(&g_slock);
+
+    if (!id){
+        free(pcm);
+        audio_log_register_failure_once(bytes);
+        return 0;
+    }
+    fprintf(stderr, "  [ses] tampon #%d: %u Hz, %u kanal, %u bit, %u bayt (%.2f sn)\n",
+            id, rate, chans, bits, bytes,
+            (double)bytes / (double)(rate * chans * (bits/8u)));
     return id;
 }
 
@@ -307,18 +455,62 @@ uint32_t audio_status(int id){
  * mixer. Return zero when a coherent buffer snapshot is not immediately
  * available; callers can simply skip that sample. */
 int audio_snapshot(AudioSnapshot *out){
-    if (!out || pthread_mutex_trylock(&g_slock) != 0) return 0;
+    if (!out) return 0;
+    uint64_t now = audio_monotonic_us();
+    if (pthread_mutex_trylock(&g_slock) != 0) return 0;
     AudioSnapshot snap = {0};
     for (int i = 1; i < g_sndn; i++){
         const SndBuf *b = &g_snd[i];
         if (!b->used) continue;
+        snap.buffer_count++;
         if (b->playing) audio_add(&snap.active_buffers, 1);
         audio_add(&snap.plays, b->plays);
         audio_add(&snap.reissues, b->reissues);
         audio_add(&snap.stops, b->stops);
         audio_add(&snap.write_calls, b->wr_calls);
     }
+
+    /* Reserve the bounded rows for currently active buffers first. */
+    for (unsigned pass = 0; pass < 2 &&
+         snap.buffers_captured < AUDIO_SNAPSHOT_MAX_BUFFERS; pass++){
+        for (int i = 1; i < g_sndn &&
+             snap.buffers_captured < AUDIO_SNAPSHOT_MAX_BUFFERS; i++){
+            const SndBuf *b = &g_snd[i];
+            if (!b->used || (pass == 0) != (b->playing != 0)) continue;
+            AudioBufferSnapshot *row = &snap.buffers[snap.buffers_captured++];
+            row->id = (uint32_t)i;
+            row->storage_id = b->storage_id;
+            row->size_bytes = b->bytes;
+            row->rate = b->rate;
+            row->channels = b->chans;
+            row->bits = b->bits;
+            row->active = b->playing ? 1u : 0u;
+            row->looping = b->loop ? 1u : 0u;
+            row->write_seen = b->diag_write_seen ? 1u : 0u;
+            audio_cursors_locked(b, &row->play_cursor_bytes, &row->write_cursor_bytes);
+            row->write_end_offset = b->diag_write_end_offset;
+            row->last_write_bytes_reported = b->diag_last_write_bytes;
+            row->write_calls = b->diag_write_calls;
+            row->write_bytes_reported = b->diag_write_bytes;
+            row->last_write_age_us = (b->diag_write_seen && b->diag_last_write_us &&
+                                      now >= b->diag_last_write_us)
+                                   ? now - b->diag_last_write_us : 0;
+            row->max_write_gap_us = b->diag_max_write_gap_us;
+        }
+    }
+    snap.buffers_omitted = snap.buffer_count - snap.buffers_captured;
     snap.hardware_rate = audio_get_hardware_rate();
+    snap.callback_count = atomic_load_explicit(&g_cb_count, memory_order_relaxed);
+    snap.callback_gap_max_us = atomic_load_explicit(&g_cb_gap_max_us, memory_order_relaxed);
+    snap.callback_duration_max_us = atomic_load_explicit(&g_cb_duration_max_us, memory_order_relaxed);
+    snap.callback_late_count = atomic_load_explicit(&g_cb_late_count, memory_order_relaxed);
+    snap.callback_over_budget_count = atomic_load_explicit(&g_cb_over_budget_count, memory_order_relaxed);
+    snap.callback_max_frames = (uint32_t)atomic_load_explicit(&g_cb_max_frames, memory_order_relaxed);
+    snap.mirror_bytes = g_pcm_mirror_bytes;
+    snap.publish_calls = g_pcm_publish_calls;
+    snap.publish_bytes = g_pcm_publish_bytes;
+    snap.publish_max_ns = g_pcm_publish_max_ns;
+    snap.rejected_writes = g_pcm_rejected_writes;
     *out = snap;
     pthread_mutex_unlock(&g_slock);
     return 1;
@@ -330,19 +522,120 @@ void audio_note_write(int id, uint32_t end_off){
     if (g_snd[id].used && g_snd[id].bytes){
         g_snd[id].wpos = end_off % g_snd[id].bytes;
         g_snd[id].wseen = 1;
+        uint32_t storage_id = g_snd[id].storage_id;
+        for (int i = 1; i < g_sndn; i++){
+            SndBuf *b = &g_snd[i];
+            if (b->used && b->bytes && b->storage_id == storage_id){
+                b->diag_write_end_offset = end_off % b->bytes;
+            }
+        }
     }
     pthread_mutex_unlock(&g_slock);
 }
 
 void audio_note_write_stat(int id, uint32_t n, int nonzero){
     if (id <= 0 || id >= MAXSND) return;
+    uint64_t now = audio_monotonic_us();
     pthread_mutex_lock(&g_slock);
     if (g_snd[id].used){
-        audio_count(&g_snd[id].wr_calls);
-        audio_add(&g_snd[id].wr_bytes, n);
-        if (nonzero) audio_count(&g_snd[id].wr_nonzero);
+        SndBuf *target = &g_snd[id];
+        audio_count(&target->wr_calls);
+        audio_add(&target->wr_bytes, n);
+        if (nonzero) audio_count(&target->wr_nonzero);
+        uint32_t storage_id = target->storage_id;
+        for (int i = 1; i < g_sndn; i++){
+            SndBuf *b = &g_snd[i];
+            if (!b->used || b->storage_id != storage_id) continue;
+            if (now && b->diag_last_write_us && now >= b->diag_last_write_us){
+                uint64_t gap = now - b->diag_last_write_us;
+                if (gap > b->diag_max_write_gap_us) b->diag_max_write_gap_us = gap;
+            }
+            b->diag_write_seen = 1;
+            b->diag_last_write_us = now;
+            b->diag_last_write_bytes = n;
+            audio_count(&b->diag_write_calls);
+            audio_add(&b->diag_write_bytes, n);
+        }
     }
     pthread_mutex_unlock(&g_slock);
+}
+
+static int audio_pcm_region_offset(const SndBuf *b, uint32_t guest_addr,
+                                   uint32_t bytes, uint32_t *offset){
+    if (!bytes){
+        *offset = 0;
+        return 1;
+    }
+    if (guest_addr < b->data) return 0;
+    uint32_t delta = guest_addr - b->data;
+    if (delta > b->bytes || bytes > b->bytes - delta) return 0;
+    *offset = delta;
+    return 1;
+}
+
+int audio_publish_write(int id, uint32_t p1, uint32_t n1,
+                        uint32_t p2, uint32_t n2, int nonzero_sample){
+    uint64_t started_ns = audio_monotonic_ns();
+    int ok = 0;
+    pthread_mutex_lock(&g_slock);
+    if (id > 0 && id < g_sndn){
+        SndBuf *target = &g_snd[id];
+        uint32_t off1 = 0, off2 = 0;
+        int valid1 = target->used && target->pcm && g_mem &&
+                     audio_pcm_region_offset(target, p1, n1, &off1);
+        int valid2 = target->used && target->pcm && g_mem &&
+                     audio_pcm_region_offset(target, p2, n2, &off2);
+        /* Validate both guest spans completely before publishing either one. */
+        if (valid1 && valid2){
+            if (n1) memcpy(target->pcm + off1, g_mem + p1, n1);
+            if (n2) memcpy(target->pcm + off2, g_mem + p2, n2);
+
+            uint64_t total_bytes = (uint64_t)n1 + (uint64_t)n2;
+            uint32_t end_offset = target->diag_write_end_offset;
+            if (total_bytes){
+                uint64_t now_us;
+                uint64_t raw_end = n2 ? (uint64_t)off2 + n2 : (uint64_t)off1 + n1;
+                end_offset = (uint32_t)(raw_end % target->bytes);
+                target->wpos = end_offset;
+                target->wseen = 1;
+                audio_count(&target->wr_calls);
+                audio_add(&target->wr_bytes, total_bytes);
+                if (nonzero_sample > 0) audio_count(&target->wr_nonzero);
+                /* Age/gap timestamps refer to the completed mirror copy. */
+                now_us = audio_monotonic_us();
+
+                uint32_t reported_bytes = total_bytes > UINT32_MAX
+                                        ? UINT32_MAX : (uint32_t)total_bytes;
+                for (int i = 1; i < g_sndn; i++){
+                    SndBuf *b = &g_snd[i];
+                    if (!b->used || b->storage_id != target->storage_id) continue;
+                    b->wpos = end_offset;
+                    b->wseen = 1;
+                    b->diag_write_end_offset = end_offset;
+                    if (now_us && b->diag_last_write_us &&
+                        now_us >= b->diag_last_write_us){
+                        uint64_t gap = now_us - b->diag_last_write_us;
+                        if (gap > b->diag_max_write_gap_us) b->diag_max_write_gap_us = gap;
+                    }
+                    b->diag_write_seen = 1;
+                    b->diag_last_write_us = now_us;
+                    b->diag_last_write_bytes = reported_bytes;
+                    audio_count(&b->diag_write_calls);
+                    audio_add(&b->diag_write_bytes, total_bytes);
+                }
+                audio_count(&g_pcm_publish_calls);
+                audio_add(&g_pcm_publish_bytes, total_bytes);
+                uint64_t finished_ns = audio_monotonic_ns();
+                uint64_t elapsed_ns = started_ns && finished_ns >= started_ns
+                                    ? finished_ns - started_ns : 0;
+                if (elapsed_ns > g_pcm_publish_max_ns) g_pcm_publish_max_ns = elapsed_ns;
+            }
+            ok = 1;
+        }
+    }
+    if (!ok) audio_count(&g_pcm_rejected_writes);
+    pthread_mutex_unlock(&g_slock);
+    return ok;
 }
 
 void audio_set_freq(int id, uint32_t hz){
@@ -389,19 +682,27 @@ int audio_duplicate(int src){
     return id;
 }
 
-#define WRITE_LEAD_MS 50u
+static void audio_cursors_locked(const SndBuf *b, uint32_t *play, uint32_t *write){
+    uint32_t p = 0, w = 0;
+    if (b && b->used && b->bytes){
+        uint32_t bpf = b->chans * (b->bits / 8u);
+        uint32_t sz = b->bytes;
+        if (bpf){
+            p = (uint32_t)(b->cursor * (double)bpf) % sz;
+            uint32_t lead = (b->rate * WRITE_LEAD_MS / 1000u) * bpf;
+            if (lead >= sz) lead = sz / 4u;
+            w = (p + lead) % sz;
+        }
+    }
+    if (play) *play = p;
+    if (write) *write = w;
+}
+
 void audio_cursors(int id, uint32_t *play, uint32_t *write){
     uint32_t p = 0, w = 0;
     if (id > 0 && id < MAXSND){
         pthread_mutex_lock(&g_slock);
-        if (g_snd[id].used && g_snd[id].bytes){
-            uint32_t bpf = g_snd[id].chans * (g_snd[id].bits/8u);
-            uint32_t sz  = g_snd[id].bytes;
-            p = (uint32_t)(g_snd[id].cursor * (double)bpf) % sz;
-            uint32_t lead = (g_snd[id].rate * WRITE_LEAD_MS / 1000u) * bpf;
-            if (lead >= sz) lead = sz / 4u;
-            w = (p + lead) % sz;
-        }
+        audio_cursors_locked(&g_snd[id], &p, &w);
         pthread_mutex_unlock(&g_slock);
     }
     if (play)  *play  = p;
@@ -451,7 +752,7 @@ static void mix_chunk(int16_t *out, unsigned frames, uint32_t hw_rate){
     pthread_mutex_lock(&g_slock);
     for (int i = 1; i < g_sndn; i++){
         SndBuf *b = &g_snd[i];
-        if (!b->used || !b->playing || !b->bytes) continue;
+        if (!b->used || !b->playing || !b->bytes || !b->pcm) continue;
         uint32_t bps  = b->bits / 8u;
         uint32_t bpf  = b->chans * bps;
         if (!bpf) continue;
@@ -496,7 +797,13 @@ static void mix_chunk(int16_t *out, unsigned frames, uint32_t hw_rate){
         for (unsigned f = 0; f < frames; f++){
             double sp = b->cursor + step * (double)f;
             if (sp >= (double)nsrc){
-                if (b->loop) sp = fmod(sp, (double)nsrc);
+                if (b->loop){
+                    double source_len = (double)nsrc;
+                    /* The single-wrap interval has an exact subtraction
+                     * remainder; retain fmod for all multi-wrap values. */
+                    if (sp < source_len * 2.0) sp -= source_len;
+                    else sp = fmod(sp, source_len);
+                }
                 else { b->playing = 0; break; }
             }
             uint32_t si0 = (uint32_t)sp;
@@ -505,18 +812,18 @@ static void mix_chunk(int16_t *out, unsigned frames, uint32_t hw_rate){
 
             for (unsigned c = 0; c < OUT_CH; c++){
                 uint32_t sc = (b->chans == 2u) ? (uint32_t)c : 0u;
-                uint32_t off0 = b->data + si0 * bpf + sc * bps;
-                uint32_t off1 = b->data + si1 * bpf + sc * bps;
+                size_t off0 = (size_t)si0 * bpf + sc * bps;
+                size_t off1 = (size_t)si1 * bpf + sc * bps;
                 float s0, s1;
                 if (b->bits == 16u){
                     int16_t v0, v1;
-                    memcpy(&v0, g_mem + off0, 2);
-                    memcpy(&v1, g_mem + off1, 2);
+                    memcpy(&v0, b->pcm + off0, 2);
+                    memcpy(&v1, b->pcm + off1, 2);
                     s0 = (float)v0 / 32768.f;
                     s1 = (float)v1 / 32768.f;
                 } else {
-                    s0 = ((float)g_mem[off0] - 128.f) / 128.f;
-                    s1 = ((float)g_mem[off1] - 128.f) / 128.f;
+                    s0 = ((float)b->pcm[off0] - 128.f) / 128.f;
+                    s1 = ((float)b->pcm[off1] - 128.f) / 128.f;
                 }
                 float sample = s0 + alpha * (s1 - s0);
                 acc[f * OUT_CH + c] += sample * b->vol;
@@ -526,7 +833,11 @@ static void mix_chunk(int16_t *out, unsigned frames, uint32_t hw_rate){
         b->cursor += step * (double)frames;
         if (nsrc){
             if (b->cursor >= (double)nsrc){
-                if (b->loop) b->cursor = fmod(b->cursor, (double)nsrc);
+                if (b->loop){
+                    double source_len = (double)nsrc;
+                    if (b->cursor < source_len * 2.0) b->cursor -= source_len;
+                    else b->cursor = fmod(b->cursor, source_len);
+                }
                 else { b->cursor = 0.0; b->playing = 0; }
             }
         }
@@ -536,21 +847,20 @@ static void mix_chunk(int16_t *out, unsigned frames, uint32_t hw_rate){
     if (active > g_active_peak) g_active_peak = active;
     g_mixed_frames += frames;
 
-    /* Sessizlik kontrolu */
-    if (active){
-        unsigned zero = 0;
-        for (unsigned k = 0; k < frames * OUT_CH; k++) if (acc[k] == 0.f) zero++;
-        g_out_frames += frames * OUT_CH;
-        g_out_zero   += zero;
-        if (zero > (frames * OUT_CH) * 3u / 4u) g_gap_cb++;
-    }
-
-    /* Doygunluk ve int16 paketleme */
+    /* Doygunluk, exact-zero diagnostics, and int16 packing share one pass. */
+    unsigned zero = 0;
     for (unsigned k = 0; k < frames * OUT_CH; k++){
         float v = acc[k];
+        if (active && v == 0.f) zero++;
         if (v >  1.f) v =  1.f;
         if (v < -1.f) v = -1.f;
         out[k] = (int16_t)(v * 32767.f);
+    }
+    /* Keep the original active-buffer guard and pre-clamp exact-zero test. */
+    if (active){
+        g_out_frames += frames * OUT_CH;
+        g_out_zero   += zero;
+        if (zero > (frames * OUT_CH) * 3u / 4u) g_gap_cb++;
     }
     g_cb_no++;
     if (g_dump) fwrite(out, sizeof(int16_t), (size_t)frames * OUT_CH, g_dump);
@@ -573,14 +883,52 @@ static void mix_into(int16_t *out, unsigned frames){
 
 #ifndef NFSU2_AUDIO_CORE_TEST
 static uint64_t now_us_a(void){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
+    return audio_monotonic_us();
+}
+
+/* One clock sample at callback entry and one at exit; never called per sample. */
+static uint64_t audio_callback_begin(uint64_t *last, uint64_t *last_budget,
+                                    uint32_t frames, uint32_t hw_rate,
+                                    uint64_t *budget_out){
+    if (atomic_exchange_explicit(&g_cb_clock_reset, false, memory_order_relaxed)){
+        *last = 0;
+        *last_budget = 0;
+    }
+    uint64_t now = now_us_a();
+    uint64_t budget = hw_rate ? (uint64_t)frames * 1000000ull / hw_rate : 0;
+    uint64_t gap = 0;
+    if (*last && now >= *last){
+        gap = now - *last;
+        if (gap > g_worst_gap_us) g_worst_gap_us = gap;
+        audio_atomic_max_u64(&g_cb_gap_max_us, gap);
+        /* A callback interval follows the prior callback's frame count. */
+        if (*last_budget && gap > *last_budget * 2u){
+            audio_count(&g_late_callbacks);
+            atomic_fetch_add_explicit(&g_cb_late_count, 1, memory_order_relaxed);
+        }
+    }
+    *last = now;
+    *last_budget = budget;
+    atomic_fetch_add_explicit(&g_cb_count, 1, memory_order_relaxed);
+    audio_atomic_max_u32(&g_cb_max_frames, frames);
+    if (budget_out) *budget_out = budget;
+    return gap;
+}
+
+static void audio_callback_end(uint64_t started, uint64_t budget){
+    uint64_t ended = now_us_a();
+    if (!started || ended < started) return;
+    uint64_t duration = ended - started;
+    audio_atomic_max_u64(&g_cb_duration_max_us, duration);
+    if (budget && duration > budget)
+        atomic_fetch_add_explicit(&g_cb_over_budget_count, 1, memory_order_relaxed);
 }
 
 /* AudioQueue Geri Cagirmasi (Yedek Yol) */
 static void cb(void *ud, AudioQueueRef q, AudioQueueBufferRef buf){
     (void)ud;
     if (atomic_load_explicit(&g_audio_suspended, memory_order_relaxed)){
+        atomic_store_explicit(&g_cb_clock_reset, true, memory_order_relaxed);
         memset(buf->mAudioData, 0, FRAMES * OUT_CH * sizeof(int16_t));
         buf->mAudioDataByteSize = FRAMES * OUT_CH * sizeof(int16_t);
         AudioQueueEnqueueBuffer(q, buf, 0, NULL);
@@ -590,19 +938,18 @@ static void cb(void *ud, AudioQueueRef q, AudioQueueBufferRef buf){
     if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
 
     static uint64_t last = 0;
-    uint64_t now = now_us_a();
-    uint64_t budget = (uint64_t)FRAMES * 1000000ull / (uint64_t)hw_rate;
-    if (last && now - last > budget * (uint64_t)NBUF) audio_count(&g_starved);
-    if (last && now - last > budget * 2u) audio_count(&g_late_callbacks);
-    if (last){ uint64_t d = now - last; if (d > g_worst_gap_us) g_worst_gap_us = d; }
-    last = now;
+    static uint64_t last_budget = 0;
+    uint64_t budget = 0;
+    uint64_t gap = audio_callback_begin(&last, &last_budget, FRAMES, hw_rate, &budget);
+    if (gap && budget && gap > budget * (uint64_t)NBUF) audio_count(&g_starved);
 
     mix_into((int16_t *)buf->mAudioData, FRAMES);
     buf->mAudioDataByteSize = FRAMES * OUT_CH * sizeof(int16_t);
     AudioQueueEnqueueBuffer(q, buf, 0, NULL);
+    audio_callback_end(last, budget);
 }
 
-/* RemoteIO AudioUnit render callback. mix_into/mix_chunk reads guest PCM and
+/* RemoteIO AudioUnit render callback. mix_into/mix_chunk reads host PCM mirrors and
  * takes g_slock, so this is not a lock-free callback path. */
 static OSStatus au_cb(void *ud, AudioUnitRenderActionFlags *flags,
                       const AudioTimeStamp *ts, UInt32 bus, UInt32 nframes,
@@ -614,28 +961,26 @@ static OSStatus au_cb(void *ud, AudioUnitRenderActionFlags *flags,
     if (atomic_load_explicit(&g_audio_suspended, memory_order_relaxed) ||
         atomic_load_explicit(&g_audio_reconfiguring, memory_order_relaxed) ||
         !atomic_load_explicit(&g_audio_on, memory_order_relaxed)){
+        atomic_store_explicit(&g_cb_clock_reset, true, memory_order_relaxed);
         memset(abl->mBuffers[0].mData, 0, nframes * OUT_CH * sizeof(int16_t));
         abl->mBuffers[0].mDataByteSize = nframes * OUT_CH * sizeof(int16_t);
         return noErr;
     }
 
     static uint64_t last = 0;
-    uint64_t now = now_us_a();
+    static uint64_t last_budget = 0;
     uint32_t hw_rate = (uint32_t)atomic_load_explicit(&g_hw_rate, memory_order_relaxed);
     if (!hw_rate) hw_rate = AUDIO_DEFAULT_RATE;
-    uint64_t budget = (uint64_t)nframes * 1000000ull / (uint64_t)hw_rate;
-    if (last){
-        uint64_t d = now - last;
-        if (d > g_worst_gap_us) g_worst_gap_us = d;
-        if (budget && d > budget * 2u) audio_count(&g_late_callbacks);
-    }
-    last = now;
+    uint64_t budget = 0;
+    (void)audio_callback_begin(&last, &last_budget,
+                               (uint32_t)nframes, hw_rate, &budget);
 
     int16_t *out = (int16_t *)abl->mBuffers[0].mData;
     if (nframes > g_au_slice) g_au_slice = nframes;
 
     mix_into(out, (unsigned)nframes);
     abl->mBuffers[0].mDataByteSize = nframes * OUT_CH * sizeof(int16_t);
+    audio_callback_end(last, budget);
     return noErr;
 }
 
@@ -863,6 +1208,7 @@ fail:
 /* --- Yasam Dongusu API Fonksiyonlari --- */
 
 void audio_ios_pause(void){
+    atomic_store_explicit(&g_cb_clock_reset, true, memory_order_relaxed);
     atomic_store_explicit(&g_audio_suspended, true, memory_order_release);
     if (g_backend == 1 && g_au){
         AudioOutputUnitStop(g_au);
@@ -872,6 +1218,7 @@ void audio_ios_pause(void){
 }
 
 void audio_ios_resume(void){
+    atomic_store_explicit(&g_cb_clock_reset, true, memory_order_relaxed);
 #if TARGET_OS_IPHONE
     @autoreleasepool {
         NSError *err = nil;
@@ -888,6 +1235,7 @@ void audio_ios_resume(void){
 
 void audio_ios_reconfigure_sample_rate(uint32_t new_rate){
     if (new_rate < 4000u || new_rate > 192000u) return;
+    atomic_store_explicit(&g_cb_clock_reset, true, memory_order_relaxed);
     if (g_backend != 1 || !g_au) {
         atomic_store_explicit(&g_hw_rate, new_rate, memory_order_relaxed);
         return;
@@ -933,6 +1281,7 @@ void audio_ios_restart_subsystem(void){
 void audio_init(void){
     if (atomic_load_explicit(&g_audio_on, memory_order_relaxed)) return;
     { const char *e = getenv("NOSOUND"); if (e && *e && *e != '0') return; }
+    atomic_store_explicit(&g_cb_clock_reset, true, memory_order_relaxed);
 
     /* Ring buffer baslat */
     audio_ringbuf_init(&g_stream_rb, AUDIO_RING_FRAMES, OUT_CH);
@@ -1003,6 +1352,7 @@ void audio_init(void){
 }
 
 void audio_shutdown(void){
+    atomic_store_explicit(&g_cb_clock_reset, true, memory_order_relaxed);
     atomic_store_explicit(&g_audio_on, false, memory_order_release);
     if (g_backend == 1 && g_au){
         AudioOutputUnitStop(g_au);

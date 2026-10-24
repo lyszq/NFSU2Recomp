@@ -21,4 +21,24 @@ void metal_draw_tv(const TVert *tv, unsigned nverts, unsigned prim, unsigned tex
 void metal_pipeline_cache_snapshot(uint64_t *lookups, uint64_t *hits,
                                    uint64_t *probes, uint64_t *compiled_ns,
                                    unsigned *entries);
+
+/* Lightweight cumulative renderer timings for the periodic runtime log.
+ * Frame intervals are commit-to-commit and include app lifecycle gaps;
+ * guest_present_interval_max_us is the max interval between metal_present calls. */
+typedef struct {
+    uint64_t vs_library_count, vs_library_ns;
+    uint64_t ps_library_count, ps_library_ns;
+    uint64_t texture_upload_count, texture_upload_ns, texture_upload_bytes;
+    uint64_t frame_interval_le_16667_us, frame_interval_le_33333_us;
+    uint64_t frame_interval_le_66667_us, frame_interval_gt_66667_us;
+    uint64_t frame_interval_max_us;
+    uint64_t guest_present_interval_max_us;
+    uint64_t next_drawable_ns, encode_ns, guest_present_wait_ns;
+    uint64_t frames_dropped, gpu_ring_busy_skips;
+    /* Main encoder only, excluding fused postprocess/helper encoders.
+     * CPU includes fixed-function draws. Published in batches per frame. */
+    uint64_t main_gpu_vs_draws, main_cpu_vs_draws;
+    uint64_t frames_committed; /* CPU command-buffer commits, not display proof. */
+} MetalRuntimePerfSnapshot;
+void metal_runtime_perf_snapshot(MetalRuntimePerfSnapshot *snapshot);
 #endif

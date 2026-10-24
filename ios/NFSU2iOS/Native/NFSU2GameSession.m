@@ -29,6 +29,7 @@ static void copy_text(char *destination, size_t capacity, const char *source) {
 #include "gfx.h"
 #include "audio.h"
 #include "fileio.h"
+#include "guest_lock.h"
 #include "NFSU2InputBridge.h"
 
 extern void dispatch_init(void);
@@ -80,11 +81,12 @@ static dispatch_queue_t session_log_queue(void) {
  * on the existing log queue. No per-frame files or audio-callback IO. */
 static void log_performance_if_due(void) {
     if (!pthread_main_np()) return;
-    static uint64_t origin_us, last_us;
+    static uint64_t origin_us, last_us, last_frames;
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return;
     uint64_t now_us = (uint64_t)ts.tv_sec * 1000000ull + (uint64_t)ts.tv_nsec / 1000ull;
     if (last_us && now_us >= last_us && now_us - last_us < 10000000ull) return;
+    uint64_t interval_us=last_us && now_us>=last_us ? now_us-last_us : 0;
     if (!origin_us || now_us < origin_us) origin_us = now_us;
     last_us = now_us;
     uint64_t elapsed_ms = (now_us - origin_us) / 1000ull;
@@ -96,6 +98,13 @@ static void log_performance_if_due(void) {
     fileio_perf_snapshot(&io);
     AudioSnapshot audio = {0};
     int audio_ready = audio_snapshot(&audio);
+    MetalRuntimePerfSnapshot renderer = {0};
+    metal_runtime_perf_snapshot(&renderer);
+    double commit_fps=interval_us && renderer.frames_committed>=last_frames
+        ? (double)(renderer.frames_committed-last_frames)*1000000.0/(double)interval_us : 0.0;
+    last_frames=renderer.frames_committed;
+    GuestLockSnapshot guest = {0};
+    guest_lock_snapshot(&guest);
     dispatch_async(session_log_queue(), ^{
         fprintf(stderr,
                 "runtime performance: elapsed_ms=%llu pso_lookups=%llu pso_hits=%llu "
@@ -112,6 +121,84 @@ static void log_performance_if_due(void) {
                 (unsigned long long)audio.active_buffers, (unsigned long long)audio.plays,
                 (unsigned long long)audio.reissues, (unsigned long long)audio.stops,
                 (unsigned long long)audio.write_calls, audio.hardware_rate);
+        fprintf(stderr,
+                "runtime stages: elapsed_ms=%llu vs_libraries=%llu vs_compile_ms=%.3f "
+                "ps_libraries=%llu ps_compile_ms=%.3f frames_committed=%llu commit_fps=%.2f fps_window_ms=%llu "
+                "main_gpu_vs_draws=%llu main_cpu_vs_draws=%llu "
+                "tex_uploads=%llu tex_upload_ms=%.3f "
+                "tex_upload_bytes=%llu frame_le16=%llu frame_le33=%llu frame_le66=%llu frame_gt66=%llu "
+                "frame_max_us=%llu present_interval_max_us=%llu drawable_wait_ms=%.3f encode_ms=%.3f "
+                "present_wait_ms=%.3f dropped=%llu ring_busy=%llu guest_host_waits=%llu "
+                "guest_host_wait_ms=%.3f guest_host_wait_max_ms=%.3f "
+                "io_commit_ms=%.3f io_service_ms=%.3f io_service_max_ms=%.3f; cumulative, lifecycle gaps included\n",
+                (unsigned long long)elapsed_ms,
+                (unsigned long long)renderer.vs_library_count, (double)renderer.vs_library_ns / 1e6,
+                (unsigned long long)renderer.ps_library_count, (double)renderer.ps_library_ns / 1e6,
+                (unsigned long long)renderer.frames_committed,commit_fps,
+                (unsigned long long)(interval_us/1000ull),
+                (unsigned long long)renderer.main_gpu_vs_draws,
+                (unsigned long long)renderer.main_cpu_vs_draws,
+                (unsigned long long)renderer.texture_upload_count, (double)renderer.texture_upload_ns / 1e6,
+                (unsigned long long)renderer.texture_upload_bytes,
+                (unsigned long long)renderer.frame_interval_le_16667_us,
+                (unsigned long long)renderer.frame_interval_le_33333_us,
+                (unsigned long long)renderer.frame_interval_le_66667_us,
+                (unsigned long long)renderer.frame_interval_gt_66667_us,
+                (unsigned long long)renderer.frame_interval_max_us,
+                (unsigned long long)renderer.guest_present_interval_max_us,
+                (double)renderer.next_drawable_ns / 1e6, (double)renderer.encode_ns / 1e6,
+                (double)renderer.guest_present_wait_ns / 1e6,
+                (unsigned long long)renderer.frames_dropped,
+                (unsigned long long)renderer.gpu_ring_busy_skips,
+                (unsigned long long)guest.host_waits, (double)guest.host_wait_ns / 1e6,
+                (double)guest.max_host_wait_ns / 1e6,
+                (double)io.read_commit_ns / 1e6, (double)io.read_service_ns / 1e6,
+                (double)io.read_service_max_ns / 1e6);
+        fprintf(stderr,
+                "runtime guest scheduler: elapsed_ms=%llu acquisitions=%llu queued=%llu "
+                "acquire_wait_ms=%.3f acquire_wait_max_ms=%.3f fair_handoffs=%llu; "
+                "cumulative, cooperative boundaries only, lifecycle gaps included\n",
+                (unsigned long long)elapsed_ms, (unsigned long long)guest.acquisitions,
+                (unsigned long long)guest.queued_waiters,
+                (double)guest.acquisition_wait_ns / 1e6,
+                (double)guest.acquisition_wait_max_ns / 1e6,
+                (unsigned long long)guest.fair_handoffs);
+        if (audio_ready){
+            fprintf(stderr,
+                    "runtime audio callbacks: elapsed_ms=%llu callbacks=%llu max_frames=%u "
+                    "gap_max_us=%llu duration_max_us=%llu late=%llu over_budget=%llu "
+                    "buffers=%u captured=%u omitted=%u; cumulative, lifecycle gaps included\n",
+                    (unsigned long long)elapsed_ms, (unsigned long long)audio.callback_count,
+                    audio.callback_max_frames, (unsigned long long)audio.callback_gap_max_us,
+                    (unsigned long long)audio.callback_duration_max_us,
+                    (unsigned long long)audio.callback_late_count,
+                    (unsigned long long)audio.callback_over_budget_count,
+                    audio.buffer_count, audio.buffers_captured, audio.buffers_omitted);
+            fprintf(stderr,
+                    "runtime audio publication: elapsed_ms=%llu mirror_bytes=%llu publishes=%llu "
+                    "publish_bytes=%llu publish_max_us=%.3f rejected=%llu; "
+                    "cumulative, publish time includes mutex wait\n",
+                    (unsigned long long)elapsed_ms, (unsigned long long)audio.mirror_bytes,
+                    (unsigned long long)audio.publish_calls, (unsigned long long)audio.publish_bytes,
+                    (double)audio.publish_max_ns / 1000.0,
+                    (unsigned long long)audio.rejected_writes);
+            for (uint32_t i = 0; i < audio.buffers_captured; ++i){
+                const AudioBufferSnapshot *buffer = &audio.buffers[i];
+                fprintf(stderr,
+                        "runtime audio buffer: elapsed_ms=%llu id=%u storage=%u active=%u loop=%u "
+                        "size=%u rate=%u channels=%u bits=%u play=%u write=%u write_seen=%u "
+                        "write_end=%u last_write_bytes_reported=%u writes=%llu bytes_reported=%llu "
+                        "write_age_us=%llu write_gap_max_us=%llu; write age is not an underrun verdict\n",
+                        (unsigned long long)elapsed_ms, buffer->id, buffer->storage_id,
+                        buffer->active, buffer->looping, buffer->size_bytes, buffer->rate,
+                        buffer->channels, buffer->bits, buffer->play_cursor_bytes,
+                        buffer->write_cursor_bytes, buffer->write_seen, buffer->write_end_offset,
+                        buffer->last_write_bytes_reported, (unsigned long long)buffer->write_calls,
+                        (unsigned long long)buffer->write_bytes_reported,
+                        (unsigned long long)buffer->last_write_age_us,
+                        (unsigned long long)buffer->max_write_gap_us);
+            }
+        }
     });
 }
 
@@ -477,6 +564,16 @@ int nfs_game_session_start(const char *executable_path,
     /* Existing bounded diagnostics correlate long serialized guest holds with
      * audio producer gaps. This process-only default respects an explicit override. */
     setenv("GILLOG", "500", 0);
+    /* The desktop hosts (run.sh / bundle.m) enable native vertex shaders.
+     * Neither host is linked into the full iOS app; an absent GPUVS otherwise
+     * leaves draw_up on its CPU interpreter. Preserve an explicit override
+     * and the existing unsupported-shader / arena-overflow fallback paths. */
+    if (setenv("GPUVS", "1", 0) != 0){
+        fprintf(stderr,"runtime renderer policy: could not set GPUVS default (errno=%d)\n",errno);
+    }
+    const char *gpuvs_policy=getenv("GPUVS");
+    fprintf(stderr,"runtime renderer policy: GPUVS=%s; native Metal vertex path when enabled, CPU fallback retained; device performance unmeasured\n",
+            gpuvs_policy ? gpuvs_policy : "(unset)");
 
     if (!metal_available() || !metal_window_ready()) {
         return fail_session(ENODEV,

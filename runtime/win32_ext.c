@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <time.h>
@@ -12,6 +14,7 @@
 #include <sched.h>
 #include <TargetConditionals.h>
 #include "win32_guest_thread_resources.h"
+#include "guest_lock.h"
 
 #ifndef NFS_FULL_RUNTIME
 #define NFS_FULL_RUNTIME 0
@@ -28,6 +31,7 @@ void win32_exit_scope_leave(void *previous);
 int win32_exit_thread(int code);
 int win32_exit_requested(void);
 void win32_exit_checkpoint(CPU *c);
+void win32_set_last_error(CPU *c, uint32_t value);
 void mem_commit(uint32_t,uint32_t);
 uint32_t win32_alloc(uint32_t n, int zero);
 uint32_t res_find(uint32_t,uint32_t,int);
@@ -58,8 +62,18 @@ static WStat g_wstat[64];
  * paylastigi guest bellek/allocator'lar guvenli olur, hem de komut izi tutarli
  * kalir. Kilit yalnizca bloklayan cagrilarda (Sleep/Wait*) birakilir.      */
 static pthread_mutex_t g_guest = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_guest_handoff = PTHREAD_COND_INITIALIZER;
+/* Generation/handoff sleepers are protected by g_guest. Ordinary waiters are
+ * atomic because they announce themselves before acquiring that mutex. */
+static uint64_t g_guest_generation;
+static unsigned g_guest_handoff_sleepers;
+static uint64_t g_guest_waiters, g_guest_acquisitions;
+static uint64_t g_guest_acquire_wait_ns, g_guest_acquire_wait_max_ns;
+static uint64_t g_guest_fair_handoffs;
 extern CPU *g_cur_cpu;
 static _Thread_local CPU *tl_cpu = 0;
+static _Thread_local int tl_guest_owned = 0;
+static _Thread_local int tl_cs_depth = 0;
 static _Thread_local void *tl_obj = 0;   /* bu thread'in nesnesi */
 /* Tum guest thread'lerinin CPU durumu: takilma aninda HEPSININ yigin izini
  * dokebilmek icin (tek thread'inki yaniltici olabiliyor). */
@@ -303,7 +317,8 @@ static void stall_checkpoint(void){
  * Ses her 30 sn'de bir ~50 ms sessizlik yaziyor -- suclunun bu olup
  * olmadigini olcuyoruz.  GILLOG=<ms> esigi asan her tutusu bildirir. */
 static uint64_t gil_now_us(void){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
     return (uint64_t)ts.tv_sec*1000000ull + (uint64_t)ts.tv_nsec/1000ull;
 }
 static _Thread_local uint64_t tl_gil_t0 = 0;
@@ -316,7 +331,8 @@ static int gil_thr_us(void){
 static void gil_took(void){ tl_gil_t0 = gil_now_us(); }
 static void gil_gave(void){
     if (!tl_gil_t0) return;
-    uint64_t d = gil_now_us() - tl_gil_t0;
+    uint64_t now = gil_now_us();
+    uint64_t d = now >= tl_gil_t0 ? now - tl_gil_t0 : 0;
     tl_gil_t0 = 0;
     if (d > g_gil_max_us) g_gil_max_us = d;
     int thr = gil_thr_us();
@@ -325,20 +341,146 @@ static void gil_gave(void){
         static int shown = 0;
         if (shown < 80){ shown++;
             double audio_time(void);
-            fprintf(stderr, "  [GIL] t=%.3f sn  kilit %.1f ms tutuldu  guest eip=%08x\n",
-                    audio_time(), d/1000.0, tl_cpu ? tl_cpu->eip : 0u);
+            const char *api = tl_diag_slot >= 0 && tl_diag_slot < MAXCPUS
+                ? g_cpu_import_diag[tl_diag_slot].api : NULL;
+            fprintf(stderr, "  [GIL] t=%.3f sn  kilit %.1f ms tutuldu  guest eip=%08x "
+                    "wall_ms=%llu tid=%u cs_depth=%d last_import=%s\n",
+                    audio_time(), d/1000.0, tl_cpu ? tl_cpu->eip : 0u,
+                    (unsigned long long)diagnostic_wall_ms(), cpu_tid_checked(tl_cpu),
+                    tl_cs_depth, api ? api : "none");
         }
     }
 }
+static uint64_t g_host_waits, g_host_wait_ns, g_max_host_wait_ns;
+static _Thread_local uint64_t tl_host_wait_start_us;
+
+/* Called only while owning g_guest, after a real execution acquisition.
+ * unreg_cpu's maintenance lock deliberately does not advance this generation. */
+static void guest_record_acquisition(uint64_t started_us){
+    uint64_t now = gil_now_us();
+    uint64_t ns = started_us && now >= started_us ? (now - started_us) * 1000ull : 0;
+    __atomic_fetch_add(&g_guest_acquisitions, 1ull, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_guest_acquire_wait_ns, ns, __ATOMIC_RELAXED);
+    uint64_t maximum = __atomic_load_n(&g_guest_acquire_wait_max_ns, __ATOMIC_RELAXED);
+    if (ns > maximum)
+        __atomic_store_n(&g_guest_acquire_wait_max_ns, ns, __ATOMIC_RELAXED);
+    ++g_guest_generation;
+    if (g_guest_handoff_sleepers) pthread_cond_broadcast(&g_guest_handoff);
+}
+
+static void guest_acquire_mutex(void){
+    uint64_t started = gil_now_us();
+    __atomic_fetch_add(&g_guest_waiters, 1ull, __ATOMIC_RELAXED);
+    pthread_mutex_lock(&g_guest);
+    __atomic_fetch_sub(&g_guest_waiters, 1ull, __ATOMIC_RELAXED);
+    tl_guest_owned = 1;
+    guest_record_acquisition(started);
+}
+
 void guest_lock(CPU *c){
 #if NFS_FULL_RUNTIME
     nfs_game_session_checkpoint();
 #endif
-    pthread_mutex_lock(&g_guest); tl_cpu=c; g_cur_cpu=c; reg_cpu(c); gil_took();
+    guest_acquire_mutex();
+    tl_cpu=c; g_cur_cpu=c; reg_cpu(c); gil_took();
 }
-void guest_unlock(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
-static void guest_yield_begin(void){ gil_gave(); pthread_mutex_unlock(&g_guest); }
-static void guest_yield_end(void){ pthread_mutex_lock(&g_guest); g_cur_cpu = tl_cpu; gil_took(); }
+void guest_unlock(void){
+    gil_gave(); tl_guest_owned=0; pthread_mutex_unlock(&g_guest);
+}
+static void guest_yield_begin(void){
+    gil_gave(); tl_guest_owned=0; pthread_mutex_unlock(&g_guest);
+}
+static void guest_yield_end(void){
+    guest_acquire_mutex();
+    g_cur_cpu = tl_cpu; gil_took();
+}
+
+int guest_host_wait_begin(void){
+    if (!tl_guest_owned) return 0;
+    guest_yield_begin();
+    tl_host_wait_start_us = gil_now_us();
+    return 1;
+}
+
+void guest_host_wait_end(int released){
+    if (!released) return;
+    uint64_t started = tl_host_wait_start_us;
+    guest_yield_end();
+    uint64_t now = gil_now_us();
+    uint64_t ns = started && now >= started ? (now - started) * 1000ull : 0;
+    __atomic_fetch_add(&g_host_waits, 1ull, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_host_wait_ns, ns, __ATOMIC_RELAXED);
+    uint64_t maximum = __atomic_load_n(&g_max_host_wait_ns, __ATOMIC_RELAXED);
+    while (maximum < ns && !__atomic_compare_exchange_n(
+            &g_max_host_wait_ns, &maximum, ns, 1, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+    tl_host_wait_start_us = 0;
+}
+
+void guest_lock_snapshot(GuestLockSnapshot *snapshot){
+    if (!snapshot) return;
+    snapshot->host_waits = __atomic_load_n(&g_host_waits, __ATOMIC_RELAXED);
+    snapshot->host_wait_ns = __atomic_load_n(&g_host_wait_ns, __ATOMIC_RELAXED);
+    snapshot->max_host_wait_ns = __atomic_load_n(&g_max_host_wait_ns, __ATOMIC_RELAXED);
+    snapshot->acquisition_wait_ns = __atomic_load_n(&g_guest_acquire_wait_ns, __ATOMIC_RELAXED);
+    snapshot->acquisition_wait_max_ns = __atomic_load_n(&g_guest_acquire_wait_max_ns, __ATOMIC_RELAXED);
+    snapshot->acquisitions = __atomic_load_n(&g_guest_acquisitions, __ATOMIC_RELAXED);
+    snapshot->queued_waiters = __atomic_load_n(&g_guest_waiters, __ATOMIC_RELAXED);
+    snapshot->fair_handoffs = __atomic_load_n(&g_guest_fair_handoffs, __ATOMIC_RELAXED);
+}
+
+#if NFS_FULL_RUNTIME && TARGET_OS_IPHONE
+static int guest_handoff_deadline(struct timespec *deadline){
+    /* g_guest_handoff uses the default CLOCK_REALTIME condvar clock. */
+    if (clock_gettime(CLOCK_REALTIME, deadline) != 0) return 0;
+    deadline->tv_nsec += 2000000L;
+    if (deadline->tv_nsec >= 1000000000L){
+        ++deadline->tv_sec; deadline->tv_nsec -= 1000000000L;
+    }
+    return 1;
+}
+
+static void guest_poll_handoff(void){
+    if (!tl_guest_owned || tl_cs_depth || !tl_gil_t0 ||
+        !__atomic_load_n(&g_guest_waiters, __ATOMIC_RELAXED)) return;
+    uint64_t now = gil_now_us();
+    if (now < tl_gil_t0 || now - tl_gil_t0 < 2000ull) return;
+    struct timespec deadline;
+    if (!guest_handoff_deadline(&deadline)) return;
+    uint64_t generation = g_guest_generation;
+    uint64_t started = now;
+    ++g_guest_handoff_sleepers;
+    /* Stay visible while cond-wait is reacquiring g_guest, so the new owner
+     * also has a reason to hand execution back at its next safe boundary. */
+    __atomic_fetch_add(&g_guest_waiters, 1ull, __ATOMIC_RELAXED);
+    gil_gave(); tl_guest_owned = 0;
+    while (g_guest_generation == generation &&
+           __atomic_load_n(&g_guest_waiters, __ATOMIC_RELAXED) > 1ull &&
+           !win32_exit_requested()){
+        int rc = pthread_cond_timedwait(&g_guest_handoff, &g_guest, &deadline);
+        if (g_guest_generation != generation) break;
+        /* Keep the original deadline across spurious wakes. A signaled waiter
+         * may be OS-descheduled; do not renew forever behind its live count.
+         * Mutex reacquisition itself remains subject to host scheduling. */
+        if (rc != 0) break;
+    }
+    int transferred = g_guest_generation != generation;
+    __atomic_fetch_sub(&g_guest_waiters, 1ull, __ATOMIC_RELAXED);
+    --g_guest_handoff_sleepers;
+    tl_guest_owned = 1; g_cur_cpu = tl_cpu;
+    /* The cond-wait's self-reacquisition advances generation only now, after
+     * the wait predicate has been decided. It cannot satisfy its own handoff. */
+    guest_record_acquisition(started);
+    gil_took();
+    if (transferred)
+        __atomic_fetch_add(&g_guest_fair_handoffs, 1ull, __ATOMIC_RELAXED);
+}
+#endif
+
+void guest_frame_checkpoint(void){
+#if NFS_FULL_RUNTIME && TARGET_OS_IPHONE
+    guest_poll_handoff();
+#endif
+}
 /* Buyuk kilidi birakarak uyu (win32.c: oyunun kare bekleme dongusu). */
 uint64_t g_sleep_late_ns, g_sleep_gil_ns, g_sleep_n;    /* tani: uyku gecikmesi / kilit bekleme */
 /* nanosleep macOS'ta zamanlayici birlestirme payiyla uyaniyor: oyunda 3 ms
@@ -433,7 +575,6 @@ void frame_pace(void){
 #define MAXCS 512
 static struct { uint32_t key; pthread_mutex_t m; int used; } g_cs[MAXCS];
 static pthread_mutex_t g_cs_tab = PTHREAD_MUTEX_INITIALIZER;
-static _Thread_local int tl_cs_depth = 0;
 uint64_t g_cs_enter = 0, g_cs_contended = 0;
 
 static int cs_disabled(void){
@@ -492,6 +633,18 @@ static uint32_t cur_tid(CPU *c){
 }
 
 void guest_fair_yield(void){
+#if NFS_FULL_RUNTIME && TARGET_OS_IPHONE
+    static _Thread_local uint32_t polls = 0;
+    ++polls;
+    /* Keep lifecycle progress even in import-only loops with no queued worker.
+     * The old yield path checked pause every 1024 imports outside the GIL. */
+    if ((polls & 0x3FFu) == 0 && tl_guest_owned && !tl_cs_depth){
+        guest_yield_begin();
+        nfs_game_session_checkpoint();
+        guest_yield_end();
+    }
+    if ((polls & 0x7Fu) == 0) guest_poll_handoff();
+#else
     if (tl_cs_depth) return;          /* kritik bolum icinde sira verme */
     static _Thread_local uint32_t n = 0;
     if ((++n & 0x3FFu) != 0) return;          /* her 1024 cagrida bir */
@@ -512,6 +665,7 @@ void guest_fair_yield(void){
     nfs_game_session_checkpoint();
 #endif
     guest_yield_end();
+#endif
 }
 
 static uint32_t obj_new(ObKind k){
@@ -530,6 +684,82 @@ static Obj *obj_get(uint32_t h){
     if (h < H_BASE || h >= H_BASE+OBJ_MAX) return 0;
     uint32_t i = h - H_BASE;
     return g_obj[i].kind ? &g_obj[i] : 0;
+}
+
+/* WaitForSingleObject uses a realtime-clock condition variable. Keep one
+ * absolute deadline for finite waits, but cap each sleep so process exit is
+ * still observed during INFINITE waits (and long finite waits). */
+#define WIN32_WAIT_INFINITE 0xFFFFFFFFu
+#define WIN32_WAIT_EXIT_POLL_MS 2000u
+#define WIN32_WAIT_FAILED 0xFFFFFFFFu
+#define WIN32_ERROR_GEN_FAILURE 31u
+
+static int win32_wait_timespec_cmp(const struct timespec *a,
+                                   const struct timespec *b){
+    if (a->tv_sec != b->tv_sec) return a->tv_sec < b->tv_sec ? -1 : 1;
+    if (a->tv_nsec != b->tv_nsec) return a->tv_nsec < b->tv_nsec ? -1 : 1;
+    return 0;
+}
+
+static int win32_wait_deadline_after_ms(struct timespec *deadline,
+                                        uint32_t ms){
+    if (!deadline || clock_gettime(CLOCK_REALTIME, deadline) != 0) return 0;
+    uint32_t seconds = ms / 1000u;
+    long nanoseconds = deadline->tv_nsec + (long)(ms % 1000u) * 1000000L;
+    if (nanoseconds >= 1000000000L){
+        ++seconds;
+        nanoseconds -= 1000000000L;
+    }
+    /* ms is 32-bit, so its seconds conversion above is also 32-bit. Guard
+     * the eventual time_t addition on legacy narrower time_t targets. */
+    if (sizeof(time_t) <= sizeof(uint64_t)){
+        const int is_signed = (time_t)-1 < (time_t)0;
+        const unsigned width = (unsigned)(sizeof(time_t) * CHAR_BIT);
+        const unsigned value_bits = width - (is_signed ? 1u : 0u);
+        uint64_t max_seconds = UINT64_MAX;
+        if (value_bits < 64u)
+            max_seconds = (UINT64_C(1) << value_bits) - 1u;
+        const uint64_t now_seconds = (uint64_t)deadline->tv_sec;
+        if (now_seconds > max_seconds ||
+            (uint64_t)seconds > max_seconds - now_seconds) return 0;
+    }
+    deadline->tv_sec += (time_t)seconds;
+    deadline->tv_nsec = nanoseconds;
+    return 1;
+}
+
+static int win32_wait_deadline_expired(const struct timespec *deadline){
+    struct timespec now;
+    if (!deadline || clock_gettime(CLOCK_REALTIME, &now) != 0) return -1;
+    return win32_wait_timespec_cmp(&now, deadline) >= 0;
+}
+
+static int win32_wait_next_chunk(struct timespec *wake_deadline,
+                                 const struct timespec *deadline,
+                                 int finite){
+    if (!win32_wait_deadline_after_ms(wake_deadline,
+                                     WIN32_WAIT_EXIT_POLL_MS)) return 0;
+    if (finite && win32_wait_timespec_cmp(deadline, wake_deadline) < 0)
+        *wake_deadline = *deadline;
+    return 1;
+}
+
+static int win32_wait_cond_step(Obj *o, const struct timespec *deadline,
+                               int finite){
+    struct timespec wake_deadline;
+    if (!win32_wait_next_chunk(&wake_deadline, deadline, finite)) return -1;
+    int rc = pthread_cond_timedwait(&o->cv, &o->mtx, &wake_deadline);
+    if (rc != 0 && rc != ETIMEDOUT) return -1;
+    return 0;
+}
+
+static int win32_wait_object_signaled(const Obj *o){
+    return o->kind == OB_SEM ? o->signaled > 0 : o->signaled != 0;
+}
+
+static void win32_wait_object_consume(Obj *o){
+    if (o->kind == OB_SEM) --o->signaled;
+    else if (o->kind != OB_THREAD && !o->manual) o->signaled = 0;
 }
 
 /* ---- guest thread ---- */
@@ -1029,8 +1259,20 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
           uint32_t tid = cur_tid(c);
           if (h>=H_BASE && h<H_BASE+64){ g_wstat[h-H_BASE].waits++;
                                          g_wstat[h-H_BASE].waiter_tid = tid; }
-          static int sh=0;
+          static unsigned sh=0;
           if (++sh % 400 == 0){
+#if NFS_FULL_RUNTIME
+            stall_checkpoint();
+#endif
+            /* Full handle tables produced thousands of synchronous writes
+             * during normal play. Keep them available for an explicit capture;
+             * routine performance summaries are emitted by the session logger. */
+            static int waitlog = -1;
+            if (waitlog < 0){
+                const char *value = getenv("WAITLOG");
+                waitlog = value && *value && *value != '0';
+            }
+            if (waitlog){
             fprintf(stderr,"  [olay] wall_ms=%llu handle tur sinyal bekleme SetEvent bekleyen-tid setter-tid owner rec state\n",
                     (unsigned long long)diagnostic_wall_ms());
             for (int i=0;i<64;i++) if (g_wstat[i].waits || g_wstat[i].sets){
@@ -1053,9 +1295,7 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                         g_wstat[i].waiter_tid, g_wstat[i].setter_tid,
                         owner, rec, manual, state);
             }
-#if NFS_FULL_RUNTIME
-            stall_checkpoint();
-#endif
+            }
           } }
         if(!o){ r=0; }
         else if (o->kind == OB_MUTEX){
@@ -1063,13 +1303,17 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
              * alabilmeli; yoksa oyunun ic ice kilit alan CRT sarmalayicisi
              * kendi kendini kilitliyor (video oynatici boyle donuyordu). */
             uint32_t me = cur_tid(c);
+            const int finite = ms != WIN32_WAIT_INFINITE;
+            struct timespec deadline;
+            int deadline_ok = !finite || !ms ||
+                win32_wait_deadline_after_ms(&deadline, ms);
             guest_yield_begin();
             pthread_mutex_lock(&o->mtx);
             if (o->owner_tid == me && o->rec > 0){
                 o->rec++; r = 0;                       /* WAIT_OBJECT_0 */
             } else {
-                struct timespec ts;
                 int timed_out = 0;
+                int wait_failed = 0;
                 int process_exit_pending = win32_exit_requested();
                 while (!process_exit_pending && !o->signaled && !timed_out){
                     if (win32_exit_requested()){
@@ -1077,43 +1321,79 @@ int win32_ext_call(CPU *c, const char *n, uint32_t *out){
                         break;
                     }
                     if (!ms){ timed_out = 1; break; }
-                    clock_gettime(CLOCK_REALTIME,&ts);
-                    uint32_t wait = (ms==0xFFFFFFFFu)? 2000u : (ms>2000u?2000u:ms);
-                    ts.tv_sec += wait/1000; ts.tv_nsec += (long)(wait%1000)*1000000L;
-                    if(ts.tv_nsec>=1000000000L){ts.tv_sec++;ts.tv_nsec-=1000000000L;}
-                    if (pthread_cond_timedwait(&o->cv,&o->mtx,&ts) != 0 &&
-                        ms != 0xFFFFFFFFu) timed_out = 1;
+                    if (finite){
+                        if (!deadline_ok){ wait_failed = 1; break; }
+                        int expired = win32_wait_deadline_expired(&deadline);
+                        if (expired < 0){ wait_failed = 1; break; }
+                        if (expired){ timed_out = 1; break; }
+                    }
+                    if (win32_wait_cond_step(o, &deadline, finite) != 0){
+                        wait_failed = 1;
+                        break;
+                    }
                     if (win32_exit_requested()){
                         process_exit_pending = 1;
                         break;
                     }
-                    if (ms != 0xFFFFFFFFu) break;
                 }
                 if (!process_exit_pending && o->signaled){
                     o->signaled = 0; o->owner_tid = me; o->rec = 1; r = 0;
                 }
-                else r = 0x102u;                        /* WAIT_TIMEOUT */
+                else r = wait_failed ? WIN32_WAIT_FAILED : 0x102u;
+                if (!process_exit_pending && win32_exit_requested())
+                    process_exit_pending = 1;
+                if (process_exit_pending) r = 0x102u;
             }
             /* A scope jump is safe only after releasing this object mutex and
              * restoring the guest lock expected by the worker's cleanup. */
             pthread_mutex_unlock(&o->mtx);
             guest_yield_end();
             win32_exit_checkpoint(c);
+            if (r == WIN32_WAIT_FAILED)
+                win32_set_last_error(c, WIN32_ERROR_GEN_FAILURE);
         }
         else {
+            const int finite = ms != WIN32_WAIT_INFINITE;
+            struct timespec deadline;
+            int deadline_ok = !finite || !ms ||
+                win32_wait_deadline_after_ms(&deadline, ms);
+            int process_exit_pending = 0;
+            int wait_failed = 0;
             guest_yield_begin();
             pthread_mutex_lock(&o->mtx);
-            if(!o->signaled && ms){
-                struct timespec ts; clock_gettime(CLOCK_REALTIME,&ts);
-                uint32_t wait = (ms==0xFFFFFFFFu)? 2000u : (ms>2000u?2000u:ms);
-                ts.tv_sec += wait/1000; ts.tv_nsec += (long)(wait%1000)*1000000L;
-                if(ts.tv_nsec>=1000000000L){ts.tv_sec++;ts.tv_nsec-=1000000000L;}
-                pthread_cond_timedwait(&o->cv,&o->mtx,&ts);
+            while (!win32_wait_object_signaled(o)){
+                if (!ms) break;
+                if (win32_exit_requested()){
+                    process_exit_pending = 1;
+                    break;
+                }
+                if (finite){
+                    if (!deadline_ok){ wait_failed = 1; break; }
+                    int expired = win32_wait_deadline_expired(&deadline);
+                    if (expired < 0){ wait_failed = 1; break; }
+                    if (expired) break;
+                }
+                if (win32_wait_cond_step(o, &deadline, finite) != 0){
+                    wait_failed = 1;
+                    break;
+                }
+                if (win32_exit_requested()){
+                    process_exit_pending = 1;
+                    break;
+                }
             }
-            r = o->signaled ? 0u : 0x102u;              /* WAIT_OBJECT_0 / WAIT_TIMEOUT */
-            if(o->signaled && !o->manual) o->signaled=0;
+            if (!process_exit_pending && win32_wait_object_signaled(o)){
+                r = 0u;                                 /* WAIT_OBJECT_0 */
+                win32_wait_object_consume(o);
+            } else r = wait_failed ? WIN32_WAIT_FAILED : 0x102u;
+            if (!process_exit_pending && win32_exit_requested())
+                process_exit_pending = 1;
+            if (process_exit_pending) r = 0x102u;
             pthread_mutex_unlock(&o->mtx);
             guest_yield_end();
+            if (process_exit_pending) win32_exit_checkpoint(c);
+            if (r == WIN32_WAIT_FAILED)
+                win32_set_last_error(c, WIN32_ERROR_GEN_FAILURE);
         } }
     /* --- thread --- */
     else if (!strcmp(n,"CreateThread")){

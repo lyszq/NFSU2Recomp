@@ -31,6 +31,7 @@
 #endif
 
 #if NFS_FULL_RUNTIME
+#include "guest_lock.h"
 extern void nfs_game_session_checkpoint(void);
 #endif
 
@@ -123,7 +124,36 @@ static _Atomic unsigned long long g_wait_frame_ns = 0;    /* ana: kare hazir ols
 static _Atomic long     g_frames_drawn  = 0;
 static _Atomic long     g_tris_drawn    = 0;
 static _Atomic long     g_tex_created   = 0, g_tex_uploaded = 0;
+static _Atomic uint64_t g_vs_library_count = 0, g_vs_library_ns = 0;
+static _Atomic uint64_t g_ps_library_count = 0, g_ps_library_ns = 0;
+static _Atomic uint64_t g_texture_upload_count = 0, g_texture_upload_ns = 0;
+static _Atomic uint64_t g_texture_upload_bytes = 0;
+static _Atomic uint64_t g_frame_interval_le_16667_us = 0;
+static _Atomic uint64_t g_frame_interval_le_33333_us = 0;
+static _Atomic uint64_t g_frame_interval_le_66667_us = 0;
+static _Atomic uint64_t g_frame_interval_gt_66667_us = 0;
+static _Atomic uint64_t g_frame_interval_max_us = 0;
+static _Atomic uint64_t g_prev_frame_commit_us = 0;
+static _Atomic uint64_t g_prev_guest_present_us = 0;
+static _Atomic uint64_t g_guest_present_interval_max_us = 0;
 static _Atomic int      g_should_quit   = 0;
+
+static uint64_t metal_monotonic_ns(void){
+    struct timespec ts = {0, 0};
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static uint64_t metal_elapsed_ns(uint64_t start_ns){
+    uint64_t end_ns = metal_monotonic_ns();
+    return start_ns && end_ns >= start_ns ? end_ns - start_ns : 0;
+}
+
+static void metal_atomic_max_u64(_Atomic uint64_t *dst, uint64_t value){
+    uint64_t old = atomic_load_explicit(dst, memory_order_relaxed);
+    while (old < value && !atomic_compare_exchange_weak_explicit(
+            dst, &old, value, memory_order_relaxed, memory_order_relaxed)) {}
+}
 
 /* --- fare durumu: on yuz fareyle geziliyor (DIMOUSESTATE2) --------------
  * DirectInput goreli hareket ister; mutlak konumu da GetCursorPos icin
@@ -732,6 +762,7 @@ static void pp_report(void){
                 g_pp_cat[i].f * sc / fr / 1e6, (double)g_pp_cat[i].n / fr); }
 }
 static _Atomic unsigned long long g_pass_n = 0, g_draw_n = 0;
+static _Atomic unsigned long long g_main_gpu_vs_draws = 0, g_main_cpu_vs_draws = 0;
 /* Render hedefi = doku kimligi | ((yuz+1) << 16).  Kup dokuda oyun ayni
  * dokunun ALTI YUZUNE ayri ayri ciziyor; yuz olmadan altisi ust uste
  * ayni yuzeye gidiyordu. */
@@ -859,8 +890,29 @@ static float    g_cur_aref   = 0.f;
 static float    g_cur_fog[4] = {0.f,0.f,0.f,0.f};
 static int      g_cur = 0;                 /* guest'in yazdigi tampon */
 static int      g_ready = -1;              /* ana thread'in cizecegi tampon */
+static uint64_t g_ready_serial = 0;        /* g_qlock altinda: bekleyen karenin kimligi */
 static pthread_mutex_t g_qlock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_qcond = PTHREAD_COND_INITIALIZER;
+/* Called with g_qlock held.  metal_present runs in guest execution on the
+ * full runtime, so release the guest lock while sleeping on the host condvar.
+ * The backend mutex must be dropped before restoring the guest lock (which
+ * can itself wait); the caller then rechecks g_ready/g_enc_rb under g_qlock. */
+static int metal_qcond_wait(int timed, const struct timespec *deadline){
+    int released = 0;
+#if NFS_FULL_RUNTIME
+    released = guest_host_wait_begin();
+#endif
+    int rc = timed ? pthread_cond_timedwait(&g_qcond, &g_qlock, deadline)
+                   : pthread_cond_wait(&g_qcond, &g_qlock);
+    if (released){
+        pthread_mutex_unlock(&g_qlock);
+#if NFS_FULL_RUNTIME
+        guest_host_wait_end(released);
+#endif
+        pthread_mutex_lock(&g_qlock);
+    }
+    return rc;
+}
 /* g_qcond: ana thread -> konuk ("kareni aldim").
  * g_rcond: konuk -> ana thread ("kare hazir").  Eskiden ana thread
  * 4 ms'lik nanosleep ile YOKLUYORDU; kare suresi histogrami tam 5 ms
@@ -995,8 +1047,9 @@ static void fb_put(id<MTLBuffer> b, const void *src, NSUInteger n){
  * Havuz TEK tampon: HD yakalama cekirdegi tum kayitlari tek baglamayla
  * okuyabilsin.  Yansilar yalnizca konuk thread'inde kurulur/dusurulur; ana
  * thread karenin teslim anindaki havuz nesnesini baglar (buyume eskisini
- * kopyalayip yenisine gecer, ofsetler degismez).  Bosalan bloklar ucustaki
- * kareler bitsin diye PF_DELAY kare sonra yeniden kullanilir. */
+ * kopyalayip yenisine gecer, ofsetler degismez). Bosalan bloklar en az
+ * PF_DELAY kare bekler; asil guvenlik, o araligi okuyabilen bekleyen ve
+ * GPU'daki karelerin tamamlanmis olmasina baglidir. */
 #define MIR_N     4096u             /* yansi tablosu (acik adresleme, 2^n) */
 #define MIR_TOMB  1u                /* silinmis yuva (konuk adresi asla 1 olmaz) */
 #define PF_N      4096
@@ -1005,9 +1058,13 @@ static void fb_put(id<MTLBuffer> b, const void *src, NSUInteger n){
 #define POOL_MAX  (768u << 20)
 static id<MTLBuffer> g_pool;        /* guncel havuz (degisimi g_qlock altinda) */
 static id<MTLBuffer> g_pool_fr[2];  /* karenin teslim anindaki havuz */
+/* g_qlock protects these serials, including the encoding-before-commit gap.
+ * Guest Presents can advance while the GPU is stalled, so g_gframe alone
+ * cannot prove that a shared-buffer range is safe to overwrite. */
+static uint64_t g_pool_inflight[NFB];
 static uint32_t g_pool_top = 0;
 static struct { uint32_t key, gen, off, size, imax, used; } g_mir[MIR_N];
-static struct { uint32_t off, size, at; } g_pf[PF_N];
+static struct { uint32_t off, size, at; uint64_t retired; } g_pf[PF_N];
 static int g_pfn = 0;
 static uint32_t g_gframe = 0;       /* konuk kare sayaci (metal_present) */
 static unsigned long g_mir_build = 0, g_mir_drop = 0, g_mir_live = 0, g_mir_full = 0;
@@ -1026,8 +1083,22 @@ static int pool_reserve(uint32_t top){
 }
 static int pool_alloc(uint32_t want, uint32_t *off, uint32_t *size){
     want = (want + 255u) & ~255u;
+    uint64_t safe_serial = 0;
+    int have_safe_serial = 0;
     for (int i = 0; i < g_pfn; i++){
         if (g_pf[i].size < want || g_gframe - g_pf[i].at < PF_DELAY) continue;
+        if (!have_safe_serial){
+            pthread_mutex_lock(&g_qlock);
+            safe_serial = g_ready_serial;
+            if (g_ready >= 0 && safe_serial) safe_serial--;
+            for (unsigned j = 0; j < NFB; j++){
+                uint64_t serial = g_pool_inflight[j];
+                if (serial && serial <= safe_serial) safe_serial = serial - 1u;
+            }
+            pthread_mutex_unlock(&g_qlock);
+            have_safe_serial = 1;
+        }
+        if (g_pf[i].retired > safe_serial) continue;
         *off = g_pf[i].off;
         if (g_pf[i].size - want >= 4096u){ *size = want; g_pf[i].off += want; g_pf[i].size -= want; }
         else { *size = g_pf[i].size; g_pf[i] = g_pf[--g_pfn]; }
@@ -1039,7 +1110,15 @@ static int pool_alloc(uint32_t want, uint32_t *off, uint32_t *size){
 }
 static void pool_free(uint32_t off, uint32_t size){
     if (!size) return;
-    if (g_pfn < PF_N){ g_pf[g_pfn].off = off; g_pf[g_pfn].size = size; g_pf[g_pfn].at = g_gframe; g_pfn++; }
+    if (g_pfn < PF_N){
+        /* Earlier draws in the unpublished guest frame may still reference
+         * this generation. Include that frame, not just the last Present. */
+        pthread_mutex_lock(&g_qlock);
+        uint64_t retired = g_ready_serial + 1u;
+        pthread_mutex_unlock(&g_qlock);
+        g_pf[g_pfn].off = off; g_pf[g_pfn].size = size;
+        g_pf[g_pfn].at = g_gframe; g_pf[g_pfn].retired = retired; g_pfn++;
+    }
 }
 static void mir_sweep(void){                 /* uzun suredir cizilmeyen yansilari dusur */
     for (unsigned i = 0; i < MIR_N; i++){
@@ -1174,22 +1253,44 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
  * HIC cizilmiyor ama govde onu ornekliyor (ps 265, asama 0): Reset
  * hedefleri birakinca Metal o bellegi yeni dokulara verebiliyor ve kup
  * eski dokunun copunu tasiyordu (kasitli copla dogrulandi: govdede gurultu). */
+#define TEX_ZERO_BSS_CAP (4u * 1024u * 1024u)
+/* Zero-initialized BSS: a shared, immutable-by-convention source for common
+ * base mips.  Keep this uninitialized and non-const so it does not occupy
+ * 4 MiB of initialized data in the executable. */
+static uint8_t g_tex_zero_bss[TEX_ZERO_BSS_CAP];
+
 static void tex_zero_all(id<MTLTexture> t, unsigned w, unsigned h, unsigned levels,
                          unsigned faces, unsigned blk, unsigned bpb){
     if (ENVC("NOTEXZERO")) { if (faces == 1) levels = 1; else return; }  /* tani: eski davranis */
+    void *shared_zero = NULL;
+    int shared_zero_owned = 0;
+    int shared_zero_attempted = 0;
     for (unsigned lv = 0; lv < levels; lv++){
         unsigned lw = w >> lv, lh = h >> lv;
         if (!lw) lw = 1; if (!lh) lh = 1;
         size_t row, rows;
         if (!blk || blk == 1){ row = (size_t)lw * (bpb ? bpb : 4); rows = lh; }
         else { row = (size_t)((lw + blk - 1) / blk) * bpb; rows = (lh + blk - 1) / blk; }
-        void *zero = calloc(1, row * rows);
-        if (!zero) return;
+        if (rows && row > SIZE_MAX / rows){
+            if (shared_zero_owned) free(shared_zero);
+            return;
+        }
+        size_t bytes = row * rows;
+        if (!shared_zero_attempted){
+            shared_zero_attempted = 1;
+            if (bytes <= sizeof g_tex_zero_bss) shared_zero = g_tex_zero_bss;
+            else { shared_zero = calloc(1, bytes); shared_zero_owned = shared_zero != NULL; }
+        }
+        /* All later mips are no larger than mip 0.  Reuse its zeroed storage;
+         * large textures retain the old allocation and per-mip fallback. */
+        void *zero = shared_zero ? shared_zero : calloc(1, bytes);
+        if (!zero){ if (shared_zero_owned) free(shared_zero); return; }
         for (unsigned f = 0; f < faces; f++)
             [t replaceRegion:MTLRegionMake2D(0,0,lw,lh) mipmapLevel:lv slice:f
                    withBytes:zero bytesPerRow:row bytesPerImage:0];
-        free(zero);
+        if (zero != shared_zero) free(zero);
     }
+    if (shared_zero_owned) free(shared_zero);
 }
 unsigned metal_create_texture(unsigned w, unsigned h, unsigned levels, unsigned d3dfmt){
     return metal_create_texture_ex(w, h, levels, d3dfmt, 0);
@@ -1197,6 +1298,7 @@ unsigned metal_create_texture(unsigned w, unsigned h, unsigned levels, unsigned 
 unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
                                  unsigned d3dfmt, unsigned is_rt){
     if (!g_dev || g_texn >= MAXTEX) return 0;
+    @autoreleasepool {
     unsigned blk, bpb;
     uint32_t fallback_fmt = 0;
     MTLPixelFormat pf = d3dfmt_texture_storage(d3dfmt, &blk, &bpb,
@@ -1224,6 +1326,7 @@ unsigned metal_create_texture_ex(unsigned w, unsigned h, unsigned levels,
     g_tex_isrt[id_] = is_rt ? 1 : 0;
     atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
     return id_;
+    }
 }
 /* Guest (Reset): simdiye kadarki render hedefleri olu. */
 void metal_reset_rts(void){
@@ -3143,6 +3246,7 @@ static int pass_clear_only(int rb, unsigned i){
 unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
                                    unsigned d3dfmt, unsigned is_rt){
     if (!g_dev || g_texn >= MAXTEX) return 0;
+    @autoreleasepool {
     unsigned blk, bpb;
     uint32_t fallback_fmt = 0;
     MTLPixelFormat pf = d3dfmt_texture_storage(d3dfmt, &blk, &bpb,
@@ -3172,6 +3276,7 @@ unsigned metal_create_texture_cube(unsigned edge, unsigned levels,
     g_tex_isrt[id_] = is_rt ? 1 : 0;
     atomic_fetch_add(&g_tex_created, 1); if (g_perflog) perflog_event(PL_TEX, 0, 0);
     return id_;
+    }
 }
 int metal_tex_is_cube(unsigned id_){
     return (id_ && id_ < MAXTEX) ? g_tex_cube[id_] : 0;
@@ -3201,6 +3306,7 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
         return;
     }
 
+    uint64_t upload_started_ns = metal_monotonic_ns();
     const void *upload_data = data;
     size_t upload_pitch = pitch;
     unsigned upload_rows = (blk == 1u) ? lh : (lh + blk - 1u) / blk;
@@ -3272,6 +3378,12 @@ void metal_upload_texture_face(unsigned id_, unsigned level, unsigned face,
         perflog_event(PL_TEXUP, (uint64_t)(_u1.tv_sec - _u0.tv_sec) * 1000000000ull + (uint64_t)_u1.tv_nsec - (uint64_t)_u0.tv_nsec,
                       (uint64_t)upload_size); }
     if (level < 16u) g_tex_lvlmask[id_] |= 1u << level;
+    atomic_fetch_add_explicit(&g_texture_upload_count, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_texture_upload_ns,
+                              metal_elapsed_ns(upload_started_ns),
+                              memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_texture_upload_bytes, (uint64_t)upload_size,
+                              memory_order_relaxed);
     atomic_fetch_add(&g_tex_uploaded, 1);
 }
 void metal_upload_texture(unsigned id_, unsigned level, const void *data,
@@ -3740,7 +3852,11 @@ void metal_register_vs(int vsid, const char *msl){
                          [NSString stringWithUTF8String:msl]];
         NSError *err = nil;
         struct timespec _c0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_c0);
+        uint64_t compile_started_ns = metal_monotonic_ns();
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&err];
+        uint64_t compile_elapsed_ns = metal_elapsed_ns(compile_started_ns);
+        atomic_fetch_add_explicit(&g_vs_library_count, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_vs_library_ns, compile_elapsed_ns, memory_order_relaxed);
         if (g_perflog){ struct timespec _c1; clock_gettime(CLOCK_MONOTONIC, &_c1);
             perflog_event(PL_VS, (uint64_t)(_c1.tv_sec - _c0.tv_sec) * 1000000000ull + (uint64_t)_c1.tv_nsec - (uint64_t)_c0.tv_nsec, 0); }
         if (!lib){
@@ -4155,7 +4271,11 @@ void metal_register_ps(int psid, const char *msl){
                          [NSString stringWithUTF8String:msl]];
         NSError *err = nil;
         struct timespec _c0; if (g_perflog) clock_gettime(CLOCK_MONOTONIC, &_c0);
+        uint64_t compile_started_ns = metal_monotonic_ns();
         id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&err];
+        uint64_t compile_elapsed_ns = metal_elapsed_ns(compile_started_ns);
+        atomic_fetch_add_explicit(&g_ps_library_count, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_ps_library_ns, compile_elapsed_ns, memory_order_relaxed);
         if (g_perflog){ struct timespec _c1; clock_gettime(CLOCK_MONOTONIC, &_c1);
             perflog_event(PL_PS, (uint64_t)(_c1.tv_sec - _c0.tv_sec) * 1000000000ull + (uint64_t)_c1.tv_nsec - (uint64_t)_c0.tv_nsec, 0); }
         if (!lib){
@@ -4246,6 +4366,12 @@ void metal_clear_target_ex(unsigned argb, unsigned flags, float z){
 }
 
 void metal_present(void){
+    uint64_t present_us = metal_monotonic_ns() / 1000ull;
+    uint64_t previous_present_us = atomic_exchange_explicit(
+        &g_prev_guest_present_us, present_us, memory_order_relaxed);
+    if (previous_present_us && present_us >= previous_present_us)
+        metal_atomic_max_u64(&g_guest_present_interval_max_us,
+                             present_us - previous_present_us);
 #if NFS_FULL_RUNTIME
     nfs_game_session_checkpoint();
 #endif
@@ -4256,7 +4382,9 @@ void metal_present(void){
      * (kullanicinin gordugu "siyah olup geliyor" hatasi).               */
     int dropped = 0;
     if (g_ready >= 0){
-        struct timespec ts, _w0; clock_gettime(CLOCK_MONOTONIC,&_w0);
+        uint64_t wait_started_ns = metal_monotonic_ns();
+        uint64_t wait_serial = g_ready_serial;
+        struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_nsec += 60L * 1000000L;             /* en fazla 60 ms */
         if (ts.tv_nsec >= 1000000000L){ ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
@@ -4265,8 +4393,24 @@ void metal_present(void){
             /* Sure doldu ama ana thread onceki kareyi hala KODLUYOR: birakma,
              * bekle.  Takas g_cur'u onun okudugu tampona cevirirdi (bkz.
              * g_enc_rb).  Kodlama biter bitmez sinyal gelir. */
-            if (late && g_enc_rb >= 0){ pthread_cond_wait(&g_qcond, &g_qlock); continue; }
-            if (pthread_cond_timedwait(&g_qcond, &g_qlock, &ts) != 0){
+            int timed = !(late && g_enc_rb >= 0);
+            int wait_rc = metal_qcond_wait(timed, timed ? &ts : NULL);
+            /* We may have dropped the guest lock after the condvar woke, so
+             * decide timeout/drop only from the state revalidated under qlock. */
+            if (g_ready < 0) continue;
+            /* A second guest producer can replace the pending frame while
+             * this wait has yielded the GIL. Give each new serial its own
+             * 60 ms window, including after the late/indefinite wait path. */
+            if (g_ready_serial != wait_serial){
+                wait_serial = g_ready_serial;
+                late = 0;
+                clock_gettime(CLOCK_REALTIME, &ts);
+                ts.tv_nsec += 60L * 1000000L;
+                if (ts.tv_nsec >= 1000000000L){ ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+                continue;
+            }
+            if (!timed) continue;
+            if (wait_rc != 0){
                 if (g_enc_rb >= 0){
                     if (!late){ late = 1;
                         unsigned long n = atomic_fetch_add(&g_enc_late, 1ul);
@@ -4278,13 +4422,11 @@ void metal_present(void){
                 break;                             /* takilmayalim */
             }
         }
-        { struct timespec _w1; clock_gettime(CLOCK_MONOTONIC,&_w1);
-          atomic_fetch_add(&g_wait_present_ns,
-            (unsigned long long)(_w1.tv_sec-_w0.tv_sec)*1000000000ull
-            + (unsigned long long)_w1.tv_nsec - (unsigned long long)_w0.tv_nsec); }
+        atomic_fetch_add(&g_wait_present_ns, metal_elapsed_ns(wait_started_ns));
     }
     g_pool_fr[g_cur] = g_pool;       /* bu karenin indisli cizimleri bu havuzda */
     g_gframe++;
+    g_ready_serial++;
     g_ready = g_cur;                 /* ana thread bu tamponu cizsin */
     g_cur ^= 1;                      /* guest digerine yazmaya devam etsin */
     /* bkz. SIRALI DOKU YUKLEME: atlanan (hic kodlanmayan) karenin yuklemeleri kaybolmasin */
@@ -4311,6 +4453,34 @@ void metal_present(void){
 
 long metal_frames_dropped(void){ return atomic_load(&g_frames_dropped); }
 unsigned long long metal_wait_present_ns(void){ return atomic_load(&g_wait_present_ns); }
+void metal_runtime_perf_snapshot(MetalRuntimePerfSnapshot *snapshot){
+    if (!snapshot) return;
+    snapshot->frames_committed = (uint64_t)atomic_load_explicit(&g_frames_drawn,memory_order_relaxed);
+    snapshot->vs_library_count = atomic_load_explicit(&g_vs_library_count, memory_order_relaxed);
+    snapshot->vs_library_ns = atomic_load_explicit(&g_vs_library_ns, memory_order_relaxed);
+    snapshot->ps_library_count = atomic_load_explicit(&g_ps_library_count, memory_order_relaxed);
+    snapshot->ps_library_ns = atomic_load_explicit(&g_ps_library_ns, memory_order_relaxed);
+    snapshot->texture_upload_count = atomic_load_explicit(&g_texture_upload_count, memory_order_relaxed);
+    snapshot->texture_upload_ns = atomic_load_explicit(&g_texture_upload_ns, memory_order_relaxed);
+    snapshot->texture_upload_bytes = atomic_load_explicit(&g_texture_upload_bytes, memory_order_relaxed);
+    snapshot->frame_interval_le_16667_us = atomic_load_explicit(&g_frame_interval_le_16667_us, memory_order_relaxed);
+    snapshot->frame_interval_le_33333_us = atomic_load_explicit(&g_frame_interval_le_33333_us, memory_order_relaxed);
+    snapshot->frame_interval_le_66667_us = atomic_load_explicit(&g_frame_interval_le_66667_us, memory_order_relaxed);
+    snapshot->frame_interval_gt_66667_us = atomic_load_explicit(&g_frame_interval_gt_66667_us, memory_order_relaxed);
+    snapshot->frame_interval_max_us = atomic_load_explicit(&g_frame_interval_max_us, memory_order_relaxed);
+    snapshot->guest_present_interval_max_us = atomic_load_explicit(&g_guest_present_interval_max_us, memory_order_relaxed);
+    snapshot->next_drawable_ns = atomic_load_explicit(&g_wait_drawable_ns, memory_order_relaxed);
+    snapshot->encode_ns = atomic_load_explicit(&g_enc_ns, memory_order_relaxed);
+    snapshot->guest_present_wait_ns = atomic_load_explicit(&g_wait_present_ns, memory_order_relaxed);
+    snapshot->frames_dropped = (uint64_t)atomic_load_explicit(&g_frames_dropped, memory_order_relaxed);
+    snapshot->main_gpu_vs_draws = atomic_load_explicit(&g_main_gpu_vs_draws, memory_order_relaxed);
+    snapshot->main_cpu_vs_draws = atomic_load_explicit(&g_main_cpu_vs_draws, memory_order_relaxed);
+#if TARGET_OS_IPHONE
+    snapshot->gpu_ring_busy_skips = atomic_load_explicit(&g_fb_gpu_busy_skips, memory_order_relaxed);
+#else
+    snapshot->gpu_ring_busy_skips = 0;
+#endif
+}
 int metal_thermal_state(void){ return (int)[[NSProcessInfo processInfo] thermalState]; }
 
 /* PERFLOG ekran goruntusu: drawable'in tam boy kopyasi; tamamlaninca arka plan
@@ -4620,7 +4790,8 @@ static MTLBlendOperation d3d_blendop(unsigned op){
     }
 }
 
-static id<MTLRenderPipelineState> pso_for(uint64_t key){
+static id<MTLRenderPipelineState> pso_for(uint64_t key, int *cacheable){
+    if (cacheable) *cacheable = 0;
     ++g_pso_lookups;
     if (!g_psomap_degraded){
         size_t lookup_probes = 0;
@@ -4631,6 +4802,7 @@ static id<MTLRenderPipelineState> pso_for(uint64_t key){
         g_pso_probes += lookup_probes;
         if (cached){
             ++g_pso_hits;
+            if (cacheable) *cacheable = 1;
             return g_psocache[(unsigned)cached - 1u].pso;
         }
     } else {
@@ -4639,6 +4811,7 @@ static id<MTLRenderPipelineState> pso_for(uint64_t key){
             ++g_pso_probes;
             if (g_psocache[i].key == key){
                 ++g_pso_hits;
+                if (cacheable) *cacheable = 1;
                 return g_psocache[i].pso;
             }
         }
@@ -4713,14 +4886,17 @@ static id<MTLRenderPipelineState> pso_for(uint64_t key){
                                                   key, (uint16_t)(g_pson + 1u),
                                                   &existing, NULL, NULL);
         if (inserted == NFS_PIPELINE_CACHE_DUPLICATE && existing &&
-            existing <= g_pson)
+            existing <= g_pson){
+            if (cacheable) *cacheable = 1;
             return g_psocache[(unsigned)existing - 1u].pso;
+        }
         if (inserted != NFS_PIPELINE_CACHE_INSERTED){
             g_psomap_degraded = 1;
             fprintf(stderr, "metal: PSO hash index unavailable; falling back to dense lookup\n");
         }
     }
     g_pson++;
+    if (cacheable) *cacheable = 1;
     return ps;
 }
 
@@ -4845,7 +5021,7 @@ static int fb_plan(int rb, uint8_t *role, unsigned n){
 /* zincir [s, e]: ek 0 = ilk kaydin hedefi (TA), ek 1 = ilk kaydin girdisi (TB).
  * Durum baglama ana dongudeki kurallarla ayni (ornekleyici, sabitler, dokular,
  * kose tamponlari, UV OLCEGI); asama 0 karo belleginden gelir. */
-static id<MTLRenderPipelineState> pso_for(uint64_t key);
+static id<MTLRenderPipelineState> pso_for(uint64_t key, int *cacheable);
 static int alfavar_mode(void);
 /* FBZINCIR=2 + FBZCTRL=1 (tani): ayni yardimci, ama her kayit KENDI gecisinde ve
  * NORMAL boru hattiyla (asama 0 dokudan).  Ana donguyle birebir olmali; olmazsa
@@ -4873,7 +5049,7 @@ static void fb_encode_ctrl(id<MTLCommandBuffer> cb, int rb, unsigned s, unsigned
         [enc setDepthStencilState:dss_for(0)];
         uint64_t k2 = (uint64_t)(dr->blend & 0xFFFFFu) | ((uint64_t)(dr->ps & 0xFFF) << 20) | ((uint64_t)(dr->vsid & 0xFFF) << 32);
         if (alfavar_mode() && !(dr->alpha_ref > 0.f)) k2 |= 1ull << 52;
-        [enc setRenderPipelineState:pso_for(k2)];
+        [enc setRenderPipelineState:pso_for(k2, NULL)];
         [enc setCullMode:(dr->cull == 1u) ? MTLCullModeNone : (dr->cull == 2u) ? MTLCullModeFront : MTLCullModeBack];
         for (int si = 0; si < 4; si++) [enc setFragmentSamplerState:samp_for(dr->smp[si]) atIndex:si];
         { struct { float aref, usec, p0, p1; float proj[4]; float c[PSC_N][4]; float fogv[4]; } fp;
@@ -5297,6 +5473,7 @@ int metal_render_frame(void){
                         pthread_mutex_lock(&g_qlock);
                         int rb = g_ready;
                         g_enc_rb = rb;
+                        g_pool_inflight[fbi] = rb >= 0 ? g_ready_serial : 0;
                         /* Kilidi BURADA birak.  Eskiden tum kare kodlamasi
                          * boyunca (0.4-2 ms), sonra da kose kopyasi boyunca
                          * tutuluyordu; metal_draw_raw cizim basina ayni kilidi
@@ -5334,6 +5511,13 @@ int metal_render_frame(void){
                          * 532 baytlik sabit tamponu ve 4 doku KOSULSUZ baglaniyordu.
                          * Degismeyeni yeniden baglamak Metal'de bedava degil. */
                         id<MTLRenderPipelineState> c_pso = nil;
+                        uint64_t c_pso_key = 0;
+                        int c_pso_key_valid = 0; /* son sonuc PSO onbelleginde kaliciysa */
+                        /* Vertex bindings persist across draws/pipeline switches.  CPU-VS draws
+                         * leave slots 1/2 alone; invalidate only when a new encoder is made. */
+                        id<MTLBuffer> c_vbuf1 = nil, c_vbuf2 = nil;
+                        NSUInteger c_vbuf1off = 0, c_vbuf2off = 0;
+                        int c_vbuf1_valid = 0, c_vbuf2_valid = 0;
                         unsigned c_smp[4] = {~0u,~0u,~0u,~0u};
                         unsigned c_tex[4] = {~0u,~0u,~0u,~0u};
                         unsigned c_bcol = ~0u;
@@ -5640,6 +5824,9 @@ int metal_render_frame(void){
                             }
                             if (!nrep) fprintf(stderr,"  [sliver] kare %ld: hic bulunamadi\n", fno_pre);
                         }
+                        unsigned long long encoded_draws = 0;
+                        unsigned long long main_gpu_vs_draws = 0;
+                        unsigned long long main_cpu_vs_draws = 0;
                         if (rb >= 0 && g_pso){
                             for (unsigned i = 0; i <= g_dn[rb]; i++){
                                 /* FBZINCIR=2: eski yoldan cizilen zincir bitti -> ayni girdiyle
@@ -5684,16 +5871,26 @@ int metal_render_frame(void){
 #endif
                                     if (enc){ [enc endEncoding]; enc = nil; }
                                     cur_t = 0xFFFFFFFFu; cur_z = 0xFFFFFFFFu;
-                                    if (dr->tex && dr->tex < MAXTEX && g_tex[dr->tex] && g_fb_up[fbi] &&
-                                        dr->rawoff + dr->up_pitch <= g_fb_up[fbi].length){
-                                        id<MTLBlitCommandEncoder> bc = pp_blit(cb, "doku yukleme (sirali)");
-                                        [bc copyFromBuffer:g_fb_up[fbi] sourceOffset:dr->rawoff
-                                            sourceBytesPerRow:dr->up_pitch sourceBytesPerImage:0
-                                                   sourceSize:MTLSizeMake(dr->up_w, dr->up_h, 1)
-                                                    toTexture:g_tex[dr->tex] destinationSlice:dr->up_face
-                                             destinationLevel:dr->up_level destinationOrigin:MTLOriginMake(0, 0, 0)];
-                                        [bc endEncoding];
-                                    }
+                                    id<MTLBlitCommandEncoder> upload_enc = nil;
+                                    unsigned upload_end = i;
+                                    /* Batch only the adjacent upload run; copy order stays unchanged. */
+                                    do {
+                                        MDraw *up = &g_dbuf[rb][upload_end];
+                                        if (up->tex && up->tex < MAXTEX && g_tex[up->tex] && g_fb_up[fbi] &&
+                                            up->rawoff + up->up_pitch <= g_fb_up[fbi].length){
+                                            if (!upload_enc)
+                                                upload_enc = pp_blit(cb, "doku yukleme (sirali)");
+                                            if (upload_enc)
+                                                [upload_enc copyFromBuffer:g_fb_up[fbi] sourceOffset:up->rawoff
+                                                    sourceBytesPerRow:up->up_pitch sourceBytesPerImage:0
+                                                           sourceSize:MTLSizeMake(up->up_w, up->up_h, 1)
+                                                            toTexture:g_tex[up->tex] destinationSlice:up->up_face
+                                                     destinationLevel:up->up_level destinationOrigin:MTLOriginMake(0, 0, 0)];
+                                        }
+                                        upload_end++;
+                                    } while (upload_end < g_dn[rb] && g_dbuf[rb][upload_end].is_up);
+                                    if (upload_enc) [upload_enc endEncoding];
+                                    i = upload_end - 1;
                                     continue;
                                 }
                                 if (nfb && fbrole[i] == 1){
@@ -6232,7 +6429,10 @@ int metal_render_frame(void){
                                       [enc setVertexBytes:z4 length:sizeof z4 atIndex:3];
                                       c_uvb[0] = c_uvb[1] = 0.f; }
                                     /* yeni kodlayici = tum durum sifirlandi */
-                                    c_pso = nil; c_bcol = ~0u; c_depth = ~0u; c_fp_valid = 0;
+                                    c_pso = nil; c_pso_key_valid = 0;
+                                    c_vbuf1 = nil; c_vbuf1_valid = 0;
+                                    c_vbuf2 = nil; c_vbuf2_valid = 0;
+                                    c_bcol = ~0u; c_depth = ~0u; c_fp_valid = 0;
                                     c_cull = ~0u;
                                     /* D3D'de on yuz SAAT YONUNDEDIR.  CULLWIND=1
                                      * ile ters cevrilebilir (kose yolumuz Y'yi
@@ -6300,7 +6500,15 @@ int metal_render_frame(void){
 #if NFS_ENHANCED
                                   if (c_ms) k2 |= (uint64_t)hd_msaa_l2() << 50;   /* bkz. COZUNURLUGE GORE MSAA */
 #endif
-                                  id<MTLRenderPipelineState> ps2 = pso_for(k2);
+                                  id<MTLRenderPipelineState> ps2;
+                                  if (c_pso && c_pso_key_valid && k2 == c_pso_key){
+                                      ps2 = c_pso;
+                                  } else {
+                                      int cacheable = 0;
+                                      ps2 = pso_for(k2, &cacheable);
+                                      c_pso_key = k2;
+                                      c_pso_key_valid = cacheable;
+                                  }
                                   if (ps2 != c_pso){ c_pso = ps2;
                                       [enc setRenderPipelineState:ps2]; } }
                                 /* BLENDFACTOR: boru hattinin degil kodlayicinin
@@ -6367,11 +6575,17 @@ int metal_render_frame(void){
                                                            ? g_tex[tt] : g_white;
                                       [enc setFragmentTexture:txn atIndex:(NSUInteger)q4];
                                   } }
-                                atomic_fetch_add(&g_draw_n, 1ull);
+                                encoded_draws++;
+                                if (dr->vsid > 0) main_gpu_vs_draws++;
+                                else main_cpu_vs_draws++;
                                 if (dr->vsid > 0 && dr->ix_isz){
                                     id<MTLBuffer> pl = g_pool_fr[rb];
-                                    [enc setVertexBuffer:pl offset:dr->rawoff atIndex:1];
-                                    [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
+                                    if (!c_vbuf1_valid || c_vbuf1 != pl || c_vbuf1off != dr->rawoff){
+                                        [enc setVertexBuffer:pl offset:dr->rawoff atIndex:1];
+                                        c_vbuf1 = pl; c_vbuf1off = dr->rawoff; c_vbuf1_valid = 1; }
+                                    if (!c_vbuf2_valid || c_vbuf2 != g_mtlkb || c_vbuf2off != dr->koff){
+                                        [enc setVertexBuffer:g_mtlkb offset:dr->koff atIndex:2];
+                                        c_vbuf2 = g_mtlkb; c_vbuf2off = dr->koff; c_vbuf2_valid = 1; }
                                     [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:dr->count
                                                      indexType:(dr->ix_isz == 4u) ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16
                                                    indexBuffer:pl indexBufferOffset:dr->ix_ib
@@ -6381,8 +6595,12 @@ int metal_render_frame(void){
                                         float u4[4] = { dr->uvb[0], dr->uvb[1], 0, 0 };
                                         [enc setVertexBytes:u4 length:sizeof u4 atIndex:3];
                                         c_uvb[0] = dr->uvb[0]; c_uvb[1] = dr->uvb[1]; }
-                                    [enc setVertexBuffer:g_mtlrvb offset:dr->rawoff atIndex:1];
-                                    [enc setVertexBuffer:g_mtlkb  offset:dr->koff   atIndex:2];
+                                    if (!c_vbuf1_valid || c_vbuf1 != g_mtlrvb || c_vbuf1off != dr->rawoff){
+                                        [enc setVertexBuffer:g_mtlrvb offset:dr->rawoff atIndex:1];
+                                        c_vbuf1 = g_mtlrvb; c_vbuf1off = dr->rawoff; c_vbuf1_valid = 1; }
+                                    if (!c_vbuf2_valid || c_vbuf2 != g_mtlkb || c_vbuf2off != dr->koff){
+                                        [enc setVertexBuffer:g_mtlkb offset:dr->koff atIndex:2];
+                                        c_vbuf2 = g_mtlkb; c_vbuf2off = dr->koff; c_vbuf2_valid = 1; }
                                     [enc drawPrimitives:MTLPrimitiveTypeTriangle
                                             vertexStart:0 vertexCount:dr->count];
                                 } else {
@@ -6395,6 +6613,11 @@ int metal_render_frame(void){
                                   if (g_dbuf[rb][i].vsid > 0) tt += (long)(g_dbuf[rb][i].count/3);
                               atomic_fetch_add(&g_tris_drawn, tt); }
                         }
+                        atomic_fetch_add_explicit(&g_draw_n, encoded_draws, memory_order_relaxed);
+                        atomic_fetch_add_explicit(&g_main_gpu_vs_draws, main_gpu_vs_draws,
+                                                  memory_order_relaxed);
+                        atomic_fetch_add_explicit(&g_main_cpu_vs_draws, main_cpu_vs_draws,
+                                                  memory_order_relaxed);
 #if NFS_ENHANCED
                         if (enc){ int pe = rb >= 0 ? hd_ms_end(enc, rb, g_dn[rb], c_ms, c_gb, c_att) : 0;
                                   [enc endEncoding]; enc = nil;
@@ -6496,6 +6719,9 @@ int metal_render_frame(void){
                                 unsigned long ne = atomic_fetch_add(&g_cb_err, 1ul);
                                 if (ne < 5) fprintf(stderr, "metal: KOMUT TAMPONU HATASI: %s\n",
                                                     [[b2.error localizedDescription] UTF8String]); }
+                            pthread_mutex_lock(&g_qlock);
+                            g_pool_inflight[fbi] = 0;
+                            pthread_mutex_unlock(&g_qlock);
                             fb_release(fbi);        /* GPU bitti: takim yeniden kullanilabilir */
                             double g = (b2.GPUEndTime - b2.GPUStartTime) * 1e9;
                             if (g > 0.0 && g < 1e9){
@@ -6512,6 +6738,25 @@ int metal_render_frame(void){
                             } }];
                         [cb presentDrawable:d];
                         [cb commit];
+                        uint64_t commit_us = metal_monotonic_ns() / 1000ull;
+                        uint64_t previous_commit_us = atomic_exchange_explicit(
+                            &g_prev_frame_commit_us, commit_us, memory_order_relaxed);
+                        if (previous_commit_us && commit_us >= previous_commit_us){
+                            uint64_t interval_us = commit_us - previous_commit_us;
+                            if (interval_us <= 16667u)
+                                atomic_fetch_add_explicit(&g_frame_interval_le_16667_us, 1,
+                                                          memory_order_relaxed);
+                            else if (interval_us <= 33333u)
+                                atomic_fetch_add_explicit(&g_frame_interval_le_33333_us, 1,
+                                                          memory_order_relaxed);
+                            else if (interval_us <= 66667u)
+                                atomic_fetch_add_explicit(&g_frame_interval_le_66667_us, 1,
+                                                          memory_order_relaxed);
+                            else
+                                atomic_fetch_add_explicit(&g_frame_interval_gt_66667_us, 1,
+                                                          memory_order_relaxed);
+                            metal_atomic_max_u64(&g_frame_interval_max_us, interval_us);
+                        }
                         long fno = atomic_fetch_add(&g_frames_drawn, 1) + 1;
                         if (g_perflog){ struct timespec _p1; clock_gettime(CLOCK_MONOTONIC, &_p1);
                             perflog_render_frame(fno, pl_nt,

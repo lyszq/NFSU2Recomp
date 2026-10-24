@@ -31,6 +31,19 @@ __attribute__((weak)) void watch_report_change(uint32_t ip, uint32_t o, uint32_t
     (void)ip;(void)o;(void)n;
 }
 void mprot_arm(uint32_t);
+/* WATCHADDR is a startup diagnostic setting, like the other cached runtime
+ * environment options. Parse it once instead of scanning environ on every
+ * resource/guest-heap commit, including ordinary runs where it is absent. */
+static pthread_once_t g_commit_watch_once = PTHREAD_ONCE_INIT;
+static uint32_t g_commit_watch_target;
+static int g_commit_watch_enabled, g_commit_watch_done;
+static void commit_watch_init(void){
+    const char *value=getenv("WATCHADDR");
+    if (value){
+        g_commit_watch_target=(uint32_t)strtoul(value,0,0);
+        g_commit_watch_enabled=1;
+    }
+}
 void mem_init(void){
     int rc = guest_memory_init();
     if (rc){ errno = rc; perror("mmap 4GB"); exit(1); }
@@ -38,11 +51,9 @@ void mem_init(void){
 
 void mem_commit(uint32_t addr, uint32_t size){
     if (!size) return;
-    uint64_t lo = (uint64_t)addr & ~0x3FFFull;
     /* Preserve the desktop API's legacy clipping at the end of x86 space. */
     uint64_t length = size;
     if (length > GSZ - addr) length = GSZ - addr;
-    uint64_t hi = ((uint64_t)addr + length + 0x3FFFu) & ~0x3FFFull;
     int rc = guest_memory_commit(addr, length);
     if (rc){
         fprintf(stderr,"mem_commit 0x%08x+%u failed: %s\n", addr, size, strerror(rc));
@@ -50,12 +61,16 @@ void mem_commit(uint32_t addr, uint32_t size){
     }
     /* WATCHADDR=<adres>: o adres commit edilir edilmez watchpoint kur.
      * Boylece ilk yazan bile yakalanir. */
-    { static int wa_done = 0;
-      const char *wa = getenv("WATCHADDR");
-      if (wa && !wa_done){
-          uint32_t t = (uint32_t)strtoul(wa, 0, 0);
-          if ((uint64_t)t >= lo && (uint64_t)t < hi){ wa_done = 1; mprot_arm(t); }
-      } }
+    pthread_once(&g_commit_watch_once,commit_watch_init);
+    if (g_commit_watch_enabled &&
+        !__atomic_load_n(&g_commit_watch_done,__ATOMIC_RELAXED)){
+        uint64_t lo=(uint64_t)addr & ~0x3FFFull;
+        uint64_t hi=((uint64_t)addr+length+0x3FFFu) & ~0x3FFFull;
+        uint32_t t=g_commit_watch_target;
+        if ((uint64_t)t>=lo && (uint64_t)t<hi &&
+            !__atomic_exchange_n(&g_commit_watch_done,1,__ATOMIC_RELAXED))
+            mprot_arm(t);
+    }
 }
 uint64_t mem_committed(void){ return guest_memory_committed(); }
 

@@ -10,6 +10,8 @@
 #include <stdlib.h>
 #include <math.h>
 #include "audio.h"
+#include "guest_lock.h"
+#include "guest_memory.h"
 
 /* getenv() her cagrida ortam dizisini TARAR ve kilit alir.  Cizim basina
  * calisan yollarda (ornegin SetVertexShaderConstantF icindeki "PDLIST"
@@ -113,7 +115,87 @@ enum { IF_D3D9=1, IF_DEV, IF_TEX, IF_VB, IF_IB, IF_SURF, IF_SIMPLE,
        IF_VSHADER, IF_VDECL, IF_STATEBLOCK, IF_SWAPCHAIN, IF_QUERY,
        IF_DI8, IF_DIDEV, IF_DS, IF_DSBUF };
 
+/* Guest execution serializes this bounded host registry. Keep multiple locks
+ * per object, including identical/overlapping and out-of-order unlocks, without
+ * trusting guest memory for list links or allocating on the mixer path. */
+#define DS_LOCK_CAP 4096u
+#define DS_LOCK_BUCKETS 256u
+typedef struct {
+    uint32_t owner, p1, n1, p2, n2, next;
+} DSLock;
+static DSLock g_ds_locks[DS_LOCK_CAP + 1u];
+static uint32_t g_ds_lock_heads[DS_LOCK_BUCKETS], g_ds_lock_free;
+static int g_ds_lock_initialized;
+static uint32_t ds_lock_bucket(uint32_t owner){
+    return ((owner >> 4) ^ (owner >> 12)) & (DS_LOCK_BUCKETS - 1u);
+}
+static int ds_lock_add(uint32_t owner, uint32_t p1, uint32_t n1,
+                       uint32_t p2, uint32_t n2){
+    if (!g_ds_lock_initialized){
+        for (uint32_t i=1; i<DS_LOCK_CAP; ++i) g_ds_locks[i].next=i+1u;
+        g_ds_locks[DS_LOCK_CAP].next=0; /* Last usable slot, not a sentinel. */
+        g_ds_lock_free=1; g_ds_lock_initialized=1;
+    }
+    uint32_t i=g_ds_lock_free, h=ds_lock_bucket(owner);
+    if (!i) return 0;
+    g_ds_lock_free=g_ds_locks[i].next;
+    g_ds_locks[i]=(DSLock){owner,p1,n1,p2,n2,g_ds_lock_heads[h]};
+    g_ds_lock_heads[h]=i;
+    return 1;
+}
+static uint32_t ds_lock_match(uint32_t owner, uint32_t p1, uint32_t n1,
+                              uint32_t p2, uint32_t n2){
+    uint32_t best=0;
+    for (uint32_t i=g_ds_lock_heads[ds_lock_bucket(owner)]; i; i=g_ds_locks[i].next){
+        DSLock *l=&g_ds_locks[i];
+        if (l->owner==owner && l->p1==p1 && l->p2==p2 && n1<=l->n1 && n2<=l->n2 &&
+            (!best || (uint64_t)l->n1+l->n2 <
+                      (uint64_t)g_ds_locks[best].n1+g_ds_locks[best].n2)) best=i;
+    }
+    return best;
+}
+static void ds_lock_remove(uint32_t owner, uint32_t match){
+    uint32_t *link=&g_ds_lock_heads[ds_lock_bucket(owner)];
+    while (*link){
+        uint32_t i=*link;
+        if ((match && i==match) || (!match && g_ds_locks[i].owner==owner)){
+            *link=g_ds_locks[i].next;
+            g_ds_locks[i].next=g_ds_lock_free; g_ds_lock_free=i;
+            if (match) return;
+        } else link=&g_ds_locks[i].next;
+    }
+}
+static int ds_pcm_nonzero_sample(uint32_t p, uint32_t n){
+    uint32_t limit=n<4096u ? n : 4096u;
+    for (uint32_t i=0; i<limit; ++i) if (MR8(p+i)) return 1;
+    return 0;
+}
+
+/* Constant setters run under guest serialization. Check each covered 16 KiB
+ * granule once, then copy the readable whole-register prefix in one operation.
+ * No mutex per vector, float conversion, or speculative read across a hole.
+ * Callers cap count to their host register array before forming dst. */
+static void com_copy_constants(void *dst, uint32_t source,
+                               uint32_t count, uint32_t register_bytes){
+    if (!count || !g_mem) return;
+    uint64_t end=(uint64_t)source+(uint64_t)count*register_bytes;
+    if (end > GUEST_MEMORY_SIZE) end=GUEST_MEMORY_SIZE;
+    uint64_t cursor=source;
+    while (cursor<end && mem_is_committed((uint32_t)cursor)){
+        uint64_t next=(cursor | (GUEST_MEMORY_GRANULE-1u))+1u;
+        cursor=next<end ? next : end;
+    }
+    size_t bytes=(size_t)((cursor-source)/register_bytes)*register_bytes;
+    if (bytes) memcpy(dst,g_mem+source,bytes);
+}
+
+static int com_has_room(uint32_t iface, uint32_t extra){
+    uint64_t vtable_bytes=((uint64_t)g_if[iface].n*4u+15u)&~UINT64_C(15);
+    uint64_t object_bytes=((uint64_t)extra+4u+15u)&~UINT64_C(15);
+    return (uint64_t)com_ptr+vtable_bytes+object_bytes <= COM_MAX;
+}
 static uint32_t com_new(uint32_t iface, uint32_t extra){
+    if (!com_has_room(iface,extra)) return 0;
     unsigned n = g_if[iface].n;
     uint32_t vt = com_alloc(n*4u);
     for (unsigned i=0;i<n;i++) MR32(vt+4u*i) = COM_MAGIC | (iface<<16) | i;
@@ -317,6 +399,9 @@ uint32_t g_tss_raw[8][40] = {
     [6] = { [11] = 6u }, [7] = { [11] = 7u },
 };
 uint32_t g_smp_raw[16][20];
+/* Derived backend state changes only with these guest state tables. Initial
+ * bits and Reset force defaults to be published before the next draw. */
+static unsigned g_smp_pending = 15u, g_texproj_pending = 15u;
 
 /* Bu metot bir state block'a kaydedilir mi? */
 /* --- metot KIMLIGI ------------------------------------------------------
@@ -786,6 +871,7 @@ void draw_stats_save(uint64_t*,uint64_t*);
 /* Yeniden oynatma (state block Apply) sirasinda argumanlar guest yiginindan
  * degil kayittan gelir. */
 static const uint32_t *g_arg_ovr = 0;
+static _Thread_local unsigned g_com_depth;
 static uint32_t A(CPU*c,int i){
     if (g_arg_ovr) return g_arg_ovr[i & 7];
     return MR32(c->esp + 4u*(uint32_t)i);
@@ -864,11 +950,20 @@ static uint64_t g_gpuvs_draws = 0, g_gpuvs_fail = 0, g_gpuvs_drop = 0;
 
 static int gpuvs_id(const VSProg *prog, uint32_t vs, uint32_t decl,
                     const DElem *el, int nel){
+    /* Adjacent material draws often retain their shader/layout pair. Keys
+     * never change after slot allocation; read live state so an in-progress
+     * or failed entry retains exactly the existing dense-lookup behavior. */
+    static int last_slot=-1;
+    if (last_slot>=0 && g_gvs[last_slot].vs==vs && g_gvs[last_slot].decl==decl)
+        return g_gvs[last_slot].state>0 ? g_gvs[last_slot].gid : -1;
     for (int i = 0; i < g_gvsn; i++)
-        if (g_gvs[i].vs == vs && g_gvs[i].decl == decl)
+        if (g_gvs[i].vs == vs && g_gvs[i].decl == decl){
+            last_slot=i;
             return g_gvs[i].state > 0 ? g_gvs[i].gid : -1;
+        }
     if (g_gvsn >= MAXGVS || g_gvs_next >= MAXGVS) return -1;
     int slot = g_gvsn++;
+    last_slot=slot;
     g_gvs[slot].vs = vs; g_gvs[slot].decl = decl;
     g_gvs[slot].state = -1; g_gvs[slot].gid = 0;
 
@@ -1155,8 +1250,11 @@ static const VSConst *fixmat_apply(const VSConst *vsk){
  * Daha once tamami yok sayiliyor, her sey linear+mip-linear ciziliyordu. */
 static void smp_push(void){
     void metal_set_samplers(const unsigned k[4]);
-    unsigned k[4];
+    static unsigned k[4];
+    unsigned pending=g_smp_pending;
+    if (!pending) return;
     for (int st = 0; st < 4; st++){
+        if (!(pending & (1u << st))) continue;
         unsigned mn = g_smp_raw[st][6], mg = g_smp_raw[st][5], mp = g_smp_raw[st][7];
         unsigned au = g_smp_raw[st][1], av = g_smp_raw[st][2], an = g_smp_raw[st][10];
         if (mn < 1u || mn > 3u) mn = 2u;          /* gecersiz/kurulmamis -> LINEAR */
@@ -1170,12 +1268,16 @@ static void smp_push(void){
               | ((au & 7u) << 6) | ((av & 7u) << 9) | ((al & 7u) << 12);
     }
     metal_set_samplers(k);
+    g_smp_pending=0;
 }
 
 static void texproj_push(void){
     void metal_set_texproj(const float[4]);
-    float sel[4];
+    static float sel[4];
+    unsigned pending=g_texproj_pending;
+    if (!pending) return;
     for (int st = 0; st < 4; st++){
+        if (!(pending & (1u << st))) continue;
         unsigned ci  = g_tss_raw[st][11] & 0xFFFFu;
         unsigned ttf = g_tss_raw[st][24];
         if (ci > 3u) ci = (unsigned)st;
@@ -1194,6 +1296,7 @@ static void texproj_push(void){
         sel[st] = (float)(ci + 16u*(unsigned)pm);
     }
     metal_set_texproj(sel);
+    g_texproj_pending=0;
 }
 
 /* dip_indexed -> draw_up: bu cizimin koseleri havuzdaki yansilardan indisle
@@ -1219,7 +1322,8 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
      * kez).  Guvenli: bildirim nesneleri yaratilinca kopyalanip bir daha
      * degismiyor ve com_alloc adresleri yeniden kullanmiyor. */
     static struct { uint32_t decl; const VSProg *prog; int nel, p_off, p_type, c_off, c_type,
-                    t_off, t_type, ok; DElem el[16]; } dcc[64];
+                    t_off, t_type, ok; unsigned gpu_alignment_mask, gpu_extent;
+                    int gpu_layout_ok; DElem el[16]; } dcc[64];
     uint32_t d = g_cur_decl;
     unsigned dci = (unsigned)(((uintptr_t)prog >> 4) ^ (d >> 3) ^ (d >> 11)) & 63u;
     int dlog = ENVC("DECLLOG") != NULL;
@@ -1272,6 +1376,25 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
     dcc[dci].decl = d; dcc[dci].prog = prog; dcc[dci].nel = nel;
     dcc[dci].p_off = p_off; dcc[dci].p_type = p_type; dcc[dci].c_off = c_off;
     dcc[dci].c_type = c_type; dcc[dci].t_off = t_off; dcc[dci].t_type = t_type;
+    /* Generated MSL uses typed uint/short loads. Raw uploads align the buffer
+     * base, but an attribute offset or vertex stride can still misalign them.
+     * Validate this immutable layout once; unsupported/unaligned layouts keep
+     * the existing CPU path rather than relying on undefined GPU loads. */
+    unsigned alignment_mask=0, extent=0;
+    int gpu_layout_ok=1;
+    for (int k=0; k<nel; ++k){
+        unsigned type=el[k].type, size=0, mask=0;
+        if (type<=3u){ size=4u*(type+1u); mask=3u; }
+        else if (type==4u || type==5u || type==8u) size=4u;
+        else if (type==6u || type==9u || type==11u){ size=4u; mask=1u; }
+        else if (type==7u || type==10u || type==12u){ size=8u; mask=1u; }
+        else gpu_layout_ok=0;
+        if (el[k].off & mask) gpu_layout_ok=0;
+        alignment_mask |= mask;
+        if ((unsigned)el[k].off+size>extent) extent=(unsigned)el[k].off+size;
+    }
+    dcc[dci].gpu_alignment_mask=alignment_mask;
+    dcc[dci].gpu_extent=extent; dcc[dci].gpu_layout_ok=gpu_layout_ok;
     memcpy(dcc[dci].el, el, sizeof el); dcc[dci].ok = 1;
     }
     const DElem *el = dcc[dci].el; int nel = dcc[dci].nel;
@@ -1285,7 +1408,9 @@ static int draw_up(uint32_t pt, uint32_t nv, uint32_t vp, uint32_t stride){
      * bildiriminden alinip gölgelendiriciye gomulur.
      * Cevrilemeyen gölgelendirici (akis denetimi vb.) sessizce yanlis
      * calismaz: vs_to_msl 0 doner ve kanitlanmis CPU yoluna dusulur. */
-    if (prog && nel && stride && stride <= 256u && g_gpuvs){
+    if (prog && nel && stride && stride <= 256u && g_gpuvs &&
+        dcc[dci].gpu_layout_ok && !(stride & dcc[dci].gpu_alignment_mask) &&
+        stride >= dcc[dci].gpu_extent){
         int gid = gpuvs_id(prog, g_cur_vs, g_cur_decl, el, nel);
         if (gid > 0){
             int  metal_draw_raw(const void*, unsigned, unsigned, unsigned,
@@ -1821,12 +1946,13 @@ static void fxtr_dev(CPU *c, int iface, int mid, int nargs, const char *nm){
 }
 
 int com_call(CPU *c, uint32_t magic){
+    ++g_com_depth;
     uint32_t iface=(magic>>16)&0x1FFFu, m=magic&0xFFFFu;
     g_com_calls++;
     if (!g_sb_replay) POP32(c->eip);
     if (iface==0 || iface>=NEL(g_if) || m>=g_if[iface].n){
         fprintf(stderr,"  [COM] gecersiz arayuz/metot %u:%u\n", iface, m);
-        c->eax=0x80004001u; return 1;
+        c->eax=0x80004001u; --g_com_depth; return 1;
     }
     if (iface < MSTAT_IF && m < MSTAT_M) g_mstat[iface][m]++;
     const Method *M=&g_if[iface].m[m];
@@ -1892,6 +2018,7 @@ int com_call(CPU *c, uint32_t magic){
         } else g_sb_dropped++;
         c->eax = 0;
         c->esp += 4u*(uint32_t)nargs;
+        --g_com_depth;
         return 1;
     }
 
@@ -1924,6 +2051,7 @@ int com_call(CPU *c, uint32_t magic){
         }
         if (iface==IF_DSBUF){
             uint32_t self0=A(c,0);
+            ds_lock_remove(self0,0); /* Release discards all uncommitted locks. */
             if (self0 && mem_is_committed(self0+31) && MR32(self0+28)){
                 void audio_stop(int);
                 audio_stop((int)MR32(self0+28));
@@ -2069,7 +2197,10 @@ int com_call(CPU *c, uint32_t magic){
             r=0; }
         else if (MID(SetSamplerState)){
             uint32_t sm=A(c,1), ty=A(c,2), val=A(c,3);
-            if (sm < 16u && ty < 20u) g_smp_raw[sm][ty] = val;
+            if (sm < 16u && ty < 20u && g_smp_raw[sm][ty] != val){
+                g_smp_raw[sm][ty] = val;
+                if (sm<4u) g_smp_pending |= 1u << sm;
+            }
             if (ENVC("SMPLOG") && sm < 4u && ty < 20u){
                 static uint32_t seen[4][20];
                 if (seen[sm][ty] != val + 1u){ seen[sm][ty] = val + 1u;
@@ -2081,7 +2212,10 @@ int com_call(CPU *c, uint32_t magic){
             r=0; }
         else if (MID(SetTextureStageState)){
             uint32_t stg=A(c,1), ty=A(c,2), val=A(c,3);
-            if (stg < 8u && ty < 40u) g_tss_raw[stg][ty] = val;
+            if (stg < 8u && ty < 40u && g_tss_raw[stg][ty] != val){
+                g_tss_raw[stg][ty] = val;
+                if (stg<4u && (ty==11u || ty==24u)) g_texproj_pending |= 1u << stg;
+            }
             r=0; }
         else if (MID(SetTexture)){
             /* CUBELOG=1: kup dokunun gercekten baglanip baglanmadigini olc.
@@ -2247,11 +2381,8 @@ int com_call(CPU *c, uint32_t magic){
             static int sh=0;
             g_sc[g_scn & 7].sr = sr; g_sc[g_scn & 7].pd = pd;
             g_sc[g_scn & 7].n = n; g_scn++;
-            for (uint32_t k=0; k<n && sr+k<256; k++){
-                uint32_t o=pd+16u*k;
-                if (!mem_is_committed(o+15)) break;
-                memcpy(g_vsk.f[sr+k], g_mem+o, 16);
-            }
+            if (sr<256u)
+                com_copy_constants(g_vsk.f[sr],pd,n<256u-sr ? n : 256u-sr,16u);
             /* VSKDUMP: pd'nin CEVRESINI dok.  Matris 2 vektor kaymissa
              * dogru satirlar pd-32'de duruyor olmali. */
             /* WATCHVSK: bu tampona kim yaziyor?  Yuklemeden hemen sonra
@@ -2558,11 +2689,8 @@ int com_call(CPU *c, uint32_t magic){
             uint32_t sr2=A(c,1), pd2=A(c,2), n2=A(c,3);
             if (sr2+n2 > g_psc_max) g_psc_max = sr2+n2;
             if (sr2+n2 > 32u) g_psc_drop++;
-            for (uint32_t q4=0; q4<n2 && sr2+q4<32u; q4++){
-                uint32_t off = pd2 + 16u*q4;
-                if (!pd2 || !mem_is_committed(off+15)) break;
-                for (int c4=0;c4<4;c4++) g_psc[sr2+q4][c4] = MRF32(off+4u*(uint32_t)c4);
-            }
+            if (pd2 && sr2<32u)
+                com_copy_constants(g_psc[sr2],pd2,n2<32u-sr2 ? n2 : 32u-sr2,16u);
             r=0; }
         
         else if      (MID(TestCooperativeLevel)){
@@ -2983,19 +3111,13 @@ int com_call(CPU *c, uint32_t magic){
             r=0; }
         else if (MID(SetVertexShaderConstantI)){
             uint32_t sr=A(c,1), pd=A(c,2), n=A(c,3);
-            for (uint32_t k=0; k<n && sr+k<16; k++){
-                uint32_t o=pd+16u*k;
-                if (!mem_is_committed(o+15)) break;
-                for (int j2=0;j2<4;j2++) g_vsk.i[sr+k][j2]=(int32_t)MR32(o+4u*j2);
-            }
+            if (sr<16u)
+                com_copy_constants(g_vsk.i[sr],pd,n<16u-sr ? n : 16u-sr,16u);
             r=0; }
         else if (MID(SetVertexShaderConstantB)){
             uint32_t sr=A(c,1), pd=A(c,2), n=A(c,3);
-            for (uint32_t k=0; k<n && sr+k<16; k++){
-                uint32_t o=pd+4u*k;
-                if (!mem_is_committed(o+3)) break;
-                g_vsk.b[sr+k]=(int32_t)MR32(o);
-            }
+            if (sr<16u)
+                com_copy_constants(&g_vsk.b[sr],pd,n<16u-sr ? n : 16u-sr,4u);
             r=0; }
         else if (MID(SetVertexDeclaration)){ g_cur_decl=A(c,1); g_raw_decl=g_cur_decl; r=0; }
         else if (MID(Reset)){
@@ -3046,6 +3168,7 @@ int com_call(CPU *c, uint32_t magic){
                 memset(g_smp_raw, 0, sizeof g_smp_raw);
                 memset(g_tss_raw, 0, sizeof g_tss_raw);
                 for (int q7 = 0; q7 < 8; q7++) g_tss_raw[q7][11] = (uint32_t)q7;
+                g_smp_pending=15u; g_texproj_pending=15u;
                 if (metal_available()){ rs_apply(); g_rs_dirty = 0; }
             }
             if (g_cur_rt)
@@ -3512,7 +3635,13 @@ int com_call(CPU *c, uint32_t magic){
     else if (iface==IF_DS){
         if      (MID(CreateSoundBuffer)){
             uint32_t desc=A(c,1), pp=A(c,2);
-            uint32_t b=com_new(IF_DSBUF,64);
+            uint32_t buffer_result = 0;
+            if (!pp || !guest_memory_pointer(pp,4,1)){
+                r=DSERR_INVALIDPARAM; goto com_finish;
+            }
+            if (!com_has_room(IF_DSBUF,64)){
+                MR32(pp)=0; r=0x8007000Eu; goto com_finish;
+            }
             /* DSBUFFERDESC: dwSize@0 dwFlags@4 dwBufferBytes@8 dwReserved@12
              *               lpwfxFormat@16 guid3DAlgorithm@20
              * DIKKAT: boyut +12'den (dwReserved) okunuyordu -> her zaman 0
@@ -3533,7 +3662,23 @@ int com_call(CPU *c, uint32_t magic){
                 guest_backtrace(c, 10);
             }
             if(!bytes || bytes>0x400000u) bytes=65536u;
+            if ((uint64_t)gbuf_ptr+(((uint64_t)bytes+63u)&~UINT64_C(63)) > GBUF_MAX){
+                MR32(pp)=0; r=0x8007000Eu; goto com_finish;
+            }
+            uint32_t requested_flags = (desc && mem_is_committed(desc+7)) ? MR32(desc+4) : 0;
+            if (!(requested_flags & 0x1u) && !audio_registration_available(bytes)){
+                /* Exhausted mirror/ID budgets must not repeatedly consume
+                 * the non-reclaiming guest/COM allocation arenas. */
+                if (pp) MR32(pp)=0;
+                r=0x8007000Eu;
+                goto com_finish;
+            }
+            uint32_t b=com_new(IF_DSBUF,64);
+            if (!b){ MR32(pp)=0; r=0x8007000Eu; goto com_finish; }
             MR32(b+4)=bytes; MR32(b+8)=gbuf_alloc(bytes); MR32(b+12)=0;
+            if (!MR32(b+8)){
+                MR32(pp)=0; r=0x8007000Eu; goto com_finish;
+            }
             /* WAVEFORMATEX'ten bayt/saniye: oynatma imleci GERCEKCI ilerlemeli.
              * Video oynatici kareleri ses saatine gore suruyor; imlec sahte
              * olursa oynatma hic bitmiyor. */
@@ -3558,8 +3703,9 @@ int com_call(CPU *c, uint32_t magic){
               if (!(flags & 0x1u)){
                   audio_init();
                   MR32(b+28) = (uint32_t)audio_register(MR32(b+8), bytes, rate, chans, bits);
+                  if (!MR32(b+28)) buffer_result = 0x8007000Eu; /* E_OUTOFMEMORY */
               } }
-            if(pp) MR32(pp)=b; r=0; }
+            if(pp) MR32(pp)=buffer_result ? 0u : b; r=buffer_result; }
         else if (MID(GetCaps)){
             /* DSCAPS: dwSize@0 dwFlags@4 dwMinSecondarySampleRate@8
              *         dwMaxSecondarySampleRate@12 dwPrimaryBuffers@16
@@ -3590,20 +3736,39 @@ int com_call(CPU *c, uint32_t magic){
              * veri yok, karistiricida sesi yok.  Oyun es zamanli efektleri
              * (motor, menu tiklamalari) boyle caldigi icin HEPSI sessizdi. */
             uint32_t src=A(c,1), pp=A(c,2);
+            if (!pp || !guest_memory_pointer(pp,4,1)){
+                r=0x80070057u; goto com_finish;
+            }
+            if (!src || !guest_memory_pointer(src,32,0) || !MR32(src+28)){
+                MR32(pp)=0; r=DSERR_INVALIDCALL; goto com_finish;
+            }
+            /* No guest yield or COM allocation occurs between this preflight
+             * and com_new, so a duplicate ID cannot consume the last slot only
+             * to discover that the serialized COM arena was already full. */
+            if (!com_has_room(IF_DSBUF,64)){
+                MR32(pp)=0; r=0x8007000Eu; goto com_finish;
+            }
+            int duplicate=audio_duplicate((int)MR32(src+28));
+            if (!duplicate){
+                MR32(pp)=0; r=0x8007000Eu; goto com_finish;
+            }
             uint32_t b=com_new(IF_DSBUF,64);
-            if (src && mem_is_committed(src+31)){
+            if (!b){ MR32(pp)=0; r=0x8007000Eu; goto com_finish; }
+            {
                 MR32(b+4)=MR32(src+4);          /* boyut   */
                 MR32(b+8)=MR32(src+8);          /* veri    */
                 MR32(b+20)=MR32(src+20);        /* bayt/sn */
                 MR32(b+12)=0; MR32(b+16)=0; MR32(b+24)=0;
-                int audio_duplicate(int);
-                MR32(b+28)=(uint32_t)audio_duplicate((int)MR32(src+28));
+                MR32(b+28)=(uint32_t)duplicate;
             }
             if(pp) MR32(pp)=b; r=0; }
         else r=0;
     }
     else if (iface==IF_DSBUF){
         uint32_t self=A(c,0);
+        if (!self || !guest_memory_pointer(self,32,1)){
+            r=0x80070057u; goto com_finish;
+        }
         uint32_t sz = self?MR32(self+4):65536u, buf = self?MR32(self+8):0;
         if      (MID(Lock)){
             /* Hangi tampon nesnesi kilitleniyor?  SFX olaylari tampon
@@ -3640,14 +3805,45 @@ int com_call(CPU *c, uint32_t magic){
              * kisim hic yazilmiyor, her sarmada sessiz bosluk olusuyordu. */
             uint32_t off=A(c,1), want=A(c,2), pp1=A(c,3), pn1=A(c,4),
                      pp2=A(c,5), pn2=A(c,6), fl=A(c,7);
+            if (!pp1 || !pn1 || (pp2 && !pn2) ||
+                !guest_memory_pointer(pp1,4,1) || !guest_memory_pointer(pn1,4,1) ||
+                (pp2 && !guest_memory_pointer(pp2,4,1)) ||
+                (pn2 && !guest_memory_pointer(pn2,4,1))){
+                r=0x80070057u; goto com_finish;
+            }
             if(!buf){ buf=gbuf_alloc(sz?sz:65536u); if(self) MR32(self+8)=buf; }
             if(!sz) sz = 65536u;
             if (fl & 0x2u){ off = 0; want = sz; }        /* ENTIREBUFFER */
+            else if (fl & 0x1u){                       /* FROMWRITECURSOR */
+                uint32_t sid = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
+                if (sid) audio_cursors((int)sid, NULL, &off);
+                else {
+                    /* Match the legacy unregistered GetCurrentPosition path. */
+                    uint32_t position = self ? MR32(self+16) : 0u;
+                    uint32_t t0 = self ? MR32(self+24) : 0u;
+                    if (self && MR32(self+12) && t0){
+                        uint64_t host_us(void);
+                        uint32_t elapsed = (uint32_t)(host_us()/1000ull) - t0;
+                        uint32_t bps = MR32(self+20); if (!bps) bps = 176400u;
+                        position = (uint32_t)(((uint64_t)elapsed * bps / 1000ull) % sz);
+                    }
+                    off = (position + 2048u) % sz;
+                }
+            }
             off %= sz;
             if (!want || want > sz) want = sz;
             uint32_t avail = sz - off;
             uint32_t b1 = (want <= avail) ? want : avail;
             uint32_t b2 = want - b1;
+            if (!pp2) b2 = 0; /* No second pointer: leave the wrapped part unlocked. */
+            if (!buf || (uint64_t)buf+sz > UINT64_C(0x100000000) ||
+                !guest_memory_pointer(buf+off,b1,1) ||
+                (b2 && !guest_memory_pointer(buf,b2,1))){
+                r=0x80070057u; goto com_finish;
+            }
+            if (!ds_lock_add(self,buf+off,b1,b2?buf:0u,b2)){
+                r=0x8007000Eu; goto com_finish;
+            }
             if (ENVC("SNDLOG")){
                 static int nl=0;
                 uint32_t sid2 = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
@@ -3660,12 +3856,27 @@ int com_call(CPU *c, uint32_t magic){
                             (int)((off + sz - rp) % sz));
                 }
             }
-            if(pp1){ mem_commit(pp1,4); MR32(pp1)=buf+off; }
-            if(pn1){ mem_commit(pn1,4); MR32(pn1)=b1; }
-            if(pp2){ mem_commit(pp2,4); MR32(pp2)= b2 ? buf : 0u; }
-            if(pn2){ mem_commit(pn2,4); MR32(pn2)= b2; }
+            MR32(pp1)=buf+off; MR32(pn1)=b1;
+            if(pp2) MR32(pp2)= b2 ? buf : 0u;
+            if(pn2) MR32(pn2)= b2;
             r=0; }
         else if (MID(Unlock)){
+            uint32_t p1=A(c,1), n1=A(c,2), p2=A(c,3), n2=A(c,4);
+            uint32_t sid = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
+            uint32_t matched=ds_lock_match(self,p1,n1,p2,n2);
+            int publish_ok = matched && (!n1 || guest_memory_pointer(p1, n1, 0)) &&
+                             (!n2 || guest_memory_pointer(p2, n2, 0));
+            int nonzero_sample=0;
+            if (publish_ok)
+                nonzero_sample=ds_pcm_nonzero_sample(p1,n1) || ds_pcm_nonzero_sample(p2,n2);
+            /* Both complete guest spans are checked while the guest lock is
+             * held. Publish both regions together; never partially publish an
+             * invalid wrap or let the audio callback read guest writes. */
+            if (publish_ok && sid)
+                publish_ok = audio_publish_write((int)sid, p1, n1, p2, n2, nonzero_sample);
+            if (!publish_ok) r=0x80070057u; /* DSERR_INVALIDPARAM */
+            else {
+            ds_lock_remove(self,matched);
             /* VOICELOG=1: oyunun KENDI ses kanali tablosu.
              * sub_00725378 tabloyu [0x8b466c] adres, 0x90 adim, sayi
              * [0x8b460c] (int16) olarak geziyor; +0x26 baytini "kullanimda"
@@ -3709,15 +3920,9 @@ int com_call(CPU *c, uint32_t magic){
             }
             /* Oyun bu tampona gercek PCM yaziyor mu?  Yaziyorsa ses motoru
              * (dolayisiyla on yuz mantigi) CALISIYOR demektir. */
-            uint32_t p1=A(c,1), n1=A(c,2);
-            if (p1 && n1 && n1 < 1u<<22 && mem_is_committed(p1+ (n1>16?15:0))){
-                uint32_t nz=0, lim = n1 < 4096u ? n1 : 4096u;
-                for (uint32_t q=0;q<lim;q++) if (MR8(p1+q)) nz++;
-                if (nz){ g_snd_bytes += n1; g_snd_nonzero++; }
+            if (n1 || n2){
+                if (nonzero_sample){ g_snd_bytes += (uint64_t)n1+n2; g_snd_nonzero++; }
                 else      g_snd_zero++;
-                { uint32_t sid4 = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
-                  if (sid4){ void audio_note_write_stat(int, uint32_t, int);
-                             audio_note_write_stat((int)sid4, n1, nz ? 1 : 0); } }
                 /* SNDZERO: TAMAMEN SIFIR yazilan bolgeleri, cagiran guest
                  * adresiyle birlikte bildir.  Olculdu: oyun tam 30 sn'de bir
                  * ~50-95 ms sessizlik YAZIYOR (tampon ac degil, veri bos). */
@@ -3742,23 +3947,9 @@ int com_call(CPU *c, uint32_t magic){
                         }
                     }
                 }
-                /* Karistiriciya yazma konumunu bildir (servo icin).
-                 * DIKKAT: kilit SARMIS olabilir -- ikinci bolge (pv2,cb2)
-                 * tamponun BASINDAN devam eder.  Yalnizca birinci bolgeye
-                 * bakmak, sarmada yazma imlecini tamponun sonunda sanmaya
-                 * ve servoyu yanlis beslemeye yol aciyordu. */
-                { uint32_t sid3 = (self && mem_is_committed(self+31)) ? MR32(self+28) : 0;
-                  uint32_t base3 = self ? MR32(self+8) : 0;
-                  uint32_t n2u   = A(c,4);
-                  if (sid3 && base3 && p1 >= base3){
-                      void audio_note_write(int, uint32_t);
-                      if (n2u && n2u < 1u<<22)
-                          audio_note_write((int)sid3, n2u);          /* bastan devam */
-                      else
-                          audio_note_write((int)sid3, (p1 - base3) + n1);
-                  } }
             }
-            r=0; }
+            r=0;
+            } }
         else if (MID(Play)){
             if(self){ MR32(self+12)=1; uint64_t host_us(void);
                       MR32(self+24)=(uint32_t)(host_us()/1000ull);
@@ -4211,6 +4402,7 @@ int com_call(CPU *c, uint32_t magic){
     }
     else r=0;
 
+com_finish:
     if (g_com_trace && !MID(Present) && strncmp(nm,"Draw",4)
         && !MID(SetRenderState) && !MID(SetTextureStageState))
         fprintf(stderr,"  [COM] %s::%-28s (%d arg) -> 0x%08x%s\n",
@@ -4218,6 +4410,14 @@ int com_call(CPU *c, uint32_t magic){
     if(!impl) g_com_unimpl++;
     c->eax=r;
     if (!g_sb_replay) c->esp += 4u*(uint32_t)nargs;
+    --g_com_depth;
+#if defined(NFS_FULL_RUNTIME) && NFS_FULL_RUNTIME
+    /* Present is an inexpensive frame boundary even when the game makes
+     * almost no Win32 imports. Yield only after all COM/stack work is done. */
+    if (iface == IF_DEV && MID(Present) && !g_com_depth &&
+        !g_sb_replay && !g_arg_ovr && !g_dxrec_depth)
+        guest_frame_checkpoint();
+#endif
     return 1;
 }
 

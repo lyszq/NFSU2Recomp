@@ -24,6 +24,13 @@ static void reset_audio(uint32_t hw_rate){
     g_mixed_frames = g_active_peak = 0;
     g_replay = g_reissue = g_starved = g_worst_gap_us = 0;
     g_late_callbacks = g_out_frames = g_out_zero = g_gap_cb = 0;
+    atomic_store_explicit(&g_cb_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_cb_gap_max_us, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_cb_duration_max_us, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_cb_late_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_cb_over_budget_count, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_cb_max_frames, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_cb_clock_reset, true, memory_order_relaxed);
     g_cb_no = 0;
     g_backend = 0;
     g_au_slice = 0;
@@ -222,6 +229,85 @@ static void test_nonblocking_snapshot(void){
     pthread_mutex_unlock(&g_slock);
 }
 
+static const AudioBufferSnapshot *find_snapshot_buffer(const AudioSnapshot *snap,
+                                                       uint32_t id){
+    for (uint32_t i = 0; i < snap->buffers_captured; i++)
+        if (snap->buffers[i].id == id) return &snap->buffers[i];
+    return NULL;
+}
+
+static void test_per_buffer_snapshot(void){
+    const int16_t pcm[] = { 1000, 2000, 3000, 4000 };
+    int16_t out[4] = {0};
+    write_mono16(TEST_DATA_A, pcm, 4);
+    reset_audio(44100);
+    int original = audio_register(TEST_DATA_A, sizeof(pcm), 44100, 1, 16);
+    assert(original > 0);
+    int duplicate = audio_duplicate(original);
+    assert(duplicate > original);
+
+    /* Writes through a duplicate describe the shared PCM allocation. */
+    audio_note_write_stat(duplicate, 6u, 1);
+    audio_note_write(duplicate, 2u);
+    audio_note_write_stat(duplicate, 2u, 1);
+    audio_note_write(duplicate, 6u);
+    audio_play(duplicate, 1);
+    mix_into(out, 2);
+
+    AudioSnapshot snap;
+    assert(audio_snapshot(&snap));
+    assert(snap.buffer_count == 2u);
+    assert(snap.buffers_captured == 2u);
+    assert(snap.buffers_omitted == 0u);
+    assert(snap.active_buffers == 1u);
+    assert(snap.callback_count == 0u);
+    assert(snap.callback_gap_max_us == 0u);
+    assert(snap.callback_duration_max_us == 0u);
+    assert(snap.callback_late_count == 0u);
+    assert(snap.callback_over_budget_count == 0u);
+    assert(snap.callback_max_frames == 0u);
+
+    const AudioBufferSnapshot *base = find_snapshot_buffer(&snap, (uint32_t)original);
+    const AudioBufferSnapshot *copy = find_snapshot_buffer(&snap, (uint32_t)duplicate);
+    assert(base && copy);
+    assert(base->storage_id == copy->storage_id);
+    assert(base->size_bytes == sizeof(pcm));
+    assert(base->rate == 44100u && base->channels == 1u && base->bits == 16u);
+    assert(base->active == 0u && base->looping == 0u);
+    assert(copy->active == 1u && copy->looping == 1u);
+    assert(base->write_seen == 1u && copy->write_seen == 1u);
+    assert(base->write_calls == 2u && copy->write_calls == 2u);
+    assert(base->write_bytes_reported == 8u && copy->write_bytes_reported == 8u);
+    assert(base->last_write_bytes_reported == 2u);
+    assert(copy->last_write_bytes_reported == 2u);
+    assert(base->write_end_offset == 6u && copy->write_end_offset == 6u);
+    assert(base->play_cursor_bytes == 0u);
+    assert(copy->play_cursor_bytes == 4u);
+    assert(base->write_cursor_bytes == 2u);
+    assert(copy->write_cursor_bytes == 6u);
+}
+
+static void test_snapshot_buffer_limit_keeps_active_buffers(void){
+    const int16_t pcm[] = { 1000, 2000, 3000, 4000 };
+    write_mono16(TEST_DATA_A, pcm, 4);
+    reset_audio(44100);
+    int ids[AUDIO_SNAPSHOT_MAX_BUFFERS + 1u];
+    for (unsigned i = 0; i < AUDIO_SNAPSHOT_MAX_BUFFERS + 1u; i++){
+        ids[i] = audio_register(TEST_DATA_A, sizeof(pcm), 44100, 1, 16);
+        assert(ids[i] > 0);
+    }
+    audio_play(ids[AUDIO_SNAPSHOT_MAX_BUFFERS], 1);
+
+    AudioSnapshot snap;
+    assert(audio_snapshot(&snap));
+    assert(snap.buffer_count == AUDIO_SNAPSHOT_MAX_BUFFERS + 1u);
+    assert(snap.buffers_captured == AUDIO_SNAPSHOT_MAX_BUFFERS);
+    assert(snap.buffers_omitted == 1u);
+    const AudioBufferSnapshot *active = find_snapshot_buffer(
+        &snap, (uint32_t)ids[AUDIO_SNAPSHOT_MAX_BUFFERS]);
+    assert(active && active->active && active->looping);
+}
+
 int main(void){
     g_mem = (uint8_t *)calloc(TEST_MEM_SIZE, 1);
     assert(g_mem);
@@ -230,6 +316,8 @@ int main(void){
     test_static_full_write_pitch();
     test_hardware_rate_frequency_and_chunk_tail();
     test_nonblocking_snapshot();
+    test_per_buffer_snapshot();
+    test_snapshot_buffer_limit_keeps_active_buffers();
     free(g_mem);
     puts("audio core tests passed");
     return 0;

@@ -18,7 +18,8 @@
 #include <errno.h>
 #include <time.h>
 static uint64_t now_ns_io(void){
-    struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC,&ts) != 0) return 0;
     return (uint64_t)ts.tv_sec*1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
@@ -61,6 +62,9 @@ static _Atomic uint64_t g_fileio_case_cache_hits;
 static _Atomic uint64_t g_fileio_case_cache_invalidations;
 static _Atomic uint64_t g_fileio_snapshot_read_calls;
 static _Atomic uint64_t g_fileio_snapshot_read_bytes;
+static _Atomic uint64_t g_fileio_read_commit_ns;
+static _Atomic uint64_t g_fileio_read_service_ns;
+static _Atomic uint64_t g_fileio_read_service_max_ns;
 
 #if defined(__APPLE__)
 #define FILEIO_STAT_MTIME_SEC(st_) ((st_)->st_mtimespec.tv_sec)
@@ -302,6 +306,12 @@ void fileio_perf_snapshot(FileioPerfSnapshot *snapshot){
                                                 memory_order_relaxed);
     snapshot->read_bytes = atomic_load_explicit(&g_fileio_snapshot_read_bytes,
                                                 memory_order_relaxed);
+    snapshot->read_commit_ns = atomic_load_explicit(&g_fileio_read_commit_ns,
+                                                    memory_order_relaxed);
+    snapshot->read_service_ns = atomic_load_explicit(&g_fileio_read_service_ns,
+                                                     memory_order_relaxed);
+    snapshot->read_service_max_ns = atomic_load_explicit(&g_fileio_read_service_max_ns,
+                                                         memory_order_relaxed);
 }
 
 void fileio_set_root(const char *exe_path){
@@ -669,11 +679,14 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
          * bitmesini sonsuza kadar bekler.                               */
         FH*f=fh_get(A(c,0)); uint32_t buf=A(c,1), len=A(c,2), pnr=A(c,3), ov=A(c,4);
         if(!f||f->fd<0){ if(pnr) MR32(pnr)=0; r=0; }
-        else { if(len) mem_commit(buf,len);
-               ssize_t got;
-               /* This once-only snapshot initializes all read diagnostics. */
+        else { /* Initialize the immutable diagnostic options before timing. */
                int _readlog = fileio_readlog_enabled();
-               uint64_t _rd0 = _readlog ? now_ns_io() : 0;
+               uint64_t _commit0 = now_ns_io();
+               if(len) mem_commit(buf,len);
+               ssize_t got;
+               /* Bounded counters replace per-read log spam for attribution.
+                * Three monotonic reads per IO, never a scan/copy of file data. */
+               uint64_t _rd0 = now_ns_io();
                if (ov && mem_is_committed(ov+19)){
                    uint64_t off = (uint64_t)MR32(ov+8) | ((uint64_t)MR32(ov+12) << 32);
                    got = pread(f->fd, g_mem+buf, len, (off_t)off);
@@ -689,6 +702,15 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
                    got = read(f->fd, g_mem+buf, len);
                    if(got<0) got=0;
                }
+               uint64_t _rd1 = now_ns_io();
+               uint64_t _commit_ns = _commit0 && _rd0 >= _commit0 ? _rd0 - _commit0 : 0;
+               uint64_t _service_ns = _rd0 && _rd1 >= _rd0 ? _rd1 - _rd0 : 0;
+               atomic_fetch_add_explicit(&g_fileio_read_commit_ns, _commit_ns, memory_order_relaxed);
+               atomic_fetch_add_explicit(&g_fileio_read_service_ns, _service_ns, memory_order_relaxed);
+               uint64_t _maximum = atomic_load_explicit(&g_fileio_read_service_max_ns, memory_order_relaxed);
+               while (_maximum < _service_ns && !atomic_compare_exchange_weak_explicit(
+                       &g_fileio_read_service_max_ns, &_maximum, _service_ns,
+                       memory_order_relaxed, memory_order_relaxed)) {}
                /* MUTEFILE=<parca>: eslesen dosyanin okumalarini SIFIRLA
                 * doldur.  Muzik akisini (sdat.viv) susturup geriye ses
                 * efekti kaliyor mu, bunu nesnel olcmek icin.  Dosya sonu
@@ -702,7 +724,7 @@ int fileio_call(CPU *c, const char *n, uint32_t *out){
                    double audio_time(void);
                    fprintf(stderr,"  [okuma] t=%8.3f %-28s istenen=%-9u alinan=%-9ld sure=%.2f ms\n",
                            audio_time(), bn, len, (long)got,
-                           (double)(now_ns_io() - _rd0)/1e6);
+                           (double)_service_ns/1e6);
                }
                g_file_read++; g_bytes_read += (uint64_t)got;
                atomic_fetch_add_explicit(&g_fileio_snapshot_read_calls, 1u,
